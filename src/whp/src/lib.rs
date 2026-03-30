@@ -7,6 +7,8 @@ use std::ffi::c_void;
 use std::fmt::{Display, Formatter};
 use std::mem::{self, MaybeUninit};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use log::{debug, error};
 use windows_sys::Win32::Foundation::S_OK;
@@ -195,8 +197,99 @@ pub struct MsrExitInfo {
     pub rdx: u64,
 }
 
+/// Per-VM state for Hyper-V enlightenments (synthetic CPUID / MSR interface).
+///
+/// When running a Linux guest on WHP, the guest kernel has no built-in
+/// knowledge of the Windows Hypervisor Platform.  Without help it falls back
+/// to legacy clocksources (PIT, HPET, ACPI PM timer) that require a VM exit
+/// on every time read — a significant performance bottleneck since the kernel
+/// reads the clock thousands of times per second for scheduling, timers, and
+/// `gettimeofday()`.
+///
+/// By presenting the standard Hyper-V hypervisor interface (CPUID leaves
+/// `0x40000000`–`0x40000005` with the "Microsoft Hv" signature, plus a set of
+/// synthetic MSRs) we enable the Linux `hyperv_clocksource` driver.  Its
+/// centrepiece is the **Reference TSC Page**: a shared-memory page containing
+/// calibration constants that let the guest compute wall-clock time purely
+/// from `RDTSC` — no VM exit required.  This is the fastest clocksource
+/// available under any Windows-hosted hypervisor.
+pub struct HyperVState {
+    /// `HV_X64_MSR_GUEST_OS_ID` — the guest identifies itself to the hypervisor.
+    guest_os_id: AtomicU64,
+    /// Raw value last written to `HV_X64_MSR_REFERENCE_TSC` (bit 0 = enable,
+    /// bits 12:63 = page frame number).
+    tsc_reference_msr: AtomicU64,
+    /// Host TSC value captured at VM creation (for TSC page calibration).
+    vm_start_tsc: u64,
+    /// Host monotonic instant captured at VM creation (for `TIME_REF_COUNT`).
+    vm_start_instant: Instant,
+    /// Host TSC frequency in Hz, used for time conversions.
+    tsc_freq_hz: u64,
+    /// Synthetic timer 0 config (direct mode, vector, enable, periodic).
+    stimer0_config: AtomicU64,
+    /// Synthetic timer 0 count — absolute expiration in 100 ns units (one-shot)
+    /// or period (periodic).  0 means disarmed.
+    stimer0_count: AtomicU64,
+}
+impl HyperVState {
+    fn new(tsc_freq_hz: u64) -> Self {
+        Self {
+            guest_os_id: AtomicU64::new(0),
+            tsc_reference_msr: AtomicU64::new(0),
+            vm_start_tsc: unsafe { core::arch::x86_64::_rdtsc() },
+            vm_start_instant: Instant::now(),
+            tsc_freq_hz,
+            stimer0_config: AtomicU64::new(0),
+            stimer0_count: AtomicU64::new(0),
+        }
+    }
+    pub fn guest_os_id(&self) -> u64 {
+        self.guest_os_id.load(Ordering::Relaxed)
+    }
+    pub fn set_guest_os_id(&self, val: u64) {
+        self.guest_os_id.store(val, Ordering::Relaxed);
+    }
+    pub fn tsc_reference_msr(&self) -> u64 {
+        self.tsc_reference_msr.load(Ordering::Relaxed)
+    }
+    pub fn set_tsc_reference_msr(&self, val: u64) {
+        self.tsc_reference_msr.store(val, Ordering::Relaxed);
+    }
+    pub fn vm_start_tsc(&self) -> u64 {
+        self.vm_start_tsc
+    }
+    pub fn vm_start_instant(&self) -> Instant {
+        self.vm_start_instant
+    }
+    pub fn tsc_freq_hz(&self) -> u64 {
+        self.tsc_freq_hz
+    }
+    pub fn stimer0_config(&self) -> u64 {
+        self.stimer0_config.load(Ordering::Relaxed)
+    }
+    pub fn set_stimer0_config(&self, val: u64) {
+        self.stimer0_config.store(val, Ordering::Relaxed);
+    }
+    pub fn stimer0_count(&self) -> u64 {
+        self.stimer0_count.load(Ordering::Relaxed)
+    }
+    pub fn set_stimer0_count(&self, val: u64) {
+        self.stimer0_count.store(val, Ordering::Relaxed);
+    }
+    /// Compute the Hyper-V reference time counter (100 ns units) from the
+    /// current host TSC.
+    pub fn reference_time(&self) -> u64 {
+        let elapsed_tsc = unsafe { core::arch::x86_64::_rdtsc() } - self.vm_start_tsc;
+        if self.tsc_freq_hz == 0 {
+            return 0;
+        }
+        ((elapsed_tsc as u128) * 10_000_000 / self.tsc_freq_hz as u128) as u64
+    }
+}
+
 pub struct WhpVm {
     handle: WHV_PARTITION_HANDLE,
+    state: Arc<HyperVState>,
 }
 
 #[repr(C)]
@@ -265,7 +358,7 @@ impl WhpVm {
         }
 
         debug!("WHP partition created with {vcpu_count} vCPU(s)");
-        Ok(WhpVm { handle })
+        Ok(WhpVm { handle, state: Arc::new(HyperVState::new(tsc_freq_hz)) })
     }
 
     fn configure_partition(
@@ -468,6 +561,20 @@ impl WhpVm {
         if hr != S_OK {
             return Err(Error::SetPartitionProperty(hr));
         }
+        
+        let hr = unsafe {
+            WHvSetPartitionProperty(
+                handle,
+                WHvPartitionPropertyCodeCpuidResultList,
+                cpuid_results.as_ptr() as *const _,
+                (cpuid_results.len() * mem::size_of::<WHV_X64_CPUID_RESULT>()) as u32,
+            )
+        };
+        if hr != S_OK {
+            return Err(Error::SetPartitionProperty(hr));
+        }
+        debug!("CpuidResultList set ({} entries)", cpuid_results.len());
+        
 
         let hr = unsafe { WHvSetupPartition(handle) };
         if hr != S_OK {
@@ -672,6 +779,10 @@ impl WhpVm {
 
     pub fn partition_handle(&self) -> WHV_PARTITION_HANDLE {
         self.handle
+    }
+
+    pub fn state(&self) -> &Arc<HyperVState> {
+        &self.state
     }
 }
 
