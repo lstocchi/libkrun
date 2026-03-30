@@ -12,7 +12,9 @@ use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use std::fs::File;
 use std::io::{self, IsTerminal, Read};
+#[cfg(not(target_os = "windows"))]
 use std::os::fd::AsRawFd;
+#[cfg(not(target_os = "windows"))]
 use std::os::fd::{BorrowedFd, FromRawFd};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicI32;
@@ -33,15 +35,17 @@ use crate::vmm_config::net::NetBuilder;
 use devices::legacy::Cmos;
 #[cfg(all(target_os = "linux", target_arch = "riscv64"))]
 use devices::legacy::KvmAia;
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 use devices::legacy::KvmIoapic;
 use devices::legacy::Serial;
 #[cfg(target_os = "macos")]
 use devices::legacy::VcpuList;
 #[cfg(target_os = "macos")]
 use devices::legacy::{GicV3, HvfGicV3};
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 use devices::legacy::{IoApic, IrqChipT};
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+use devices::legacy::WhpIoapic;
 use devices::legacy::{IrqChip, IrqChipDevice};
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 use devices::legacy::{KvmGicV2, KvmGicV3};
@@ -81,9 +85,11 @@ use krun_display::DisplayBackend;
 use krun_display::IntoDisplayBackend;
 #[cfg(feature = "amd-sev")]
 use kvm_bindings::KVM_MAX_CPUID_ENTRIES;
+#[cfg(not(target_os = "windows"))]
 use libc::{STDERR_FILENO, STDIN_FILENO, STDOUT_FILENO};
 #[cfg(target_arch = "x86_64")]
 use linux_loader::loader::{self, KernelLoader};
+#[cfg(not(target_os = "windows"))]
 use nix::unistd::isatty;
 use polly::event_manager::{Error as EventManagerError, EventManager};
 use utils::eventfd::EventFd;
@@ -544,6 +550,9 @@ fn choose_payload(vm_resources: &VmResources) -> Result<Payload, StartMicrovmErr
 
         #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
         return Ok(Payload::KernelCopy);
+
+        #[cfg(target_os = "windows")]
+        return Err(StartMicrovmError::MissingKernelConfig);
     } else if let Some(external_kernel) = vm_resources.external_kernel() {
         Ok(Payload::ExternalKernel(external_kernel.clone()))
     } else if cfg!(feature = "efi") || vm_resources.firmware_config.is_some() {
@@ -609,9 +618,13 @@ pub fn build_microvm(
         kernel_cmdline.insert_str(cmdline).unwrap();
     }
 
-    #[cfg(not(feature = "tee"))]
+    #[cfg(all(not(feature = "tee"), not(target_os = "windows")))]
     #[allow(unused_mut)]
     let mut vm = setup_vm(&guest_memory, vm_resources.nested_enabled)?;
+
+    #[cfg(all(not(feature = "tee"), target_os = "windows"))]
+    #[allow(unused_mut)]
+    let mut vm = setup_vm(&guest_memory, vcpu_config.vcpu_count)?;
 
     #[cfg(feature = "tee")]
     let (_kvm, vm) = {
@@ -806,7 +819,7 @@ pub fn build_microvm(
     let intc: IrqChip;
     // For x86_64 we need to create the interrupt controller before calling `KVM_CREATE_VCPUS`
     // while on aarch64 we need to do it the other way around.
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     {
         let ioapic: Box<dyn IrqChipT> = if vm_resources.split_irqchip {
             Box::new(
@@ -838,6 +851,37 @@ pub fn build_microvm(
             kernel_boot,
             #[cfg(feature = "tee")]
             _sender,
+        )
+        .map_err(StartMicrovmError::Internal)?;
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+    {
+        // WHP emulates the local APIC but not the IOAPIC, so we provide a
+        // software IOAPIC that injects interrupts via WHvRequestInterrupt.
+        // Unlike KVM there is no register_irqfd shortcut -- device interrupts
+        // go through WhpIoapic::set_irq() → WHvRequestInterrupt() entirely
+        // in userspace.
+        intc = Arc::new(Mutex::new(IrqChipDevice::new(Box::new(
+            WhpIoapic::new(vm.whp_vm().clone()),
+        ))));
+
+        attach_legacy_devices_whp(
+            &mut pio_device_manager,
+            &mut mmio_device_manager,
+            Some(intc.clone()),
+        )?;
+
+        let kernel_boot = vm_resources.firmware_config.is_none();
+
+        vcpus = create_vcpus_x86_64_whp(
+            &vm,
+            &vcpu_config,
+            &guest_memory,
+            payload_config.entry_addr,
+            &pio_device_manager.io_bus,
+            &exit_evt,
+            kernel_boot,
         )
         .map_err(StartMicrovmError::Internal)?;
     }
@@ -1585,6 +1629,19 @@ pub(crate) fn setup_vm(
         .map_err(StartMicrovmError::Internal)?;
     Ok(vm)
 }
+#[cfg(all(target_os = "windows", not(feature = "tee")))]
+pub(crate) fn setup_vm(
+    guest_memory: &GuestMemoryMmap,
+    vcpu_count: u8,
+) -> std::result::Result<Vm, StartMicrovmError> {
+    let mut vm = Vm::new(vcpu_count)
+        .map_err(Error::Vm)
+        .map_err(StartMicrovmError::Internal)?;
+    vm.memory_init(guest_memory)
+        .map_err(Error::Vm)
+        .map_err(StartMicrovmError::Internal)?;
+    Ok(vm)
+}
 
 /// Sets up the serial device.
 pub fn setup_serial_device(
@@ -1610,7 +1667,7 @@ pub fn setup_serial_device(
     Ok(serial)
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 fn attach_legacy_devices(
     vm: &Vm,
     split_irqchip: bool,
@@ -1715,7 +1772,7 @@ fn attach_legacy_devices(
     Ok(())
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[allow(clippy::too_many_arguments)]
 fn create_vcpus_x86_64(
     vm: &Vm,
@@ -1747,6 +1804,76 @@ fn create_vcpus_x86_64(
         vcpus.push(vcpu);
     }
     Ok(vcpus)
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+fn attach_legacy_devices_whp(
+    pio_device_manager: &mut PortIODeviceManager,
+    mmio_device_manager: &mut MMIODeviceManager,
+    intc: Option<Arc<Mutex<IrqChipDevice>>>,
+) -> std::result::Result<(), StartMicrovmError> {
+    pio_device_manager
+        .register_devices()
+        .map_err(Error::LegacyIOBus)
+        .map_err(StartMicrovmError::Internal)?;
+
+    mmio_device_manager
+        .register_mmio_ioapic(intc)
+        .map_err(Error::RegisterMMIODevice)
+        .map_err(StartMicrovmError::Internal)?;
+
+    Ok(())
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+fn create_vcpus_x86_64_whp(
+    vm: &Vm,
+    vcpu_config: &VcpuConfig,
+    guest_mem: &GuestMemoryMmap,
+    entry_addr: GuestAddress,
+    io_bus: &devices::Bus,
+    exit_evt: &EventFd,
+    kernel_boot: bool,
+) -> super::Result<Vec<Vcpu>> {
+    // WHP doesn't put AP vCPUs in "wait-for-SIPI" state automatically.
+    // Place a `cli; hlt; jmp` idle loop in low memory so APs park there
+    // in real mode until the BSP sends INIT+SIPI via the emulated APIC.
+    if kernel_boot && vcpu_config.vcpu_count > 1 {
+        write_ap_trampoline(guest_mem);
+    }
+
+    let mut vcpus = Vec::with_capacity(vcpu_config.vcpu_count as usize);
+    for cpu_index in 0..vcpu_config.vcpu_count {
+        let mut vcpu = Vcpu::new_x86_64(
+            cpu_index,
+            vm.whp_vm().clone(),
+            guest_mem.clone(),
+            io_bus.clone(),
+            exit_evt.try_clone().map_err(Error::EventFd)?,
+        )
+        .map_err(Error::Vcpu)?;
+
+        vcpu.configure_x86_64(guest_mem, entry_addr, kernel_boot)
+            .map_err(Error::Vcpu)?;
+
+        vcpus.push(vcpu);
+    }
+    Ok(vcpus)
+}
+
+/// Write a tiny `cli; hlt; jmp` loop at [`arch::x86_64::layout::AP_TRAMPOLINE_START`]
+/// so that AP vCPUs idle in real mode until the BSP sends INIT + SIPI.
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+fn write_ap_trampoline(guest_mem: &GuestMemoryMmap) {
+    use arch::x86_64::layout::AP_TRAMPOLINE_START;
+    const AP_IDLE_CODE: [u8; 4] = [
+        0xFA, // cli
+        0xF4, // hlt
+        0xEB, 0xFC, // jmp short $-4  (back to cli)
+    ];
+    guest_mem
+        .write_slice(&AP_IDLE_CODE, GuestAddress(AP_TRAMPOLINE_START))
+        .expect("AP trampoline address must be within guest memory");
 }
 
 #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
@@ -1860,7 +1987,7 @@ fn attach_mmio_device(
     let (_mmio_base, _irq) =
         vmm.mmio_device_manager
             .register_mmio_device(vmm.vm.fd(), mmio_device, type_id, id)?;
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     let (_mmio_base, _irq) =
         vmm.mmio_device_manager
             .register_mmio_device(mmio_device, type_id, id)?;
@@ -2355,7 +2482,7 @@ pub mod tests {
     }
 
     #[test]
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     fn test_create_vcpus_x86_64() {
         let vcpu_count = 2;
 
