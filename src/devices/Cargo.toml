@@ -51,6 +51,9 @@ nix = { version = "0.30.1", features = ["ioctl", "net", "poll", "socket", "fs"] 
 hvf = { package = "krun-hvf", version = "=0.1.0-1.18.0", path = "../hvf" }
 lru = ">=0.9"
 
+[target.'cfg(target_os = "windows")'.dependencies]
+whp = { path = "../whp" }
+
 [target.'cfg(target_os = "linux")'.dependencies]
 rutabaga_gfx = { package = "krun-rutabaga-gfx", version = "=0.1.0-1.18.0", path = "../rutabaga_gfx", features = ["x"], optional = true }
 caps = "0.5.5"
