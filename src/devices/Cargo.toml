@@ -45,6 +45,9 @@ imago = { version = "0.2.1", features = ["sync-wrappers", "vm-memory"] }
 hvf = { path = "../hvf" }
 lru = ">=0.9"
 
+[target.'cfg(target_os = "windows")'.dependencies]
+whp = { path = "../whp" }
+
 [target.'cfg(target_os = "linux")'.dependencies]
 rutabaga_gfx = { path = "../rutabaga_gfx", features = ["x"], optional = true }
 caps = "0.5.5"
