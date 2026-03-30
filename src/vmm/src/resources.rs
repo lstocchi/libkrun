@@ -198,7 +198,9 @@ impl VmResources {
         // supplied by the user.
         VcpuConfig {
             vcpu_count: self.vm_config().vcpu_count.unwrap(),
+            #[cfg(not(target_os = "windows"))]
             ht_enabled: self.vm_config().ht_enabled.unwrap(),
+            #[cfg(not(target_os = "windows"))]
             cpu_template: self.vm_config().cpu_template,
         }
     }
@@ -439,7 +441,9 @@ mod tests {
         let vm_resources = default_vm_resources();
         let expected_vcpu_config = VcpuConfig {
             vcpu_count: vm_resources.vm_config().vcpu_count.unwrap(),
+            #[cfg(not(target_os = "windows"))]
             ht_enabled: vm_resources.vm_config().ht_enabled.unwrap(),
+            #[cfg(not(target_os = "windows"))]
             cpu_template: vm_resources.vm_config().cpu_template,
         };
 

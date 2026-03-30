@@ -111,6 +111,8 @@ dependencies = [
  "utils",
  "vm-memory",
  "vmm-sys-util 0.14.0",
+ "whp",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -460,6 +462,7 @@ dependencies = [
  "virtio-bindings",
  "vm-fdt",
  "vm-memory",
+ "whp",
  "zerocopy",
 ]
 
@@ -1757,6 +1760,7 @@ dependencies = [
  "log",
  "nix 0.30.1",
  "vmm-sys-util 0.14.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1842,6 +1846,8 @@ dependencies = [
  "utils",
  "vm-memory",
  "vmm-sys-util 0.14.0",
+ "whp",
+ "windows-sys 0.61.2",
  "zstd",
 ]
 
@@ -1940,6 +1946,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1a05d73b933a847d6cccdda8f838a22ff101ad9bf93e33684f39c1f5f0eece3d"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "whp"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
