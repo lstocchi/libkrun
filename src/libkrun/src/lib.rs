@@ -33,6 +33,8 @@ use std::os::fd::AsRawFd;
 use std::os::fd::{BorrowedFd, FromRawFd, RawFd};
 #[cfg(windows)]
 use std::os::windows::io::BorrowedHandle;
+#[cfg(target_os = "windows")]
+use utils::windows::SendHandle;
 use std::path::PathBuf;
 use std::slice;
 use std::sync::LazyLock;

@@ -22,6 +22,13 @@ use std::os::fd::{BorrowedFd, FromRawFd};
 use std::os::windows::io::{AsRawHandle, BorrowedHandle, FromRawHandle};
 #[cfg(windows)]
 use std::path::PathBuf;
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+#[cfg(windows)]
+use windows_sys::Win32::System::Console::{
+    GetConsoleMode, GetConsoleScreenBufferInfo, GetStdHandle, CONSOLE_MODE,
+    CONSOLE_SCREEN_BUFFER_INFO, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+};
 use std::sync::atomic::AtomicI32;
 use std::sync::{Arc, Mutex};
 #[cfg(windows)]
@@ -38,9 +45,8 @@ use super::{Error, Vmm};
 #[cfg(target_arch = "x86_64")]
 use crate::device_manager::legacy::PortIODeviceManager;
 use crate::device_manager::mmio::MMIODeviceManager;
-use crate::resources::{
-    DefaultVirtioConsoleConfig, PortConfig, TsiFlags, VirtioConsoleConfigMode, VmResources,
-};
+use crate::resources::{DefaultVirtioConsoleConfig, PortConfig, VirtioConsoleConfigMode};
+use crate::resources::{TsiFlags, VmResources};
 use crate::vmm_config::external_kernel::{ExternalKernel, KernelFormat};
 #[cfg(feature = "net")]
 use crate::vmm_config::net::NetBuilder;
@@ -200,6 +206,8 @@ pub enum StartMicrovmError {
     OpenBlockDevice(io::Error),
     /// Cannot open console output file.
     OpenConsoleFile(io::Error),
+    /// Failed to set up a console port (e.g. handle duplication).
+    ConsolePortSetup(io::Error),
     /// The GZIP decoder couldn't decompress the kernel.
     PeGzDecoder(io::Error),
     /// Cannot open the file containing the kernel code.
@@ -384,6 +392,9 @@ impl Display for StartMicrovmError {
                 err_msg = err_msg.replace('\"', "");
 
                 write!(f, "Cannot open the console output file. {err_msg}")
+            }
+            ConsolePortSetup(ref err) => {
+                write!(f, "Failed to set up console port: {err}")
             }
             PeGzDecoder(ref err) => {
                 write!(f, "The GZIP decoder couldn't decompress the kernel. {err}")
@@ -764,18 +775,38 @@ pub fn build_microvm(
 
     #[cfg(unix)]
     for s in &vm_resources.serial_consoles {
-        let input: Option<Box<dyn devices::legacy::ReadableFd + Send>> = if s.input_fd >= 0 {
+        #[cfg(unix)]
+        let has_input = s.input_fd >= 0;
+        #[cfg(windows)]
+        let has_input = !s.input_handle.as_raw_handle().is_null();
+
+        let input: Option<Box<dyn devices::legacy::ReadableFd + Send>> = if has_input {
+            #[cfg(unix)]
             let file = unsafe { File::from_raw_fd(s.input_fd) };
+            #[cfg(windows)]
+            let file = unsafe { File::from_raw_handle(s.input_handle.as_raw_handle()) };
             if file.is_terminal() {
+                #[cfg(unix)]
                 serial_ttys.push(unsafe { BorrowedFd::borrow_raw(file.as_raw_fd()) });
+                #[cfg(windows)]
+                serial_ttys.push(unsafe { BorrowedHandle::borrow_raw(file.as_raw_handle()) });
             }
             Some(Box::new(file))
         } else {
             None
         };
 
-        let output: Option<Box<dyn io::Write + Send>> = if s.output_fd >= 0 {
-            Some(Box::new(unsafe { File::from_raw_fd(s.output_fd) }))
+        #[cfg(unix)]
+        let has_output = s.output_fd >= 0;
+        #[cfg(windows)]
+        let has_output = !s.output_handle.as_raw_handle().is_null();
+
+        let output: Option<Box<dyn io::Write + Send>> = if has_output {
+            #[cfg(unix)]
+            let file = unsafe { File::from_raw_fd(s.output_fd) };
+            #[cfg(windows)]
+            let file = unsafe { File::from_raw_handle(s.output_handle.as_raw_handle()) };
+            Some(Box::new(file))
         } else {
             None
         };
@@ -2107,7 +2138,6 @@ fn create_vcpus_x86_64_whp(
 /// so that AP vCPUs idle in real mode until the BSP sends INIT + SIPI.
 #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
 fn write_ap_trampoline(guest_mem: &GuestMemoryMmap) {
-    use arch::x86_64::layout::AP_TRAMPOLINE_START;
     const AP_IDLE_CODE: [u8; 4] = [
         0xFA, // cli
         0xF4, // hlt
@@ -2681,6 +2711,97 @@ fn attach_console_devices(
         .map_err(RegisterConsoleDevice)?;
 
     Ok(())
+}
+
+#[cfg(windows)]
+fn attach_console_devices(
+    vmm: &mut Vmm,
+    event_manager: &mut EventManager,
+    intc: IrqChip,
+    vm_resources: &VmResources,
+    cfg: Option<&VirtioConsoleConfigMode>,
+    id_number: u32,
+) -> std::result::Result<(), StartMicrovmError> {
+    use self::StartMicrovmError::*;
+
+    let creating_implicit_console = cfg.is_none();
+
+    let (ports, console_reader) = match cfg {
+        None => autoconfigure_console_ports(vmm, vm_resources, None, creating_implicit_console)?,
+        Some(VirtioConsoleConfigMode::Autoconfigure(autocfg)) => {
+            autoconfigure_console_ports(vmm, vm_resources, Some(autocfg), creating_implicit_console)?
+        }
+        Some(VirtioConsoleConfigMode::Explicit(ports)) => create_explicit_ports(vmm, ports)?,
+    };
+
+    let console = Arc::new(Mutex::new(devices::virtio::Console::new(ports).unwrap()));
+    vmm.exit_observers.push(console.clone());
+    event_manager
+        .add_subscriber(console.clone())
+        .map_err(RegisterEvent)?;
+
+    let sigwinch_evt = console
+        .lock()
+        .unwrap()
+        .try_clone_sigwinch_evt()
+        .map_err(|e| RegisterConsoleDevice(e.into()))?;
+
+    if let Some(reader) = console_reader {
+        reader.start(sigwinch_evt).map_err(ConsolePortSetup)?;
+    } else {
+        spawn_console_resize_monitor(sigwinch_evt);
+    }
+
+    // The device mutex mustn't be locked here otherwise it will deadlock.
+    attach_mmio_device(vmm, format!("hvc{id_number}"), intc, console)
+        .map_err(RegisterConsoleDevice)?;
+
+    Ok(())
+}
+
+/// Polls the console screen buffer for size changes at a fixed interval.
+///
+/// This is the fallback for when stdin is not a real console handle (e.g.
+/// piped or redirected), so `ConsoleInputReader` -- which gets resize
+/// notifications event-driven via `WINDOW_BUFFER_SIZE_EVENT` from
+/// `ReadConsoleInputW` -- cannot be used.  The output handle may still be
+/// a console, so we poll `GetConsoleScreenBufferInfo` on stdout instead.
+///
+/// 500 ms is a pragmatic trade-off: low CPU overhead at the cost of up to
+/// half a second of resize latency.
+#[cfg(windows)]
+fn spawn_console_resize_monitor(sigwinch_evt: EventFd) {
+    std::thread::Builder::new()
+        .name("console-resize".into())
+        .spawn(move || {
+            let stdout_h = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
+
+            let query_size = |h| -> Option<(i16, i16)> {
+                let mut info: CONSOLE_SCREEN_BUFFER_INFO = unsafe { std::mem::zeroed() };
+                if unsafe { GetConsoleScreenBufferInfo(h, &mut info) } == 0 {
+                    return None;
+                }
+                Some((
+                    info.srWindow.Right - info.srWindow.Left + 1,
+                    info.srWindow.Bottom - info.srWindow.Top + 1,
+                ))
+            };
+
+            let (mut last_cols, mut last_rows) = query_size(stdout_h).unwrap_or((0, 0));
+
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+
+                if let Some((cols, rows)) = query_size(stdout_h) {
+                    if cols != last_cols || rows != last_rows {
+                        last_cols = cols;
+                        last_rows = rows;
+                        let _ = sigwinch_evt.write(1);
+                    }
+                }
+            }
+        })
+        .expect("spawn console-resize monitor thread");
 }
 
 #[cfg(feature = "net")]

@@ -311,7 +311,15 @@ impl VmResources {
 
     pub fn set_kernel_bundle(&mut self, kernel_bundle: KernelBundle) -> Result<KernelBundleError> {
         // Safe because this call just returns the page size and doesn't have any side effects.
+        #[cfg(unix)]
         let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize };
+        #[cfg(windows)]
+        let page_size = {
+            use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
+            let mut si: SYSTEM_INFO = unsafe { std::mem::zeroed() };
+            unsafe { GetSystemInfo(&mut si) };
+            si.dwPageSize as usize
+        };
 
         if kernel_bundle.host_addr == 0 || (kernel_bundle.host_addr as usize) & (page_size - 1) != 0
         {

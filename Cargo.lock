@@ -77,32 +77,7 @@ dependencies = [
 name = "anyhow"
 version = "1.0.102"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-<<<<<<< HEAD
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
-=======
-checksum = "e16d2d3311acee920a9eb8d33b8cbc1787ce4a264e85f964c2404b969bdcd487"
-
-[[package]]
-name = "arch"
-version = "0.1.0"
-dependencies = [
- "arch_gen",
- "kvm-bindings",
- "kvm-ioctls",
- "libc",
- "smbios",
- "tdx",
- "utils",
- "vm-memory",
- "vmm-sys-util 0.14.0",
- "whp",
- "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "arch_gen"
-version = "0.1.0"
->>>>>>> ba70cfca (whp: add safe Rust wrappers around the Windows Hypervisor Platform API)
 
 [[package]]
 name = "async-trait"
@@ -353,8 +328,6 @@ dependencies = [
 ]
 
 [[package]]
-<<<<<<< HEAD
-=======
 name = "devices"
 version = "0.1.0"
 dependencies = [
@@ -383,11 +356,11 @@ dependencies = [
  "vm-fdt",
  "vm-memory",
  "whp",
+ "windows-sys 0.61.2",
  "zerocopy",
 ]
 
 [[package]]
->>>>>>> ba70cfca (whp: add safe Rust wrappers around the Windows Hypervisor Platform API)
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -954,7 +927,12 @@ dependencies = [
  "nitro-enclaves 0.5.0",
  "once_cell",
  "vm-memory",
+<<<<<<< HEAD
  "windows-sys",
+=======
+ "vmm",
+ "windows-sys 0.61.2",
+>>>>>>> f56a7e27 (console: add Windows console and terminal I/O support)
 ]
 
 [[package]]
@@ -1698,8 +1676,6 @@ dependencies = [
 ]
 
 [[package]]
-<<<<<<< HEAD
-=======
 name = "vmm"
 version = "0.1.0"
 dependencies = [
@@ -1737,7 +1713,6 @@ dependencies = [
 ]
 
 [[package]]
->>>>>>> ba70cfca (whp: add safe Rust wrappers around the Windows Hypervisor Platform API)
 name = "vmm-sys-util"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1831,45 +1806,11 @@ dependencies = [
 ]
 
 [[package]]
-<<<<<<< HEAD
-name = "wasm-encoder"
-version = "0.244.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "990065f2fe63003fe337b932cfb5e3b80e0b4d0f5ff650e6985b1048f62c8319"
-dependencies = [
- "leb128fmt",
- "wasmparser",
-]
-
-[[package]]
-name = "wasm-metadata"
-version = "0.244.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bb0e353e6a2fbdc176932bbaab493762eb1255a7900fe0fea1a2f96c296cc909"
-dependencies = [
- "anyhow",
- "indexmap",
- "wasm-encoder",
- "wasmparser",
-]
-
-[[package]]
-name = "wasmparser"
-version = "0.244.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "47b807c72e1bac69382b3a6fb3dbe8ea4c0ed87ff5629b8685ae6b9a611028fe"
-dependencies = [
- "bitflags 2.11.0",
- "hashbrown 0.15.5",
- "indexmap",
- "semver",
-=======
 name = "whp"
 version = "0.1.0"
 dependencies = [
  "log",
  "windows-sys 0.61.2",
->>>>>>> ba70cfca (whp: add safe Rust wrappers around the Windows Hypervisor Platform API)
 ]
 
 [[package]]
