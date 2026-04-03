@@ -12,3 +12,21 @@ pub type RawFd = HANDLE;
 pub trait AsRawFd {
     fn as_raw_fd(&self) -> RawFd;
 }
+
+/// A thin wrapper around a raw `HANDLE` that implements [`Send`].
+///
+/// Raw pointers do not implement `Send`, but Windows kernel handles are safe
+/// to use from any thread.  This wrapper lets closures capture a handle value
+/// without needing an `unsafe impl Send` on the closure itself.
+#[derive(Clone, Copy)]
+#[repr(transparent)]
+pub struct SendHandle(pub HANDLE);
+
+// SAFETY: Windows kernel object handles are process-wide and thread-safe.
+unsafe impl Send for SendHandle {}
+
+impl SendHandle {
+    pub fn as_raw_handle(self) -> HANDLE {
+        self.0
+    }
+}

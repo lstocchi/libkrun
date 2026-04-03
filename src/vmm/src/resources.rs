@@ -7,7 +7,10 @@
 use std::fs::File;
 #[cfg(feature = "tee")]
 use std::io::BufReader;
+#[cfg(unix)]
 use std::os::fd::RawFd;
+#[cfg(target_os = "windows")]
+use utils::windows::SendHandle;
 use std::path::PathBuf;
 
 #[cfg(feature = "tee")]
@@ -84,15 +87,30 @@ impl Default for TeeConfig {
     }
 }
 
+#[cfg(unix)]
 pub struct SerialConsoleConfig {
     pub input_fd: RawFd,
     pub output_fd: RawFd,
 }
 
+#[cfg(windows)]
+pub struct SerialConsoleConfig {
+    pub input_handle: SendHandle,
+    pub output_handle: SendHandle,
+}
+
+#[cfg(unix)]
 pub struct DefaultVirtioConsoleConfig {
     pub input_fd: RawFd,
     pub output_fd: RawFd,
     pub err_fd: RawFd,
+}
+
+#[cfg(windows)]
+pub struct DefaultVirtioConsoleConfig {
+    pub input_handle: SendHandle,
+    pub output_handle: SendHandle,
+    pub err_handle: SendHandle,
 }
 
 pub enum VirtioConsoleConfigMode {
@@ -100,6 +118,7 @@ pub enum VirtioConsoleConfigMode {
     Explicit(Vec<PortConfig>),
 }
 
+#[cfg(unix)]
 pub enum PortConfig {
     Tty {
         name: String,
@@ -109,6 +128,19 @@ pub enum PortConfig {
         name: String,
         input_fd: RawFd,
         output_fd: RawFd,
+    },
+}
+
+#[cfg(windows)]
+pub enum PortConfig {
+    Tty {
+        name: String,
+        tty_handle: SendHandle,
+    },
+    InOut {
+        name: String,
+        input_handle: SendHandle,
+        output_handle: SendHandle,
     },
 }
 
@@ -264,7 +296,15 @@ impl VmResources {
 
     pub fn set_kernel_bundle(&mut self, kernel_bundle: KernelBundle) -> Result<KernelBundleError> {
         // Safe because this call just returns the page size and doesn't have any side effects.
+        #[cfg(unix)]
         let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize };
+        #[cfg(windows)]
+        let page_size = {
+            use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
+            let mut si: SYSTEM_INFO = unsafe { std::mem::zeroed() };
+            unsafe { GetSystemInfo(&mut si) };
+            si.dwPageSize as usize
+        };
 
         if kernel_bundle.host_addr == 0 || (kernel_bundle.host_addr as usize) & (page_size - 1) != 0
         {
