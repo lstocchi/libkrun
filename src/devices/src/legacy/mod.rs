@@ -12,9 +12,11 @@ mod gicv3;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod hvfgicv3;
 mod i8042;
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 mod ioapic;
 mod irqchip;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+mod kvm_split_ioapic;
 #[cfg(all(target_os = "linux", target_arch = "riscv64"))]
 mod kvmaia;
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
@@ -25,6 +27,8 @@ mod kvmgicv3;
 mod kvmioapic;
 #[cfg(target_arch = "aarch64")]
 mod rtc_pl031;
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+mod whp_split_ioapic;
 #[cfg(target_os = "macos")]
 mod vcpu;
 #[cfg(target_arch = "x86_64")]
@@ -55,7 +59,7 @@ pub use self::hvfgicv3::HvfGicV3;
 pub use self::i8042::Error as I8042DeviceError;
 pub use self::i8042::I8042Device;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-pub use self::ioapic::IoApic;
+pub use self::kvm_split_ioapic::IoApic;
 #[cfg(any(test, feature = "test_utils"))]
 pub use self::irqchip::test_utils::DummyIrqChip;
 pub use self::irqchip::{IrqChip, IrqChipDevice, IrqChipT};
@@ -67,6 +71,8 @@ pub use self::kvmgicv2::KvmGicV2;
 pub use self::kvmgicv3::KvmGicV3;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub use self::kvmioapic::KvmIoapic;
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+pub use self::whp_split_ioapic::WhpIoapic;
 #[cfg(target_arch = "aarch64")]
 pub use self::rtc_pl031::RTC;
 pub use self::serial::Serial;
@@ -77,8 +83,14 @@ pub use self::vcpu::VcpuList;
 // which is a composition of the desired bounds. In this case, io::Read and AsRawFd.
 // Run `rustc --explain E0225` for more details.
 /// Trait that composes the `std::io::Read` and `std::os::unix::io::AsRawFd` traits.
+#[cfg(unix)]
 pub trait ReadableFd: std::io::Read + std::os::fd::AsRawFd {}
+#[cfg(unix)]
+impl ReadableFd for std::fs::File {}
 
+#[cfg(windows)]
+pub trait ReadableFd: std::io::Read + Send {}
+#[cfg(windows)]
 impl ReadableFd for std::fs::File {}
 
 #[cfg(target_os = "linux")]

@@ -2,7 +2,10 @@ use std::cmp;
 use std::io::Write;
 use std::iter::zip;
 use std::mem::{size_of, size_of_val};
+#[cfg(unix)]
 use std::os::unix::io::{AsRawFd, RawFd};
+#[cfg(target_os = "windows")]
+use utils::windows::{AsRawFd, RawFd};
 use std::sync::Arc;
 
 use utils::eventfd::EventFd;
@@ -114,6 +117,10 @@ impl Console {
 
     pub fn get_sigwinch_fd(&self) -> RawFd {
         self.sigwinch_evt.as_raw_fd()
+    }
+
+    pub fn try_clone_sigwinch_evt(&self) -> Result<EventFd, std::io::Error> {
+        self.sigwinch_evt.try_clone()
     }
 
     pub fn update_console_size(&mut self, port_id: u32, cols: u16, rows: u16) {

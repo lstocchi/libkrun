@@ -5,21 +5,30 @@
 use std::result;
 
 use arch_gen::x86::msr_index::*;
-use kvm_bindings::{kvm_msr_entry, MsrList, Msrs};
-use kvm_ioctls::{Kvm, VcpuFd};
 
 #[derive(Debug)]
 /// MSR related errors.
 pub enum Error {
+    #[cfg(target_os = "linux")]
     /// Getting supported MSRs failed.
     GetSupportedModelSpecificRegisters(kvm_ioctls::Error),
+    #[cfg(target_os = "linux")]
     /// Setting up MSRs failed.
     SetModelSpecificRegisters(kvm_ioctls::Error),
     /// Failed to set all MSRs.
     SetModelSpecificRegistersCount,
+    #[cfg(target_os = "windows")]
+    /// Setting up MSRs via WHP failed.
+    SetMsrsWhp(whp::Error),
 }
 
 type Result<T> = result::Result<T, Error>;
+
+// Re-export platform-specific MSR setup functions.
+#[cfg(target_os = "linux")]
+pub use super::linux::msr::*;
+#[cfg(target_os = "windows")]
+pub use super::windows::msr::*;
 
 /// MSR range
 struct MsrRange {
@@ -187,77 +196,28 @@ pub const MTRR_ENABLE: u64 = 0x800;
 /// Mem type WB
 pub const MTRR_MEM_TYPE_WB: u64 = 0x6;
 
-// Creates and populates required MSR entries for booting Linux on X86_64.
-fn create_boot_msr_entries() -> Vec<kvm_msr_entry> {
-    let msr_entry_default = |msr| kvm_msr_entry {
-        index: msr,
-        data: 0x0,
-        ..Default::default()
-    };
-
+/// Returns the boot MSR entries as hypervisor-agnostic (index, value) pairs.
+pub fn boot_msr_entries() -> Vec<(u32, u64)> {
     vec![
-        msr_entry_default(MSR_IA32_SYSENTER_CS),
-        msr_entry_default(MSR_IA32_SYSENTER_ESP),
-        msr_entry_default(MSR_IA32_SYSENTER_EIP),
+        (MSR_IA32_SYSENTER_CS, 0x0),
+        (MSR_IA32_SYSENTER_ESP, 0x0),
+        (MSR_IA32_SYSENTER_EIP, 0x0),
         // x86_64 specific msrs, we only run on x86_64 not x86.
-        msr_entry_default(MSR_STAR),
-        msr_entry_default(MSR_CSTAR),
-        msr_entry_default(MSR_KERNEL_GS_BASE),
-        msr_entry_default(MSR_SYSCALL_MASK),
-        msr_entry_default(MSR_LSTAR),
+        (MSR_STAR, 0x0),
+        (MSR_CSTAR, 0x0),
+        (MSR_KERNEL_GS_BASE, 0x0),
+        (MSR_SYSCALL_MASK, 0x0),
+        (MSR_LSTAR, 0x0),
         // end of x86_64 specific code
-        msr_entry_default(MSR_IA32_TSC),
-        kvm_msr_entry {
-            index: MSR_IA32_MISC_ENABLE,
-            data: u64::from(MSR_IA32_MISC_ENABLE_FAST_STRING),
-            ..Default::default()
-        },
-        kvm_msr_entry {
-            index: MSR_MTRRdefType,
-            data: (MTRR_ENABLE | MTRR_MEM_TYPE_WB),
-            ..Default::default()
-        },
+        (MSR_IA32_TSC, 0x0),
+        (MSR_IA32_MISC_ENABLE, u64::from(MSR_IA32_MISC_ENABLE_FAST_STRING)),
+        (MSR_MTRRdefType, MTRR_ENABLE | MTRR_MEM_TYPE_WB),
     ]
-}
-
-/// Configure Model Specific Registers (MSRs) required to boot Linux for a given x86_64 vCPU.
-///
-/// # Arguments
-///
-/// * `vcpu` - Structure for the VCPU that holds the VCPU's fd.
-pub fn setup_msrs(vcpu: &VcpuFd) -> Result<()> {
-    let entry_vec = create_boot_msr_entries();
-    let msrs = Msrs::from_entries(&entry_vec).unwrap();
-    vcpu.set_msrs(&msrs)
-        .map_err(Error::SetModelSpecificRegisters)
-        .and_then(|msrs_written| {
-            if msrs_written as u32 != msrs.as_fam_struct_ref().nmsrs {
-                Err(Error::SetModelSpecificRegistersCount)
-            } else {
-                Ok(())
-            }
-        })
-}
-
-/// Returns the list of supported, serializable MSRs.
-///
-/// # Arguments
-///
-/// * `kvm_fd` - Structure that holds the KVM's fd.
-pub fn supported_guest_msrs(kvm_fd: &Kvm) -> Result<MsrList> {
-    let mut msr_list = kvm_fd
-        .get_msr_index_list()
-        .map_err(Error::GetSupportedModelSpecificRegisters)?;
-
-    msr_list.retain(|msr_index| msr_should_serialize(*msr_index));
-
-    Ok(msr_list)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kvm_ioctls::Kvm;
 
     #[test]
     fn test_msr_whitelist() {
@@ -267,34 +227,5 @@ mod tests {
                 assert_eq!(msr_should_serialize(msr), should);
             }
         }
-    }
-
-    #[test]
-    #[allow(clippy::cast_ptr_alignment)]
-    fn test_setup_msrs() {
-        let kvm = Kvm::new().unwrap();
-        let vm = kvm.create_vm().unwrap();
-        let vcpu = vm.create_vcpu(0).unwrap();
-        setup_msrs(&vcpu).unwrap();
-
-        // This test will check against the last MSR entry configured (the tenth one).
-        // See create_msr_entries() for details.
-        let test_kvm_msrs_entry = [kvm_msr_entry {
-            index: MSR_IA32_MISC_ENABLE,
-            ..Default::default()
-        }];
-        let mut kvm_msrs_wrapper = Msrs::from_entries(&test_kvm_msrs_entry).unwrap();
-
-        // Get_msrs() returns the number of msrs that it succeed in reading.
-        // We only want to read one in this test case scenario.
-        let read_nmsrs = vcpu.get_msrs(&mut kvm_msrs_wrapper).unwrap();
-        // Validate it only read one.
-        assert_eq!(read_nmsrs, 1);
-
-        // Official entries that were setup when we did setup_msrs. We need to assert that the
-        // tenth one (i.e the one with index MSR_IA32_MISC_ENABLE has the data we
-        // expect.
-        let entry_vec = create_boot_msr_entries();
-        assert_eq!(entry_vec[9], kvm_msrs_wrapper.as_slice()[0]);
     }
 }
