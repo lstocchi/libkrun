@@ -13,6 +13,8 @@ use std::io::{self, Write};
 use std::os::linux::fs::MetadataExt;
 #[cfg(target_os = "macos")]
 use std::os::macos::fs::MetadataExt;
+#[cfg(target_os = "windows")]
+use std::os::windows::fs::MetadataExt;
 use std::path::PathBuf;
 use std::result;
 use std::sync::{Arc, Mutex};
@@ -109,11 +111,18 @@ impl DiskProperties {
     fn build_device_id(disk_file: &File) -> result::Result<String, Error> {
         let blk_metadata = disk_file.metadata().map_err(Error::GetFileMetadata)?;
         // This is how kvmtool does it.
+        #[cfg(unix)]
         let device_id = format!(
             "{}{}{}",
             blk_metadata.st_dev(),
             blk_metadata.st_rdev(),
             blk_metadata.st_ino()
+        );
+        #[cfg(windows)]
+        let device_id = format!(
+            "{}{}",
+            blk_metadata.volume_serial_number().unwrap_or(0),
+            blk_metadata.file_index().unwrap_or(0)
         );
         Ok(device_id)
     }
