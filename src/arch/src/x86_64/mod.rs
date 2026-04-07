@@ -15,6 +15,10 @@ mod mptable;
 pub mod linux;
 #[cfg(target_os = "windows")]
 pub mod windows;
+#[cfg(target_os = "windows")]
+use std::mem::MaybeUninit;
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
 
 /// Logic for configuring x86_64 model specific registers (MSRs).
 pub mod msr;
@@ -82,6 +86,7 @@ pub enum Error {
 fn get_page_size() -> usize {
     unsafe { libc::sysconf(libc::_SC_PAGESIZE).try_into().unwrap() }
 }
+
 #[cfg(windows)]
 fn get_page_size() -> usize {
     let sysinfo = unsafe {
@@ -89,7 +94,6 @@ fn get_page_size() -> usize {
         GetSystemInfo(info.as_mut_ptr());
         info.assume_init()
     };
-
     sysinfo.dwPageSize as usize
 }
 
