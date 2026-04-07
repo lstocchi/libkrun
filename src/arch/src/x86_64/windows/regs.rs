@@ -118,7 +118,7 @@ pub fn setup_sregs(mem: &GuestMemoryMmap, vcpu: &whp::WhpVcpu) -> Result<()> {
         s.Base = seg.base;
         s.Limit = seg.limit;
         s.Selector = seg.selector;
-        s.Anonymous._bitfield = (seg.type_ as u16)
+        s.Anonymous.Anonymous._bitfield = (seg.type_ as u16)
             | ((seg.s as u16) << 4)
             | ((seg.dpl as u16) << 5)
             | ((seg.present as u16) << 7)
@@ -204,10 +204,8 @@ fn setup_ap_segments(vcpu: &whp::WhpVcpu) -> Result<()> {
     let mut values: [WHV_REGISTER_VALUE; 1] = unsafe { std::mem::zeroed() };
     vcpu.get_registers(&names, &mut values)
         .map_err(Error::GetWhpRegisters)?;
-    unsafe {
-        values[0].Segment.Base = 0;
-        values[0].Segment.Selector = 0;
-    }
+    values[0].Segment.Base = 0;
+    values[0].Segment.Selector = 0;    
     vcpu.set_registers(&names, &values)
         .map_err(Error::SetWhpRegisters)
 }

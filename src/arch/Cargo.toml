@@ -29,6 +29,7 @@ whp = { path = "../whp" }
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_System_Hypervisor",
+    "Win32_System_SystemInformation",
 ] }
 
 [dev-dependencies]
