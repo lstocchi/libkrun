@@ -19,16 +19,20 @@ use windows_sys::Win32::System::Hypervisor::{
     WHvEmulatorCreateEmulator, WHvEmulatorDestroyEmulator, WHvEmulatorTryIoEmulation,
     WHvEmulatorTryMmioEmulation, WHvGetCapability, WHvGetVirtualProcessorRegisters,
     WHvMapGpaRange, WHvMapGpaRangeFlagExecute, WHvMapGpaRangeFlagRead, WHvMapGpaRangeFlagWrite,
-    WHvPartitionPropertyCodeCpuidExitList, WHvPartitionPropertyCodeLocalApicEmulationMode,
+    WHV_X64_CPUID_RESULT, WHvPartitionPropertyCodeCpuidExitList,
+    WHvPartitionPropertyCodeCpuidResultList, WHvPartitionPropertyCodeExtendedVmExits,
+    WHvPartitionPropertyCodeLocalApicEmulationMode,
     WHvPartitionPropertyCodeProcessorCount, WHvRequestInterrupt, WHvRunVirtualProcessor,
     WHvRunVpExitReasonCanceled, WHvRunVpExitReasonInvalidVpRegisterValue,
     WHvRunVpExitReasonMemoryAccess, WHvRunVpExitReasonUnrecoverableException,
     WHvRunVpExitReasonUnsupportedFeature, WHvRunVpExitReasonX64Cpuid,
     WHvRunVpExitReasonX64Halt, WHvRunVpExitReasonX64IoPortAccess,
-    WHvRunVpExitReasonX64MsrAccess, WHvSetPartitionProperty, WHvSetVirtualProcessorRegisters,
+    WHvRunVpExitReasonX64InterruptWindow, WHvRunVpExitReasonX64MsrAccess,
+    WHvSetPartitionProperty, WHvSetVirtualProcessorRegisters,
     WHvSetupPartition, WHvX64LocalApicEmulationModeXApic, WHvX64RegisterRax,
     WHvX64RegisterRbx, WHvX64RegisterRcx, WHvX64RegisterRdx, WHvX64RegisterRip,
 };
+use windows_sys::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 
 #[derive(Debug)]
 pub enum Error {
@@ -193,21 +197,32 @@ pub struct MsrExitInfo {
 pub struct HyperVState {
     /// `HV_X64_MSR_GUEST_OS_ID` — the guest identifies itself to the hypervisor.
     guest_os_id: AtomicU64,
-    /// GPA of the Hyper-V Reference TSC Page, or `None` if not yet enabled.
-    tsc_reference_gpa: Mutex<Option<u64>>,
+    /// Raw value last written to `HV_X64_MSR_REFERENCE_TSC` (bit 0 = enable,
+    /// bits 12:63 = page frame number).
+    tsc_reference_msr: AtomicU64,
     /// Host TSC value captured at VM creation (for TSC page calibration).
     vm_start_tsc: u64,
     /// Host monotonic instant captured at VM creation (for `TIME_REF_COUNT`).
     vm_start_instant: Instant,
+    /// Host TSC frequency in Hz, used for time conversions.
+    tsc_freq_hz: u64,
+    /// Synthetic timer 0 config (direct mode, vector, enable, periodic).
+    stimer0_config: AtomicU64,
+    /// Synthetic timer 0 count — absolute expiration in 100 ns units (one-shot)
+    /// or period (periodic).  0 means disarmed.
+    stimer0_count: AtomicU64,
 }
 
 impl HyperVState {
-    fn new() -> Self {
+    fn new(tsc_freq_hz: u64) -> Self {
         Self {
             guest_os_id: AtomicU64::new(0),
-            tsc_reference_gpa: Mutex::new(None),
+            tsc_reference_msr: AtomicU64::new(0),
             vm_start_tsc: unsafe { core::arch::x86_64::_rdtsc() },
             vm_start_instant: Instant::now(),
+            tsc_freq_hz,
+            stimer0_config: AtomicU64::new(0),
+            stimer0_count: AtomicU64::new(0),
         }
     }
 
@@ -219,12 +234,12 @@ impl HyperVState {
         self.guest_os_id.store(val, Ordering::Relaxed);
     }
 
-    pub fn tsc_reference_gpa(&self) -> Option<u64> {
-        *self.tsc_reference_gpa.lock().unwrap()
+    pub fn tsc_reference_msr(&self) -> u64 {
+        self.tsc_reference_msr.load(Ordering::Relaxed)
     }
 
-    pub fn set_tsc_reference_gpa(&self, gpa: Option<u64>) {
-        *self.tsc_reference_gpa.lock().unwrap() = gpa;
+    pub fn set_tsc_reference_msr(&self, val: u64) {
+        self.tsc_reference_msr.store(val, Ordering::Relaxed);
     }
 
     pub fn vm_start_tsc(&self) -> u64 {
@@ -233,6 +248,36 @@ impl HyperVState {
 
     pub fn vm_start_instant(&self) -> Instant {
         self.vm_start_instant
+    }
+
+    pub fn tsc_freq_hz(&self) -> u64 {
+        self.tsc_freq_hz
+    }
+
+    pub fn stimer0_config(&self) -> u64 {
+        self.stimer0_config.load(Ordering::Relaxed)
+    }
+
+    pub fn set_stimer0_config(&self, val: u64) {
+        self.stimer0_config.store(val, Ordering::Relaxed);
+    }
+
+    pub fn stimer0_count(&self) -> u64 {
+        self.stimer0_count.load(Ordering::Relaxed)
+    }
+
+    pub fn set_stimer0_count(&self, val: u64) {
+        self.stimer0_count.store(val, Ordering::Relaxed);
+    }
+
+    /// Compute the Hyper-V reference time counter (100 ns units) from the
+    /// current host TSC.
+    pub fn reference_time(&self) -> u64 {
+        let elapsed_tsc = unsafe { core::arch::x86_64::_rdtsc() } - self.vm_start_tsc;
+        if self.tsc_freq_hz == 0 {
+            return 0;
+        }
+        ((elapsed_tsc as u128) * 10_000_000 / self.tsc_freq_hz as u128) as u64
     }
 }
 
@@ -296,8 +341,9 @@ impl WhpVm {
             h
         };
 
-        let result = Self::configure_partition(handle, vcpu_count);
-        if let Err(e) = result {
+        let tsc_freq_hz = Self::detect_tsc_frequency();
+
+        if let Err(e) = Self::configure_partition(handle, vcpu_count, tsc_freq_hz) {
             let _ = unsafe { WHvDeletePartition(handle) };
             return Err(e);
         }
@@ -305,11 +351,15 @@ impl WhpVm {
         debug!("WHP partition created with {vcpu_count} vCPU(s)");
         Ok(WhpVm {
             handle,
-            hyperv: HyperVState::new(),
+            hyperv: HyperVState::new(tsc_freq_hz),
         })
     }
 
-    fn configure_partition(handle: WHV_PARTITION_HANDLE, vcpu_count: u32) -> Result<(), Error> {
+    fn configure_partition(
+        handle: WHV_PARTITION_HANDLE,
+        vcpu_count: u32,
+        tsc_freq_hz: u64,
+    ) -> Result<(), Error> {
         Self::set_property(handle, WHvPartitionPropertyCodeProcessorCount, |p| {
             p.ProcessorCount = vcpu_count;
         })?;
@@ -322,12 +372,118 @@ impl WhpVm {
             },
         )?;
 
-        // Intercept Hyper-V enlightenment CPUID leaves so we can present
-        // synthetic hypervisor identity and feature flags to the guest.
-        let cpuid_exit_list: [u32; 6] = [
-            0x40000000, 0x40000001, 0x40000002,
-            0x40000003, 0x40000004, 0x40000005,
-        ];
+        // Enable CPUID exits (bit 0) and MSR exits (bit 1) so the
+        // CpuidExitList/Hyper-V MSR interception work.
+        // https://github.com/google/crosvm/blob/main/hypervisor/src/whpx/whpx_sys/WinHvPlatformDefs.h#L74
+        Self::set_property(handle, WHvPartitionPropertyCodeExtendedVmExits, |p| unsafe {
+            p.ExtendedVmExits.AsUINT64 = 0b11; // bit 0 = X64CpuidExit, bit 1 = X64MsrExit
+        })?;
+
+        let mut cpuid_results: Vec<WHV_X64_CPUID_RESULT> = Vec::new();
+
+        // ── Hyper-V enlightenment leaves ──
+        // WHP does NOT expose Hyper-V CPUID to the guest automatically;
+        // we must provide 0x40000000+ via CpuidResultList.  WHP handles
+        // the underlying MSRs (SynIC, stimers, reference TSC) internally.
+
+        // 0x40000000 — Hypervisor signature: "Microsoft Hv"
+        cpuid_results.push(WHV_X64_CPUID_RESULT {
+            Function: 0x40000000,
+            Reserved: [0; 3],
+            Eax: 0x40000006,
+            Ebx: 0x7263694D, // "Micr"
+            Ecx: 0x666F736F, // "osof"
+            Edx: 0x76482074, // "t Hv"
+        });
+
+        // 0x40000001 — Interface identification: "Hv#1"
+        cpuid_results.push(WHV_X64_CPUID_RESULT {
+            Function: 0x40000001,
+            Reserved: [0; 3],
+            Eax: 0x31237648, // "Hv#1"
+            Ebx: 0,
+            Ecx: 0,
+            Edx: 0,
+        });
+
+        // 0x40000002 — Version (minimal)
+        cpuid_results.push(WHV_X64_CPUID_RESULT {
+            Function: 0x40000002,
+            Reserved: [0; 3],
+            Eax: 0,
+            Ebx: 0x000A_0000, // version 10.0
+            Ecx: 0,
+            Edx: 0,
+        });
+
+        // 0x40000003 — Feature identification (Hyper-V TLFS §2.4)
+        //   EAX: partition privilege flags
+        //   EDX: misc features
+        const ACCESS_VP_RUNTIME: u32 = 1 << 0;
+        const ACCESS_REF_COUNTER: u32 = 1 << 1;
+        const ACCESS_SYNIC_REGS: u32 = 1 << 2;
+        const ACCESS_STIMER: u32 = 1 << 3;
+        const ACCESS_VP_INDEX: u32 = 1 << 6;
+        const ACCESS_REF_TSC: u32 = 1 << 9;
+        const ACCESS_FREQ_REGS: u32 = 1 << 11;
+
+        const DIRECT_TIMER_MODE: u32 = 1 << 19;
+
+        cpuid_results.push(WHV_X64_CPUID_RESULT {
+            Function: 0x40000003,
+            Reserved: [0; 3],
+            Eax: ACCESS_VP_RUNTIME
+                | ACCESS_REF_COUNTER
+                | ACCESS_SYNIC_REGS
+                | ACCESS_STIMER
+                | ACCESS_VP_INDEX
+                | ACCESS_REF_TSC
+                | ACCESS_FREQ_REGS,
+            Ebx: 0,
+            Ecx: 0,
+            Edx: DIRECT_TIMER_MODE,
+        });
+
+        // 0x40000004 — Recommendations
+        cpuid_results.push(WHV_X64_CPUID_RESULT {
+            Function: 0x40000004,
+            Reserved: [0; 3],
+            Eax: 1 << 5, // RelaxedTiming
+            Ebx: 0,
+            Ecx: 0,
+            Edx: 0,
+        });
+
+        // 0x40000005 — Implementation limits
+        cpuid_results.push(WHV_X64_CPUID_RESULT {
+            Function: 0x40000005,
+            Reserved: [0; 3],
+            Eax: 64, // max virtual processors
+            Ebx: 0,
+            Ecx: 0,
+            Edx: 0,
+        });
+
+        // ── Standard Intel CPUID leaves (SDM Vol. 2A) ──
+        if tsc_freq_hz > 0 {
+            debug!("Providing TSC frequency to guest: {} Hz", tsc_freq_hz);
+
+            // CPUID 0x15 — TSC / Core Crystal Clock (Intel SDM)
+            // TSC frequency in Hz = ECX * (EBX / EAX).
+            // We use a 1 Hz crystal with EBX = tsc_freq_hz to avoid rounding.
+            cpuid_results.push(WHV_X64_CPUID_RESULT {
+                Function: 0x15,
+                Reserved: [0; 3],
+                Eax: 1,
+                Ebx: tsc_freq_hz as u32,
+                Ecx: 1,
+                Edx: 0,
+            });
+        }
+
+        // Force CPUID leaf 1 to exit so we can set the hypervisor-present
+        // bit (ECX.31).  Without it the guest ignores 0x40000000+ leaves.
+        let cpuid_exit_list: [u32; 1] = [1];
         let hr = unsafe {
             WHvSetPartitionProperty(
                 handle,
@@ -337,8 +493,23 @@ impl WhpVm {
             )
         };
         if hr != S_OK {
+            error!("CpuidExitList failed: HRESULT 0x{hr:08x}");
             return Err(Error::SetPartitionProperty(hr));
         }
+
+        let hr = unsafe {
+            WHvSetPartitionProperty(
+                handle,
+                WHvPartitionPropertyCodeCpuidResultList,
+                cpuid_results.as_ptr() as *const _,
+                (cpuid_results.len() * mem::size_of::<WHV_X64_CPUID_RESULT>()) as u32,
+            )
+        };
+        if hr != S_OK {
+            error!("CpuidResultList failed: HRESULT 0x{hr:08x}");
+            return Err(Error::SetPartitionProperty(hr));
+        }
+        debug!("CpuidResultList set ({} entries)", cpuid_results.len());
 
         let hr = unsafe { WHvSetupPartition(handle) };
         if hr != S_OK {
@@ -370,10 +541,67 @@ impl WhpVm {
         }
     }
 
+    /// Detect the host TSC frequency in Hz.
+    /// Tries CPUID 0x15, then 0x16 (Intel), then falls back to measuring
+    /// via RDTSC over a short sleep (works on AMD and all other x86_64).
+    fn detect_tsc_frequency() -> u64 {
+        unsafe {
+            let cpuid15 = core::arch::x86_64::__cpuid(0x15);
+            if cpuid15.eax != 0 && cpuid15.ebx != 0 && cpuid15.ecx != 0 {
+                let freq = (cpuid15.ecx as u64 * cpuid15.ebx as u64) / cpuid15.eax as u64;
+                debug!("TSC frequency from CPUID 0x15: {} Hz", freq);
+                return freq;
+            }
+
+            let cpuid16 = core::arch::x86_64::__cpuid(0x16);
+            if cpuid16.eax != 0 {
+                let freq = cpuid16.eax as u64 * 1_000_000;
+                debug!("TSC frequency from CPUID 0x16: {} Hz", freq);
+                return freq;
+            }
+        }
+
+        debug!("CPUID 0x15/0x16 unavailable, measuring TSC frequency via QPC");
+
+        let mut qpc_freq = 0;
+        let mut start_qpc = 0;
+        let mut end_qpc = 0;
+
+        unsafe {
+            QueryPerformanceFrequency(&mut qpc_freq);
+            QueryPerformanceCounter(&mut start_qpc);
+        }
+
+        let start_tsc = unsafe { core::arch::x86_64::_rdtsc() };
+
+        // Spin for ~10ms. Tight loops avoid OS scheduler suspension jitter.
+        let target_qpc = start_qpc + (qpc_freq / 100);
+        loop {
+            unsafe { QueryPerformanceCounter(&mut end_qpc) };
+            if end_qpc >= target_qpc {
+                break;
+            }
+        }
+
+        let end_tsc = unsafe { core::arch::x86_64::_rdtsc() };
+        let qpc_elapsed = end_qpc - start_qpc;
+
+        if qpc_elapsed > 0 {
+            let tsc_elapsed = end_tsc.wrapping_sub(start_tsc);
+            // Calculate utilizing u128 to prevent overflow before dividing
+            let freq = (tsc_elapsed as u128 * qpc_freq as u128 / qpc_elapsed as u128) as u64;
+            debug!("TSC frequency measured: {} Hz ({} MHz)", freq, freq / 1_000_000);
+            return freq;
+        }
+
+        error!("Could not determine TSC frequency");
+        0
+    }
+
     /// Maps a host memory region into the guest physical address space.
-    pub fn map_memory(
+    pub unsafe fn map_memory(
         &self,
-        host_addr: *const u8,
+        host_addr: *mut c_void,
         guest_addr: u64,
         size: u64,
     ) -> Result<(), Error> {
@@ -421,6 +649,25 @@ impl WhpVm {
             Err(Error::RequestInterrupt(hr))
         } else {
             Ok(())
+        }
+    }
+
+    /// Fire a fixed, edge-triggered interrupt to APIC ID 0 with the given vector.
+    pub fn inject_vector(&self, vector: u32) {
+        let ctrl = WhvInterruptControl {
+            type_and_flags: 0, // Fixed, Physical, Edge
+            destination: 0,
+            vector,
+        };
+        let hr = unsafe {
+            WHvRequestInterrupt(
+                self.handle,
+                &ctrl as *const _ as *const _,
+                mem::size_of::<WhvInterruptControl>() as u32,
+            )
+        };
+        if hr != S_OK {
+            error!("inject_vector(0x{vector:02x}) failed: HRESULT 0x{hr:08x}");
         }
     }
 
@@ -536,6 +783,7 @@ pub enum VcpuExitReason {
     Canceled,
     CpuidAccess,
     MsrAccess,
+    InterruptWindow,
     UnrecoverableException,
     InvalidVpRegisterValue,
     UnsupportedFeature,
@@ -620,6 +868,11 @@ impl WhpVcpu {
         }
     }
 
+    /// RIP at the time of the VM exit.
+    pub fn exit_rip(&self) -> u64 {
+        self.exit_context.VpContext.Rip
+    }
+
     /// Instruction length from the exit context (lower 4 bits of the packed byte).
     pub fn instruction_length(&self) -> u8 {
         self.exit_context.VpContext._bitfield & 0x0F
@@ -700,9 +953,9 @@ impl WhpVcpu {
     }
 
     pub fn get_reg64(&self, name: WHV_REGISTER_NAME) -> Result<u64, Error> {
-        let value: WHV_REGISTER_VALUE = unsafe { mem::zeroed() };
-        self.get_registers(&[name], &mut [value])?;
-        Ok(unsafe { value.Reg64 })
+        let mut values = [unsafe { mem::zeroed::<WHV_REGISTER_VALUE>() }];
+        self.get_registers(&[name], &mut values)?;
+        Ok(unsafe { values[0].Reg64 })
     }
 
     pub fn set_registers(
@@ -747,6 +1000,22 @@ impl WhpVcpu {
         self.index
     }
 
+    /// Clear the `HaltSuspend` flag so a halted vCPU can process a pending
+    /// interrupt.  `WHvRequestInterrupt` queues the interrupt in the LAPIC
+    /// but does **not** clear this flag, so the vCPU stays frozen in HLT
+    /// until we explicitly reset it.
+    pub fn clear_halt_suspend(&self) -> Result<(), Error> {
+        const WHV_REGISTER_INTERNAL_ACTIVITY_STATE: WHV_REGISTER_NAME = 0x00004004;
+        let mut values = [unsafe { mem::zeroed::<WHV_REGISTER_VALUE>() }];
+        self.get_registers(&[WHV_REGISTER_INTERNAL_ACTIVITY_STATE], &mut values)?;
+        let activity = unsafe { values[0].Reg64 };
+        if activity & 2 != 0 {
+            values[0].Reg64 = activity & !2;
+            self.set_registers(&[WHV_REGISTER_INTERNAL_ACTIVITY_STATE], &values)?;
+        }
+        Ok(())
+    }
+
     #[allow(non_upper_case_globals)]
     fn decode_reason(ctx: &WHV_RUN_VP_EXIT_CONTEXT) -> VcpuExitReason {
         match ctx.ExitReason {
@@ -756,6 +1025,7 @@ impl WhpVcpu {
             WHvRunVpExitReasonCanceled => VcpuExitReason::Canceled,
             WHvRunVpExitReasonX64Cpuid => VcpuExitReason::CpuidAccess,
             WHvRunVpExitReasonX64MsrAccess => VcpuExitReason::MsrAccess,
+            WHvRunVpExitReasonX64InterruptWindow => VcpuExitReason::InterruptWindow,
             WHvRunVpExitReasonUnrecoverableException => VcpuExitReason::UnrecoverableException,
             WHvRunVpExitReasonInvalidVpRegisterValue => VcpuExitReason::InvalidVpRegisterValue,
             WHvRunVpExitReasonUnsupportedFeature => VcpuExitReason::UnsupportedFeature,
