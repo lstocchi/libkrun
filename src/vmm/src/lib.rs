@@ -44,6 +44,8 @@ use std::fmt::{Display, Formatter};
 use std::io;
 #[cfg(not(target_os = "windows"))]
 use std::os::unix::io::AsRawFd;
+#[cfg(target_os = "windows")]
+use utils::windows::AsRawFd;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -135,8 +137,12 @@ pub enum Error {
     VcpuSpawn(std::io::Error),
     /// Vm error.
     Vm(vstate::Error),
+    // Not sure they are actually used but keeping them here for upstream compatibility
+    // (utils::errno lives in vmm-sys-util which is Unix-only).
+    #[cfg(unix)]
     /// Error thrown by observer object on Vmm initialization.
     VmmObserverInit(utils::errno::Error),
+    #[cfg(unix)]
     /// Error thrown by observer object on Vmm teardown.
     VmmObserverTeardown(utils::errno::Error),
 }
@@ -168,10 +174,12 @@ impl Display for Error {
             VcpuResume => write!(f, "vCPUs resume failed."),
             VcpuSpawn(e) => write!(f, "Cannot spawn Vcpu thread: {e}"),
             Vm(e) => write!(f, "Vm error: {e}"),
+            #[cfg(unix)]
             VmmObserverInit(e) => write!(
                 f,
                 "Error thrown by observer object on Vmm initialization: {e}"
             ),
+            #[cfg(unix)]
             VmmObserverTeardown(e) => {
                 write!(f, "Error thrown by observer object on Vmm teardown: {e}")
             }
@@ -180,6 +188,7 @@ impl Display for Error {
 }
 
 /// Trait for objects that need custom initialization and teardown during the Vmm lifetime.
+#[cfg(unix)]
 pub trait VmmEventsObserver {
     /// This function will be called during microVm boot.
     fn on_vmm_boot(&mut self) -> std::result::Result<(), utils::errno::Error> {

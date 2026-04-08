@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use crate::vmm_config::block::{BlockBuilder, BlockConfigError, BlockDeviceConfig};
 use crate::vmm_config::external_kernel::ExternalKernel;
 use crate::vmm_config::firmware::FirmwareConfig;
-#[cfg(not(feature = "tee"))]
+#[cfg(not(any(feature = "tee", target_os = "windows")))]
 use crate::vmm_config::fs::*;
 #[cfg(feature = "tee")]
 use crate::vmm_config::kernel_bundle::{InitrdBundle, QbootBundle, QbootBundleError};
@@ -177,7 +177,7 @@ pub struct VmResources {
     #[cfg(feature = "tee")]
     pub initrd_bundle: Option<InitrdBundle>,
     /// The fs device.
-    #[cfg(not(feature = "tee"))]
+    #[cfg(not(any(feature = "tee", target_os = "windows")))]
     pub fs: Vec<FsDeviceConfig>,
     /// The vsock device.
     pub vsock: VsockBuilder,
@@ -357,7 +357,7 @@ impl VmResources {
         Ok(())
     }
 
-    #[cfg(not(feature = "tee"))]
+    #[cfg(not(any(feature = "tee", target_os = "windows")))]
     pub fn add_fs_device(&mut self, config: FsDeviceConfig) {
         self.fs.push(config)
     }
@@ -368,6 +368,7 @@ impl VmResources {
     }
 
     /// Sets a vsock device to be attached when the VM starts.
+    #[cfg(unix)]
     pub fn set_vsock_device(&mut self, config: VsockDeviceConfig) -> Result<VsockConfigError> {
         self.vsock.insert(config)
     }
@@ -451,6 +452,7 @@ mod tests {
             kernel_cmdline: default_kernel_cmdline(),
             kernel_bundle: Default::default(),
             external_kernel: None,
+            #[cfg(not(any(feature = "tee", target_os = "windows")))]
             fs: Default::default(),
             vsock: Default::default(),
             #[cfg(feature = "net")]

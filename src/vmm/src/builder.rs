@@ -35,7 +35,9 @@ use super::{Error, Vmm};
 use crate::device_manager::legacy::PortIODeviceManager;
 use crate::device_manager::mmio::MMIODeviceManager;
 use crate::resources::{DefaultVirtioConsoleConfig, PortConfig, VirtioConsoleConfigMode};
-use crate::resources::{TsiFlags, VmResources};
+#[cfg(unix)]
+use crate::resources::TsiFlags;
+use crate::resources::VmResources;
 use crate::vmm_config::external_kernel::{ExternalKernel, KernelFormat};
 #[cfg(feature = "net")]
 use crate::vmm_config::net::NetBuilder;
@@ -57,7 +59,9 @@ use devices::legacy::WhpIoapic;
 use devices::legacy::{IrqChip, IrqChipDevice};
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 use devices::legacy::{KvmGicV2, KvmGicV3};
-use devices::virtio::{port_io, MmioTransport, PortDescription, VirtioDevice, Vsock};
+use devices::virtio::{port_io, MmioTransport, PortDescription, VirtioDevice};
+#[cfg(unix)]
+use devices::virtio::Vsock;
 
 #[cfg(feature = "tee")]
 use kbs_types::Tee;
@@ -70,7 +74,7 @@ use crate::signal_handler::register_sigwinch_handler;
 use crate::terminal::{term_restore_mode, term_set_raw_mode};
 #[cfg(feature = "blk")]
 use crate::vmm_config::block::BlockBuilder;
-#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+#[cfg(not(any(feature = "tee", feature = "aws-nitro", target_os = "windows")))]
 use crate::vmm_config::fs::FsDeviceConfig;
 use crate::vmm_config::kernel_cmdline::DEFAULT_KERNEL_CMDLINE;
 #[cfg(target_os = "linux")]
@@ -84,8 +88,10 @@ use device_manager::shm::ShmManager;
 use devices::virtio::display::DisplayInfo;
 #[cfg(feature = "gpu")]
 use devices::virtio::display::NoopDisplayBackend;
+#[cfg(not(any(feature = "tee", feature = "aws-nitro", target_os = "windows")))]
+use devices::virtio::fs::ExportTable;
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
-use devices::virtio::{fs::ExportTable, VirtioShmRegion};
+use devices::virtio::VirtioShmRegion;
 use flate2::read::GzDecoder;
 #[cfg(feature = "gpu")]
 use krun_display::DisplayBackend;
@@ -539,7 +545,7 @@ impl Display for StartMicrovmError {
 }
 
 pub enum Payload {
-    #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
+    #[cfg(all(target_arch = "x86_64", not(feature = "tee"), not(target_os = "windows")))]
     KernelMmap,
     #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
     KernelCopy,
@@ -1078,7 +1084,7 @@ pub fn build_microvm(
         console_id += 1;
     }
 
-    #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+    #[cfg(not(any(feature = "tee", feature = "aws-nitro", target_os = "windows")))]
     let export_table: Option<ExportTable> = if cfg!(feature = "gpu") {
         Some(Default::default())
     } else {
@@ -1110,7 +1116,7 @@ pub fn build_microvm(
         attach_input_devices(&mut vmm, &vm_resources.input_backends, intc.clone())?;
     }
 
-    #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+    #[cfg(not(any(feature = "tee", feature = "aws-nitro", target_os = "windows")))]
     attach_fs_devices(
         &mut vmm,
         &vm_resources.fs,
@@ -1125,6 +1131,7 @@ pub fn build_microvm(
     #[cfg(feature = "blk")]
     attach_block_devices(&mut vmm, &vm_resources.block, intc.clone())?;
 
+    #[cfg(unix)]
     if let Some(vsock) = vm_resources.vsock.get() {
         attach_unixsock_vsock_device(&mut vmm, vsock, event_manager, intc.clone())?;
         let tsi_flags = vm_resources.vsock.tsi_flags();
@@ -1396,7 +1403,7 @@ fn load_payload(
                 .unwrap();
             Ok((guest_mem, GuestAddress(kernel_entry_addr), None, None))
         }
-        #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
+        #[cfg(all(target_arch = "x86_64", not(feature = "tee"), not(target_os = "windows")))]
         Payload::KernelMmap => {
             let (kernel_entry_addr, kernel_host_addr, kernel_guest_addr, kernel_size) =
                 if let Some(kernel_bundle) = &_vm_resources.kernel_bundle {
@@ -1521,7 +1528,7 @@ pub fn create_guest_memory(
 
     #[cfg(target_arch = "x86_64")]
     let (arch_mem_info, mut arch_mem_regions) = match payload {
-        #[cfg(not(feature = "tee"))]
+        #[cfg(not(any(feature = "tee", target_os = "windows")))]
         Payload::KernelMmap => {
             let (kernel_guest_addr, kernel_size) =
                 if let Some(kernel_bundle) = &vm_resources.kernel_bundle {
@@ -1562,7 +1569,7 @@ pub fn create_guest_memory(
 
     let mut shm_manager = ShmManager::new(&arch_mem_info);
 
-    #[cfg(not(feature = "tee"))]
+    #[cfg(not(any(feature = "tee", target_os = "windows")))]
     for (index, fs) in vm_resources.fs.iter().enumerate() {
         if let Some(shm_size) = fs.shm_size {
             shm_manager
@@ -2034,7 +2041,7 @@ fn attach_mmio_device(
     Ok(())
 }
 
-#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+#[cfg(not(any(feature = "tee", feature = "aws-nitro", target_os = "windows")))]
 fn attach_fs_devices(
     vmm: &mut Vmm,
     fs_devs: &[FsDeviceConfig],
@@ -2643,6 +2650,7 @@ fn attach_net_devices(
     Ok(())
 }
 
+#[cfg(unix)]
 fn attach_unixsock_vsock_device(
     vmm: &mut Vmm,
     unix_vsock: &Arc<Mutex<Vsock>>,

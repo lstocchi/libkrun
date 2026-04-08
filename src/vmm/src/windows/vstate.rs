@@ -7,7 +7,7 @@
 //! `macos/vstate.rs`: it consumes `whp::{WhpVm, WhpVcpu, VcpuExitReason}`
 //! and routes I/O and MMIO exits through the WHP instruction emulator.
 
-use std::arch::x86_64::__cpuid;
+use log::{debug, error, warn};
 use std::ffi::c_void;
 use std::fmt::{Display, Formatter};
 use std::io;
@@ -15,6 +15,8 @@ use std::mem;
 use std::result;
 use std::sync::Arc;
 use std::thread;
+
+use crate::windows::{HV_MSR_APIC_FREQUENCY, HV_MSR_GUEST_OS_ID, HV_MSR_HYPERCALL, HV_MSR_REFERENCE_TSC, HV_MSR_STIMER0_CONFIG, HV_MSR_STIMER0_COUNT, HV_MSR_TIME_REF_COUNT, HV_MSR_TSC_FREQUENCY, HV_MSR_TSC_INVARIANT_CONTROL, HV_MSR_VP_INDEX, HV_MSR_VP_RUNTIME};
 
 use super::super::{FC_EXIT_CODE_GENERIC_ERROR, FC_EXIT_CODE_OK};
 
@@ -123,13 +125,13 @@ impl Vm {
                 region.start_addr().raw_value(),
                 region.len()
             );
-            self.whp_vm
+            (unsafe { self.whp_vm
                 .map_memory(
-                    host_addr as *const u8,
+                    host_addr as *mut c_void,
                     region.start_addr().raw_value(),
                     region.len(),
                 )
-                .map_err(Error::SetUserMemoryRegion)?;
+                .map_err(Error::SetUserMemoryRegion) })?;
         }
         Ok(())
     }
@@ -165,7 +167,6 @@ unsafe extern "system" fn io_port_callback(
     let ctx = &*(context as *const CallbackContext);
     let io = &mut *io_access;
     let bus = &*ctx.bus;
-;
     if io.Direction != 0 {
         let data_bytes = io.Data.to_le_bytes();
         bus.write(ctx.vp_index as u64, io.Port as u64, &data_bytes[..io.AccessSize as usize]);
@@ -287,6 +288,7 @@ pub struct Vcpu {
     io_bus: devices::Bus,
     mmio_bus: Option<devices::Bus>,
     exit_evt: EventFd,
+    stimer: SynicTimer,
 
     event_receiver: Receiver<VcpuEvent>,
     event_sender: Option<Sender<VcpuEvent>>,
@@ -305,10 +307,11 @@ impl Vcpu {
         io_bus: devices::Bus,
         exit_evt: EventFd,
     ) -> Result<Self> {
+        let stimer = SynicTimer::new(vm.clone(), id as u32);
         let whp_vcpu = WhpVcpu::new(vm, id as u32).map_err(Error::VcpuRun)?;
         let emulator =
             WhpEmulator::new(build_emulator_callbacks()).map_err(Error::CreateEmulator)?;
-
+        
         let (event_sender, event_receiver) = unbounded();
         let (response_sender, response_receiver) = unbounded();
 
@@ -319,6 +322,7 @@ impl Vcpu {
             io_bus,
             mmio_bus: None,
             exit_evt,
+            stimer,
             event_receiver,
             event_sender: Some(event_sender),
             response_receiver: Some(response_receiver),
@@ -486,22 +490,34 @@ impl Vcpu {
                 Ok(VcpuEmulation::Handled)
             }
             VcpuExitReason::Halt => {
-                // WHP only surfaces this exit when the vCPU executes HLT
-                // with no pending interrupts (IF=0 or no interrupt source).
-                // Normal idle (sti; hlt with APIC timer) is handled
-                // internally by WHP and never reaches here.
-                //
-                // Cases that land here:
-                //  * AP parked in `cli; hlt` before INIT+SIPI during boot
-                //  * Any CPU after `cli; hlt` during shutdown / panic
-                //
-                // In both cases, re-enter so WHP can deliver IPIs (SIPI for
-                // boot, or Canceled when the VMM tears down via exit_evt).
-                // Yield to avoid busy-spinning if WHP returns immediately.
+                // A Linux guest hits HLT when idle. 
+                // WHP handles most HLT states internally (if interrupts are enabled), 
+                // but if we land here, the vCPU is truly stalled.
+                
+                // Check if we should actually be shutting down.
+                if self.exit_evt.is_signaled() {
+                    return Ok(VcpuEmulation::Stopped);
+                }
+
+                // Be a good host citizen. yield_now() prevents our thread from 
+                // spinning at 100% CPU while the guest is "sleeping".
                 thread::yield_now();
                 Ok(VcpuEmulation::Handled)
             }
-            VcpuExitReason::Canceled => Ok(VcpuEmulation::Interrupted),
+            VcpuExitReason::InterruptWindow => {
+                // We don't need to do anything specific here because the 
+                // next call to WHvRunVirtualProcessor will allow the hardware 
+                // to deliver any pending interrupts we've requested via STimer or IPIs.
+                Ok(VcpuEmulation::Handled)
+            }
+            VcpuExitReason::Canceled => {
+                // WHvRequestInterrupt does NOT clear HaltSuspend — the vCPU
+                // stays frozen in HLT even with a pending LAPIC interrupt.
+                // Clear it here so the next WHvRunVirtualProcessor call can
+                // actually deliver the interrupt the kick thread injected.
+                let _ = self.whp_vcpu.clear_halt_suspend();
+                Ok(VcpuEmulation::Handled)
+            }
             VcpuExitReason::UnrecoverableException => {
                 error!("vCPU {} unrecoverable exception", self.cpu_index());
                 Err(Error::VcpuUnhandledExit)
@@ -529,53 +545,20 @@ impl Vcpu {
         result
     }
 
-    /// Handle a CPUID exit by returning Hyper-V enlightenment leaves.
+    /// Handle a CPUID exit.
     ///
-    /// Leaves `0x40000000`–`0x40000005` are intercepted so the guest sees a
-    /// synthetic "Microsoft Hv" hypervisor with Reference TSC support.
-    /// All other leaves pass through the default values from WHP.
+    /// Hyper-V enlightenment leaves (0x40000000+) and TSC leaves (0x15) are
+    /// injected via `CpuidResultList` in platform.rs and never reach here.
+    /// The only leaf in the `CpuidExitList` is leaf 1, which we intercept
+    /// to set the hypervisor-present bit (ECX.31).
     fn handle_cpuid(&self, info: &CpuidExitInfo) -> Result<()> {
-        let mut eax = info.default_eax;
-        let mut ebx = info.default_ebx;
+        let eax = info.default_eax;
+        let ebx = info.default_ebx;
         let mut ecx = info.default_ecx;
-        let mut edx = info.default_edx;
+        let edx = info.default_edx;
 
-        match info.leaf {
-            0x40000000 => {
-                eax = 0x40000005;
-                ebx = u32::from_le_bytes(*b"Micr") as u64;
-                ecx = u32::from_le_bytes(*b"osof") as u64;
-                edx = u32::from_le_bytes(*b"t Hv") as u64;
-            }
-            0x40000001 => {
-                eax = u32::from_le_bytes(*b"Hv#1") as u64;
-                ebx = 0;
-                ecx = 0;
-                edx = 0;
-            }
-            0x40000002 => {
-                eax = 0;
-                ebx = (10 << 16) | 0;
-                ecx = 0;
-                edx = 0;
-            }
-            0x40000003 => {
-                // Privilege bits:
-                //   Bit  1: AccessPartitionReferenceCounter (MSR 0x40000020)
-                //   Bit  9: AccessReferenceTsc              (MSR 0x40000021)
-                //   Bit 15: AccessTscInvariantControls      (MSR 0x40000118)
-                eax = (1 << 1) | (1 << 9) | (1 << 15);
-                ebx = 0;
-                ecx = 0;
-                edx = 0;
-            }
-            0x40000004 | 0x40000005 => {
-                eax = 0;
-                ebx = 0;
-                ecx = 0;
-                edx = 0;
-            }
-            _ => { /* pass through defaults */ }
+        if info.leaf == 1 {
+            ecx |= 1 << 31;
         }
 
         self.whp_vcpu
@@ -591,7 +574,7 @@ impl Vcpu {
         let mut rdx = 0u64;
 
         match info.msr_number {
-            0x40000000 => {
+            HV_MSR_GUEST_OS_ID => {
                 // HV_X64_MSR_GUEST_OS_ID
                 if info.is_write {
                     hv.set_guest_os_id((info.rdx << 32) | (info.rax & 0xFFFF_FFFF));
@@ -601,13 +584,27 @@ impl Vcpu {
                     rdx = id >> 32;
                 }
             }
-            0x40000001 => {
+            HV_MSR_HYPERCALL => {
                 // HV_X64_MSR_HYPERCALL
+                // hypercall is not supported yet
                 if !info.is_write {
-                    rax = 1;
+                    rax = 0;
                 }
             }
-            0x40000020 => {
+            HV_MSR_VP_INDEX => {
+                if !info.is_write {
+                    rax = self.cpu_index() as u64; // Low 32 bits
+                    rdx = 0;                       // High 32 bits
+                }
+            }
+            HV_MSR_VP_RUNTIME => {
+                if !info.is_write {
+                    let runtime = hv.vm_start_instant().elapsed().as_nanos() as u64 / 100;
+                    rax = runtime & 0xFFFF_FFFF;
+                    rdx = runtime >> 32;
+                }
+            }
+            HV_MSR_TIME_REF_COUNT => {
                 // HV_X64_MSR_TIME_REF_COUNT (read-only, 100ns ticks since boot)
                 if !info.is_write {
                     let ticks = hv.vm_start_instant().elapsed().as_nanos() / 100;
@@ -615,24 +612,56 @@ impl Vcpu {
                     rdx = ((ticks >> 32) & 0xFFFF_FFFF) as u64;
                 }
             }
-            0x40000021 => {
-                // HV_X64_MSR_REFERENCE_TSC
+            HV_MSR_REFERENCE_TSC => {
                 if info.is_write {
                     let msr_value = (info.rdx << 32) | (info.rax & 0xFFFF_FFFF);
+                    hv.set_tsc_reference_msr(msr_value);
                     if msr_value & 1 != 0 {
                         let gpa = msr_value & !0xFFF;
                         self.write_tsc_reference_page(gpa);
-                        hv.set_tsc_reference_gpa(Some(gpa));
-                    } else {
-                        hv.set_tsc_reference_gpa(None);
                     }
-                } else if let Some(gpa) = hv.tsc_reference_gpa() {
-                    let value = gpa | 1;
-                    rax = value & 0xFFFF_FFFF;
-                    rdx = value >> 32;
+                } else {
+                    let val = hv.tsc_reference_msr();
+                    rax = val & 0xFFFF_FFFF;
+                    rdx = val >> 32;
                 }
             }
-            0x40000118 => {
+            HV_MSR_STIMER0_CONFIG => { // HV_X64_MSR_STIMER0_CONFIG
+                if info.is_write {
+                    let val = (info.rdx << 32) | (info.rax & 0xFFFF_FFFF);
+                    hv.set_stimer0_config(val);
+                    self.stimer.write_config(val);
+                } else {
+                    let val = hv.stimer0_config();
+                    rax = val & 0xFFFF_FFFF;
+                    rdx = val >> 32;
+                }
+            }
+            HV_MSR_STIMER0_COUNT => { // HV_X64_MSR_STIMER0_COUNT
+                if info.is_write {
+                    let val = (info.rdx << 32) | (info.rax & 0xFFFF_FFFF);
+                    hv.set_stimer0_count(val);
+                    self.stimer.write_count(val);
+                } else {
+                    let val = hv.stimer0_count();
+                    rax = val & 0xFFFF_FFFF;
+                    rdx = val >> 32;
+                }
+            }
+            HV_MSR_TSC_FREQUENCY => {
+                if !info.is_write {
+                    let freq = hv.tsc_freq_hz();
+                    rax = freq & 0xFFFF_FFFF;
+                    rdx = freq >> 32;
+                }
+            }
+            HV_MSR_APIC_FREQUENCY => {
+                if !info.is_write {
+                    rax = 1_000_000;
+                    rdx = 0;
+                }
+            }
+            HV_MSR_TSC_INVARIANT_CONTROL => {
                 // HV_X64_MSR_TSC_INVARIANT_CONTROL — simple read/write store.
                 // Stored per-VM since all vCPUs share the invariant-TSC setting.
                 // We reuse guest_os_id's pattern with a dedicated atomic, but
@@ -662,55 +691,48 @@ impl Vcpu {
         }
     }
 
-    /// Write the Hyper-V Reference TSC Page into guest memory.
+    /// Write the Hyper-V Reference TSC Page at the given GPA.
     ///
-    /// The guest uses `ReferenceTime = ((RDTSC * TscScale) >> 64) + TscOffset`
-    /// to compute time in 100ns units without VM exits.
+    /// Layout (see TLFS §12.5):
+    /// offset 0:  u32  tsc_sequence   — non-zero means calibration is valid
+    /// offset 4:  u32  (reserved)
+    /// offset 8:  u64  tsc_scale      — fractional multiplier  (time = tsc * scale >> 64)
+    /// offset 16: i64  tsc_offset     — added after scaling (in 100 ns units)
     fn write_tsc_reference_page(&self, gpa: u64) {
-        let tsc_freq = Self::get_tsc_frequency_hz();
-        if tsc_freq == 0 {
-            error!("Could not determine TSC frequency, skipping reference page");
+        let freq = self.whp_vcpu.vm().hyperv().tsc_freq_hz();
+        if freq == 0 {
+            warn!("TSC frequency unknown — cannot set up reference TSC page");
             return;
         }
 
-        let hv = self.whp_vcpu.vm().hyperv();
-        let tsc_scale: u64 = ((10_000_000u128 << 64) / tsc_freq as u128) as u64;
-        let tsc_offset: i64 =
-            -(((hv.vm_start_tsc() as u128 * tsc_scale as u128) >> 64) as i64);
+        // tsc_scale: guest computes  time_100ns = (rdtsc() * scale) >> 64
+        // So  scale = (10_000_000 << 64) / tsc_freq_hz
+        let scale: u64 = ((10_000_000u128 << 64) / freq as u128) as u64;
+
+        // tsc_offset: how many 100 ns units to add.  We anchor at 0 so the
+        // VM starts with reference_time ~= 0.  The kernel adds its own
+        // boot-time offset on top.
+        let start_tsc = self.whp_vcpu.vm().hyperv().vm_start_tsc();
+        let offset: i64 = -((start_tsc as u128 * scale as u128 >> 64) as i64);
 
         let mut page = [0u8; 4096];
-        page[0..4].copy_from_slice(&1u32.to_le_bytes()); // TscSequence = 1
-        page[8..16].copy_from_slice(&tsc_scale.to_le_bytes());
-        page[16..24].copy_from_slice(&tsc_offset.to_le_bytes());
+        
+        // tsc_sequence = 1 (valid)
+        page[0..4].copy_from_slice(&1u32.to_le_bytes());
+        // reserved
+        page[4..8].copy_from_slice(&0u32.to_le_bytes());
+        // tsc_scale
+        page[8..16].copy_from_slice(&scale.to_le_bytes());
+        // tsc_offset
+        page[16..24].copy_from_slice(&offset.to_le_bytes());
 
-        if let Err(e) = self.guest_mem.write_slice(&page, GuestAddress(gpa)) {
-            error!("Failed to write TSC reference page at GPA 0x{gpa:x}: {e:?}");
-            return;
-        }
-
-        debug!(
-            "Hyper-V Reference TSC Page at GPA 0x{:x}: freq={}MHz scale=0x{:016x} offset={}",
-            gpa,
-            tsc_freq / 1_000_000,
-            tsc_scale,
-            tsc_offset,
-        );
-    }
-
-    fn get_tsc_frequency_hz() -> u64 {
-        unsafe {
-            let cpuid15 = __cpuid(0x15);
-            if cpuid15.eax != 0 && cpuid15.ebx != 0 && cpuid15.ecx != 0 {
-                return (cpuid15.ecx as u64 * cpuid15.ebx as u64) / cpuid15.eax as u64;
-            }
-
-            let cpuid16 = __cpuid(0x16);
-            if cpuid16.eax != 0 {
-                return cpuid16.eax as u64 * 1_000_000;
-            }
-
-            error!("CPUID leaves 0x15/0x16 did not report TSC frequency");
-            0
+        let addr = GuestAddress(gpa);
+        if let Err(e) = self.guest_mem.write_slice(&page, addr) {
+            error!("Failed to write TSC reference page at GPA 0x{gpa:x}: {e}");
+        } else {
+            debug!(
+                "TSC reference page at GPA 0x{gpa:x}: scale=0x{scale:016x} offset={offset} freq={freq}Hz",
+            );
         }
     }
 
