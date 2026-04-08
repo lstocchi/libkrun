@@ -109,7 +109,7 @@ impl<B: IoapicBackend> Ioapic<B> {
     }
 }
 
-impl<B: IoapicBackend> IrqChipT for Ioapic<B> {
+impl<B: IoapicBackend + 'static> IrqChipT for Ioapic<B> {
     fn get_mmio_addr(&self) -> u64 {
         IOAPIC_BASE
     }
@@ -129,7 +129,7 @@ impl<B: IoapicBackend> IrqChipT for Ioapic<B> {
     }
 }
 
-impl<B: IoapicBackend> BusDevice for Ioapic<B> {
+impl<B: IoapicBackend + 'static> BusDevice for Ioapic<B> {
     fn read(&mut self, _vcpuid: u64, offset: u64, data: &mut [u8]) {
         let inner = self.inner.lock().unwrap();
         let regs = &inner.regs;

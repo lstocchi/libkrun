@@ -25,6 +25,8 @@ mod kvmgicv2;
 mod kvmgicv3;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod kvmioapic;
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+pub mod pic;
 #[cfg(target_arch = "aarch64")]
 mod rtc_pl031;
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
@@ -50,6 +52,8 @@ use riscv64::serial;
 
 #[cfg(target_arch = "x86_64")]
 pub use self::cmos::Cmos;
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+pub use self::x86_64::pit::{Pit, PitCounter};
 #[cfg(target_os = "macos")]
 pub use self::gicv3::GicV3;
 #[cfg(target_arch = "aarch64")]
@@ -72,6 +76,8 @@ pub use self::kvmgicv3::KvmGicV3;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub use self::kvmioapic::KvmIoapic;
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+pub use self::pic::{Pic, PicPort, PicSelect};
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 pub use self::whp_split_ioapic::WhpIoapic;
 #[cfg(target_arch = "aarch64")]
 pub use self::rtc_pl031::RTC;
@@ -89,7 +95,7 @@ pub trait ReadableFd: std::io::Read + std::os::fd::AsRawFd {}
 impl ReadableFd for std::fs::File {}
 
 #[cfg(windows)]
-pub trait ReadableFd: std::io::Read + Send {}
+pub trait ReadableFd: std::io::Read + utils::windows::AsRawFd {}
 #[cfg(windows)]
 impl ReadableFd for std::fs::File {}
 

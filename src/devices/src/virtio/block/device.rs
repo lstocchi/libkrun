@@ -13,8 +13,6 @@ use std::io::{self, Write};
 use std::os::linux::fs::MetadataExt;
 #[cfg(target_os = "macos")]
 use std::os::macos::fs::MetadataExt;
-#[cfg(target_os = "windows")]
-use std::os::windows::fs::MetadataExt;
 use std::path::PathBuf;
 use std::result;
 use std::sync::{Arc, Mutex};
@@ -119,11 +117,28 @@ impl DiskProperties {
             blk_metadata.st_ino()
         );
         #[cfg(windows)]
-        let device_id = format!(
-            "{}{}",
-            blk_metadata.volume_serial_number().unwrap_or(0),
-            blk_metadata.file_index().unwrap_or(0)
-        );
+        let device_id = {
+            use std::mem::MaybeUninit;
+            use std::os::windows::io::AsRawHandle;
+            let mut info = MaybeUninit::<windows_sys::Win32::Storage::FileSystem::BY_HANDLE_FILE_INFORMATION>::zeroed();
+            let ret = unsafe {
+                windows_sys::Win32::Storage::FileSystem::GetFileInformationByHandle(
+                    disk_file.as_raw_handle(),
+                    info.as_mut_ptr(),
+                )
+            };
+            if ret != 0 {
+                let info = unsafe { info.assume_init() };
+                format!(
+                    "{}{}{}",
+                    info.dwVolumeSerialNumber,
+                    info.nFileIndexHigh,
+                    info.nFileIndexLow
+                )
+            } else {
+                format!("{}", blk_metadata.len())
+            }
+        };
         Ok(device_id)
     }
 

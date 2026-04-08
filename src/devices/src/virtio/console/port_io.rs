@@ -18,6 +18,8 @@ use std::fs::File;
 use std::io::{self, ErrorKind};
 #[cfg(unix)]
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
+#[cfg(target_os = "windows")]
+use utils::windows::AsRawFd;
 use utils::eventfd::EventFd;
 use utils::eventfd::EFD_NONBLOCK;
 use vm_memory::bitmap::Bitmap;

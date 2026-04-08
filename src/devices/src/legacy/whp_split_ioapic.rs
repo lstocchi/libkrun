@@ -80,7 +80,10 @@ impl WhpIoapicBackend {
 
             if let Err(e) = vm.request_interrupt(&req) {
                 error!("ioapic: WHvRequestInterrupt failed for pin {i}: {e}");
+                continue;
             }
+
+            vm.cancel_vcpu(dest);
         }
     }
 }
