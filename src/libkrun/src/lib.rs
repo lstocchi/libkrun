@@ -29,6 +29,8 @@ use std::fs::File;
 use std::io::IsTerminal;
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
+#[cfg(target_os = "windows")]
+use utils::windows::AsRawFd;
 #[cfg(unix)]
 use std::os::fd::{BorrowedFd, FromRawFd, RawFd};
 #[cfg(windows)]
@@ -55,7 +57,7 @@ use vmm::vmm_config::block::{BlockDeviceConfig, BlockRootConfig};
 use vmm::vmm_config::external_kernel::{ExternalKernel, KernelFormat};
 #[cfg(not(feature = "tee"))]
 use vmm::vmm_config::firmware::FirmwareConfig;
-#[cfg(not(feature = "tee"))]
+#[cfg(not(any(feature = "tee", target_os = "windows")))]
 use vmm::vmm_config::fs::FsDeviceConfig;
 use vmm::vmm_config::kernel_bundle::KernelBundle;
 #[cfg(feature = "tee")]
@@ -64,6 +66,7 @@ use vmm::vmm_config::kernel_cmdline::{DEFAULT_KERNEL_CMDLINE, KernelCmdlineConfi
 use vmm::vmm_config::machine_config::VmConfig;
 #[cfg(feature = "net")]
 use vmm::vmm_config::net::NetworkInterfaceConfig;
+#[cfg(not(target_os = "windows"))]
 use vmm::vmm_config::vsock::VsockDeviceConfig;
 
 #[cfg(feature = "aws-nitro")]
@@ -91,6 +94,8 @@ const KRUNFW_NAME: &str = "libkrunfw-sev.so.5";
 const KRUNFW_NAME: &str = "libkrunfw-tdx.so.5";
 #[cfg(target_os = "macos")]
 const KRUNFW_NAME: &str = "libkrunfw.5.dylib";
+#[cfg(target_os = "windows")]
+const KRUNFW_NAME: &str = "libkrunfw.dll";
 
 #[cfg(feature = "aws-nitro")]
 static KRUN_NITRO_DEBUG: Mutex<bool> = Mutex::new(false);
@@ -182,7 +187,10 @@ struct ContextConfig {
     /// Console output path, only used by the aws-nitro TryFrom path.
     #[cfg(feature = "aws-nitro")]
     nitro_console_output: Option<PathBuf>,
+    console_output: Option<PathBuf>,
+    #[cfg(unix)]
     vmm_uid: Option<libc::uid_t>,
+    #[cfg(unix)]
     vmm_gid: Option<libc::gid_t>,
     #[cfg(all(
         feature = "init-blob",
@@ -322,10 +330,12 @@ impl ContextConfig {
         self.gpu_shm_size = Some(shm_size);
     }
 
+    #[cfg(unix)]
     fn set_vmm_uid(&mut self, vmm_uid: libc::uid_t) {
         self.vmm_uid = Some(vmm_uid);
     }
 
+    #[cfg(unix)]
     fn set_vmm_gid(&mut self, vmm_gid: libc::gid_t) {
         self.vmm_gid = Some(vmm_gid);
     }
@@ -447,7 +457,8 @@ mod log_defs {
 }
 
 #[allow(clippy::missing_safety_doc)]
-#[unsafe(no_mangle)]
+#[no_mangle]
+#[cfg(unix)]
 pub unsafe extern "C" fn krun_init_log(target: RawFd, level: u32, style: u32, options: u32) -> i32 {
     unsafe {
         let target = match target {
@@ -1755,6 +1766,8 @@ pub extern "C" fn krun_get_shutdown_eventfd(ctx_id: u32) -> i32 {
                 return efd.get_write_fd();
                 #[cfg(target_os = "linux")]
                 return efd.as_raw_fd();
+                #[cfg(target_os = "windows")]
+                return efd.as_raw_fd() as i32;
             } else {
                 -libc::EINVAL
             }
@@ -1940,7 +1953,7 @@ fn create_virtio_net(
         .expect("Failed to create network interface");
 }
 
-#[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
+#[cfg(all(target_arch = "x86_64", not(any(feature = "tee", target_os = "windows"))))]
 fn map_kernel(ctx_id: u32, kernel_path: &PathBuf) -> i32 {
     let file = match File::options().read(true).write(false).open(kernel_path) {
         Ok(file) => file,
@@ -2904,6 +2917,23 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         return -libc::EINVAL;
     }
 
+    #[cfg(feature = "net")]
+    {
+        if let Some(legacy_net_cfg) = ctx_cfg.legacy_net_cfg.clone() {
+            let backend = match legacy_net_cfg {
+                LegacyNetworkConfig::VirtioNetGvproxy(path) => {
+                    VirtioNetBackend::UnixgramPath(path, true)
+                }
+                LegacyNetworkConfig::VirtioNetPasst(fd) => VirtioNetBackend::UnixstreamFd(fd),
+            };
+            let mac = ctx_cfg
+                .legacy_mac
+                .unwrap_or([0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xee]);
+            create_virtio_net(&mut ctx_cfg, backend, mac, NET_COMPAT_FEATURES);
+        }
+    }
+
+    #[cfg(unix)]
     match &ctx_cfg.vsock_config {
         VsockConfig::Disabled => (),
         VsockConfig::Explicit { tsi_flags } => {
@@ -2925,18 +2955,20 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         ctx_cfg.vmr.set_gpu_shm_size(shm_size);
     }
 
-    if let Some(gid) = ctx_cfg.vmm_gid
-        && unsafe { libc::setgid(gid) } != 0
-    {
-        error!("Failed to set gid {gid}");
-        return -std::io::Error::last_os_error().raw_os_error().unwrap();
+    #[cfg(unix)]
+    if let Some(gid) = ctx_cfg.vmm_gid {
+        if unsafe { libc::setgid(gid) } != 0 {
+            error!("Failed to set gid {gid}");
+            return -std::io::Error::last_os_error().raw_os_error().unwrap();
+        }
     }
 
-    if let Some(uid) = ctx_cfg.vmm_uid
-        && unsafe { libc::setuid(uid) } != 0
-    {
-        error!("Failed to set uid {uid}");
-        return -std::io::Error::last_os_error().raw_os_error().unwrap();
+    #[cfg(unix)]
+    if let Some(uid) = ctx_cfg.vmm_uid {
+        if unsafe { libc::setuid(uid) } != 0 {
+            error!("Failed to set uid {uid}");
+            return -std::io::Error::last_os_error().raw_os_error().unwrap();
+        }
     }
 
     let (sender, _receiver) = unbounded();
