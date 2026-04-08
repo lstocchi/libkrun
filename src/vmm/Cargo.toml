@@ -6,16 +6,16 @@ edition = "2021"
 build = "build.rs"
 
 [features]
-tee = []
+tee = ["devices/tee"]
 amd-sev = [ "blk", "bitfield", "bitflags", "iocuddle", "tee", "kbs-types", "serde", "serde_json" ]
 tdx = [ "blk", "tee", "kbs-types", "serde", "serde_json", "dep:tdx" ]
-net = []
-blk = []
+net = ["devices/net"]
+blk = ["devices/blk"]
 efi = [ "blk", "net" ]
-gpu = ["krun_display"]
-snd = []
-input = ["krun_input"]
-aws-nitro = []
+gpu = ["krun_display", "devices/gpu"]
+snd = ["devices/snd"]
+input = ["krun_input", "devices/input"]
+aws-nitro = ["devices/aws-nitro"]
 
 [dependencies]
 crossbeam-channel = ">=0.5.15"

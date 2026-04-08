@@ -2575,7 +2575,7 @@ fn attach_console_devices(
         .lock()
         .unwrap()
         .try_clone_sigwinch_evt()
-        .map_err(|e| RegisterConsoleDevice(e.into()))?;
+        .map_err(|e| RegisterConsoleDevice(device_manager::mmio::Error::EventFd(e)))?;
 
     if let Some(reader) = console_reader {
         reader.start(sigwinch_evt).map_err(ConsolePortSetup)?;

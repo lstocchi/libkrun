@@ -16,6 +16,7 @@ use std::result;
 use std::sync::Arc;
 use std::thread;
 
+use crate::windows::synic_timer::SynicTimer;
 use crate::windows::{HV_MSR_APIC_FREQUENCY, HV_MSR_GUEST_OS_ID, HV_MSR_HYPERCALL, HV_MSR_REFERENCE_TSC, HV_MSR_STIMER0_CONFIG, HV_MSR_STIMER0_COUNT, HV_MSR_TIME_REF_COUNT, HV_MSR_TSC_FREQUENCY, HV_MSR_TSC_INVARIANT_CONTROL, HV_MSR_VP_INDEX, HV_MSR_VP_RUNTIME};
 
 use super::super::{FC_EXIT_CODE_GENERIC_ERROR, FC_EXIT_CODE_OK};
