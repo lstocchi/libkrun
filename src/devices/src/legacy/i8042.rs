@@ -7,10 +7,13 @@
 
 use std::fmt;
 use std::num::Wrapping;
+use std::sync::{Arc, Mutex};
 use std::{io, result};
 use utils::eventfd::EventFd;
 
 use crate::bus::BusDevice;
+#[cfg(target_os = "windows")]
+use crate::legacy::x86_64::pit::PitCounter;
 
 #[derive(Debug)]
 pub enum Error {
@@ -38,11 +41,15 @@ impl fmt::Display for Error {
 
 type Result<T> = result::Result<T, Error>;
 
-/// Offset of the status port (port 0x64)
-const OFS_STATUS: u64 = 4;
-
 /// Offset of the data port (port 0x60)
 const OFS_DATA: u64 = 0;
+
+/// Offset of the speaker / NMI status port (port 0x61).
+/// On real hardware this is the PIT-driven "Port B" register.
+const OFS_SPEAKER: u64 = 1;
+
+/// Offset of the status port (port 0x64)
+const OFS_STATUS: u64 = 4;
 
 /// i8042 commands
 /// These values are written by the guest driver to port 0x64.
@@ -93,6 +100,10 @@ pub struct I8042Device {
     buf: [u8; BUF_SIZE],
     bhead: Wrapping<usize>,
     btail: Wrapping<usize>,
+
+    /// Optional PIT counter 2 for speaker port (0x61) emulation.
+    #[cfg(target_os = "windows")]
+    pit_counter2: Option<Arc<Mutex<PitCounter>>>,
 }
 
 impl I8042Device {
@@ -108,7 +119,16 @@ impl I8042Device {
             buf: [0; BUF_SIZE],
             bhead: Wrapping(0),
             btail: Wrapping(0),
+            #[cfg(target_os = "windows")]
+            pit_counter2: None,
         }
+    }
+
+    /// Attach PIT counter 2 so that reads/writes to port 0x61 (speaker)
+    /// are delegated to the PIT.
+    #[cfg(target_os = "windows")]
+    pub fn set_pit_counter2(&mut self, counter: Arc<Mutex<PitCounter>>) {
+        self.pit_counter2 = Some(counter);
     }
 
     /// Returns a clone of the CPU reset event fd
@@ -201,6 +221,14 @@ impl BusDevice for I8042Device {
 
         match offset {
             OFS_STATUS => data[0] = self.status,
+            // On KVM the in-kernel PIT handles port 0x61, so this is just needed for Windows.
+            #[cfg(target_os = "windows")]
+            OFS_SPEAKER => {
+                data[0] = match &self.pit_counter2 {
+                    Some(ctr) => ctr.lock().unwrap().read_speaker(),
+                    None => 0x20,
+                };
+            }
             OFS_DATA => {
                 // The guest wants to read a byte from port 0x60. For the 8042, that means the top
                 // byte in the internal buffer. If the buffer is empty, the guest will get a 0.
@@ -226,6 +254,13 @@ impl BusDevice for I8042Device {
         }
 
         match offset {
+            // On KVM the in-kernel PIT handles port 0x61, so this is just needed for Windows.
+            #[cfg(target_os = "windows")]
+            OFS_SPEAKER => {
+                if let Some(ctr) = &self.pit_counter2 {
+                    ctr.lock().unwrap().write_speaker(data[0]);
+                }
+            }
             OFS_STATUS if data[0] == CMD_RESET_CPU => {
                 // The guest wants to assert the CPU reset line. We handle that by triggering
                 // our exit event fd. Meaning Firecracker will be exiting as soon as the VMM
