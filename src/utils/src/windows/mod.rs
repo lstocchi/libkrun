@@ -1,4 +1,5 @@
 use windows_sys::Win32::Foundation::HANDLE;
+use std::os::windows::io::AsRawHandle;
 
 pub(crate) mod bindings;
 pub mod epoll;
@@ -11,6 +12,12 @@ pub type RawFd = HANDLE;
 /// Windows equivalent of [`std::os::unix::io::AsRawFd`].
 pub trait AsRawFd {
     fn as_raw_fd(&self) -> RawFd;
+}
+
+impl AsRawFd for std::fs::File {
+    fn as_raw_fd(&self) -> RawFd {        
+        self.as_raw_handle() as RawFd
+    }
 }
 
 /// A thin wrapper around a raw `HANDLE` that implements [`Send`].
