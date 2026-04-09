@@ -11,26 +11,7 @@ use std::time::Instant;
 use log::{debug, error};
 use windows_sys::Win32::Foundation::S_OK;
 use windows_sys::Win32::System::Hypervisor::{
-    WHV_CAPABILITY, WHV_EMULATOR_CALLBACKS, WHV_EMULATOR_STATUS, WHV_MEMORY_ACCESS_CONTEXT,
-    WHV_PARTITION_HANDLE, WHV_PARTITION_PROPERTY, WHV_PARTITION_PROPERTY_CODE, WHV_REGISTER_NAME,
-    WHV_REGISTER_VALUE, WHV_RUN_VP_EXIT_CONTEXT, WHV_VP_EXIT_CONTEXT,
-    WHV_X64_IO_PORT_ACCESS_CONTEXT, WHvCapabilityCodeHypervisorPresent, WHvCreatePartition,
-    WHvCreateVirtualProcessor, WHvDeletePartition, WHvDeleteVirtualProcessor,
-    WHvEmulatorCreateEmulator, WHvEmulatorDestroyEmulator, WHvEmulatorTryIoEmulation,
-    WHvEmulatorTryMmioEmulation, WHvGetCapability, WHvGetVirtualProcessorRegisters,
-    WHvMapGpaRange, WHvMapGpaRangeFlagExecute, WHvMapGpaRangeFlagRead, WHvMapGpaRangeFlagWrite,
-    WHV_X64_CPUID_RESULT, WHvPartitionPropertyCodeCpuidExitList,
-    WHvPartitionPropertyCodeCpuidResultList, WHvPartitionPropertyCodeExtendedVmExits,
-    WHvPartitionPropertyCodeLocalApicEmulationMode,
-    WHvPartitionPropertyCodeProcessorCount, WHvRequestInterrupt, WHvRunVirtualProcessor,
-    WHvRunVpExitReasonCanceled, WHvRunVpExitReasonInvalidVpRegisterValue,
-    WHvRunVpExitReasonMemoryAccess, WHvRunVpExitReasonUnrecoverableException,
-    WHvRunVpExitReasonUnsupportedFeature, WHvRunVpExitReasonX64Cpuid,
-    WHvRunVpExitReasonX64Halt, WHvRunVpExitReasonX64IoPortAccess,
-    WHvRunVpExitReasonX64InterruptWindow, WHvRunVpExitReasonX64MsrAccess,
-    WHvSetPartitionProperty, WHvSetVirtualProcessorRegisters,
-    WHvSetupPartition, WHvX64LocalApicEmulationModeXApic, WHvX64RegisterRax,
-    WHvX64RegisterRbx, WHvX64RegisterRcx, WHvX64RegisterRdx, WHvX64RegisterRip,
+    WHV_CAPABILITY, WHV_EMULATOR_CALLBACKS, WHV_EMULATOR_STATUS, WHV_MEMORY_ACCESS_CONTEXT, WHV_PARTITION_HANDLE, WHV_PARTITION_PROPERTY, WHV_PARTITION_PROPERTY_CODE, WHV_REGISTER_NAME, WHV_REGISTER_VALUE, WHV_RUN_VP_EXIT_CONTEXT, WHV_VP_EXIT_CONTEXT, WHV_X64_CPUID_RESULT, WHV_X64_IO_PORT_ACCESS_CONTEXT, WHvCancelRunVirtualProcessor, WHvCapabilityCodeHypervisorPresent, WHvCreatePartition, WHvCreateVirtualProcessor, WHvDeletePartition, WHvDeleteVirtualProcessor, WHvEmulatorCreateEmulator, WHvEmulatorDestroyEmulator, WHvEmulatorTryIoEmulation, WHvEmulatorTryMmioEmulation, WHvGetCapability, WHvGetVirtualProcessorRegisters, WHvMapGpaRange, WHvMapGpaRangeFlagExecute, WHvMapGpaRangeFlagRead, WHvMapGpaRangeFlagWrite, WHvPartitionPropertyCodeCpuidExitList, WHvPartitionPropertyCodeCpuidResultList, WHvPartitionPropertyCodeExtendedVmExits, WHvPartitionPropertyCodeLocalApicEmulationMode, WHvPartitionPropertyCodeProcessorCount, WHvRequestInterrupt, WHvRunVirtualProcessor, WHvRunVpExitReasonCanceled, WHvRunVpExitReasonInvalidVpRegisterValue, WHvRunVpExitReasonMemoryAccess, WHvRunVpExitReasonUnrecoverableException, WHvRunVpExitReasonUnsupportedFeature, WHvRunVpExitReasonX64Cpuid, WHvRunVpExitReasonX64Halt, WHvRunVpExitReasonX64InterruptWindow, WHvRunVpExitReasonX64IoPortAccess, WHvRunVpExitReasonX64MsrAccess, WHvSetPartitionProperty, WHvSetVirtualProcessorRegisters, WHvSetupPartition, WHvX64LocalApicEmulationModeXApic, WHvX64RegisterRax, WHvX64RegisterRbx, WHvX64RegisterRcx, WHvX64RegisterRdx, WHvX64RegisterRflags, WHvX64RegisterRip
 };
 use windows_sys::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 
@@ -671,6 +652,16 @@ impl WhpVm {
         }
     }
 
+    /// Cancel a running `WHvRunVirtualProcessor` call so the vCPU thread
+    /// exits with `Canceled`.  Required after `request_interrupt` to wake a
+    /// vCPU that is blocked in HLT.
+    pub fn cancel_vcpu(&self, vp_index: u32) {
+        let hr = unsafe { WHvCancelRunVirtualProcessor(self.handle, vp_index, 0) };
+        if hr != S_OK {
+            error!("WHvCancelRunVirtualProcessor({vp_index}) failed: HRESULT 0x{hr:08x}");
+        }
+    }
+
     pub fn partition_handle(&self) -> WHV_PARTITION_HANDLE {
         self.handle
     }
@@ -829,6 +820,7 @@ impl WhpVcpu {
         if hr != S_OK {
             return Err(Error::RunVirtualProcessor(hr));
         }
+
         Ok(Self::decode_reason(&self.exit_context))
     }
 
@@ -1014,6 +1006,25 @@ impl WhpVcpu {
             self.set_registers(&[WHV_REGISTER_INTERNAL_ACTIVITY_STATE], &values)?;
         }
         Ok(())
+    }
+
+    /// Ask WHP to exit the next time the guest becomes interruptible
+    /// (IF transitions 0→1 via STI / IRET).  This is required when an
+    /// interrupt is pending in the LAPIC but the guest currently has
+    /// interrupts disabled (RFLAGS.IF=0).  Without this, a guest sitting
+    /// in a tight CLI loop (e.g. TSC calibration) will never see the
+    /// LAPIC interrupt because no VM-exit occurs to let WHP deliver it.
+    pub fn request_interrupt_window(&self) -> Result<(), Error> {
+        const WHV_REG_DELIVERABILITY_NOTIFICATIONS: WHV_REGISTER_NAME = 0x80000004u32 as i32;
+        // Bit 1 = InterruptNotification
+        self.set_reg64(WHV_REG_DELIVERABILITY_NOTIFICATIONS, 0x2)
+    }
+
+    /// Clear the deliverability-notification request so WHP stops exiting
+    /// on every STI instruction.  Called after an InterruptWindow exit.
+    pub fn clear_interrupt_window(&self) -> Result<(), Error> {
+        const WHV_REG_DELIVERABILITY_NOTIFICATIONS: WHV_REGISTER_NAME = 0x80000004u32 as i32;
+        self.set_reg64(WHV_REG_DELIVERABILITY_NOTIFICATIONS, 0x0)
     }
 
     #[allow(non_upper_case_globals)]
