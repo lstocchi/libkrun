@@ -500,15 +500,15 @@ impl Vcpu {
                     return Ok(VcpuEmulation::Stopped);
                 }
 
-                // Be a good host citizen. yield_now() prevents our thread from 
-                // spinning at 100% CPU while the guest is "sleeping".
-                thread::yield_now();
+                // Yield the timeslice so the synthetic-timer and PIT
+                // worker threads can run.  sleep(1ms) on Windows rounds
+                // up to one scheduler tick (~1-15 ms) which is acceptable
+                // for an idle vCPU and avoids burning a full core.
+                thread::sleep(std::time::Duration::from_millis(1));
                 Ok(VcpuEmulation::Handled)
             }
             VcpuExitReason::InterruptWindow => {
-                // We don't need to do anything specific here because the 
-                // next call to WHvRunVirtualProcessor will allow the hardware 
-                // to deliver any pending interrupts we've requested via STimer or IPIs.
+                let _ = self.whp_vcpu.clear_interrupt_window();
                 Ok(VcpuEmulation::Handled)
             }
             VcpuExitReason::Canceled => {
@@ -517,6 +517,16 @@ impl Vcpu {
                 // Clear it here so the next WHvRunVirtualProcessor call can
                 // actually deliver the interrupt the kick thread injected.
                 let _ = self.whp_vcpu.clear_halt_suspend();
+
+                // Only request an interrupt window when the guest has
+                // IF=0.  When IF=1 the LAPIC can deliver immediately on
+                // re-entry -- requesting a window would just cause a
+                // spurious InterruptWindow exit that feeds back into
+                // another Canceled, creating an infinite exit storm.
+                let rflags = self.whp_vcpu.get_reg64(0x00000011).unwrap_or(0);
+                if rflags & 0x200 == 0 {
+                    let _ = self.whp_vcpu.request_interrupt_window();
+                }
                 Ok(VcpuEmulation::Handled)
             }
             VcpuExitReason::UnrecoverableException => {
