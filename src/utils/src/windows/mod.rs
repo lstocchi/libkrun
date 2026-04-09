@@ -4,6 +4,7 @@ use std::os::windows::io::AsRawHandle;
 pub(crate) mod bindings;
 pub mod epoll;
 pub mod eventfd;
+pub mod wake_event;
 
 /// Cross-platform alias used by the rest of the codebase.  On Windows this
 /// is just [`HANDLE`] — the two names are interchangeable.
