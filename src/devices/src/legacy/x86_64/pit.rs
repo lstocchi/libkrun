@@ -29,46 +29,11 @@ use std::time::{Duration, Instant};
 use crate::bus::BusDevice;
 use crate::legacy::irqchip::IrqChip;
 use crate::legacy::pic::Pic;
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::System::Threading::{
-    CreateEventW, SetEvent, WaitForSingleObject, INFINITE,
+    WaitForSingleObject, INFINITE,
 };
-
-// ── Timer notification ───────────────────────────────────────────────
-
-struct WakeEvent(HANDLE);
-
-unsafe impl Send for WakeEvent {}
-unsafe impl Sync for WakeEvent {}
-
-impl WakeEvent {
-    fn new() -> Self {
-        // bManualReset = 0 (auto-reset), bInitialState = 0 (non-signaled).
-        // Auto-reset: the kernel holds a pending signal until a wait consumes
-        // it, so signals are never lost even if the worker is busy.
-        let h = unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) };
-        assert!(!h.is_null(), "pit: failed to create wake event");
-        Self(h)
-    }
-
-    fn signal(&self) {
-        unsafe {
-            SetEvent(self.0);
-        }
-    }
-
-    fn handle(&self) -> HANDLE {
-        self.0
-    }
-}
-
-impl Drop for WakeEvent {
-    fn drop(&mut self) {
-        unsafe {
-            CloseHandle(self.0);
-        }
-    }
-}
+use utils::windows::wake_event::WakeEvent;
 
 // ── i8254 constants ─────────────────────────────────────────────────
 
@@ -447,6 +412,7 @@ impl Pit {
         ts.period = period;
         ts.deadline = Instant::now() + period;
         drop(ts);
+
         wake.signal();
     }
 
@@ -589,7 +555,10 @@ fn pit_worker(
 
         let now = Instant::now();
         if deadline > now {
-            let wait_ms = (deadline - now).as_millis().min(u32::MAX as u128) as u32;
+            // Never pass 0: WaitForSingleObject(h, 0) is a non-blocking
+            // poll that returns immediately, causing a CPU-burning spin
+            // when the remaining time truncates below 1 ms.
+            let wait_ms = (deadline - now).as_millis().min(u32::MAX as u128).max(1) as u32;
             unsafe {
                 WaitForSingleObject(wake.handle(), wait_ms);
             }

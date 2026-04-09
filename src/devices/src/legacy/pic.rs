@@ -382,6 +382,12 @@ impl Pic {
     /// Acknowledge the highest-priority pending interrupt and inject it
     /// into vCPU 0 via WHvRequestInterrupt.  No-op when `vm` is `None`
     /// (tests).
+    ///
+    /// `get_external_interrupt` sets the ISR bit for the delivered IRQ.
+    /// On real hardware the guest's EOI clears it, but WHP's LAPIC handles
+    /// EOI internally and never forwards it to this software PIC.  We
+    /// flush ISR after injection so subsequent same-priority interrupts
+    /// are not blocked.
     fn deliver_to_whp(&mut self) {
         let vm = match &self.vm {
             Some(v) => v.clone(),
@@ -389,6 +395,10 @@ impl Pic {
         };
 
         if let Some(vector) = self.get_external_interrupt() {
+            // Flush ISR: the LAPIC owns EOI, not us.
+            self.pics[PicSelect::Primary as usize].isr = 0;
+            self.pics[PicSelect::Secondary as usize].isr = 0;
+
             let req = InterruptRequest {
                 interrupt_type: InterruptType::Fixed,
                 destination_mode: InterruptDestinationMode::Physical,
