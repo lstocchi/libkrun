@@ -55,7 +55,7 @@ use devices::legacy::{GicV3, HvfGicV3};
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 use devices::legacy::{IoApic, IrqChipT};
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-use devices::legacy::WhpIoapic;
+use devices::legacy::{Pic, PicPort, PicSelect, Pit, WhpIoapic};
 use devices::legacy::{IrqChip, IrqChipDevice};
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 use devices::legacy::{KvmGicV2, KvmGicV3};
@@ -907,6 +907,24 @@ pub fn build_microvm(
         intc = Arc::new(Mutex::new(IrqChipDevice::new(Box::new(
             WhpIoapic::new(vm.whp_vm().clone()),
         ))));
+
+        // 8259 PIC emulation — required for early-boot timer interrupts
+        // before the kernel switches to APIC mode and programs the IOAPIC.
+        let pic = Arc::new(Mutex::new(Pic::new(vm.whp_vm().clone())));
+        pio_device_manager.pic_master =
+            Some(Arc::new(Mutex::new(PicPort::new(pic.clone(), PicSelect::Primary))));
+        pio_device_manager.pic_slave =
+            Some(Arc::new(Mutex::new(PicPort::new(pic.clone(), PicSelect::Secondary))));
+
+        // Create a userspace PIT (i8254) for timer interrupts.
+        // On Linux/KVM the PIT is emulated in-kernel; on WHP we need our own.
+        let pit = Pit::new_with_pic(intc.clone(), pic);
+        pio_device_manager
+            .i8042
+            .lock()
+            .unwrap()
+            .set_pit_counter2(pit.counter2());
+        pio_device_manager.pit = Some(Arc::new(Mutex::new(pit)));
 
         attach_legacy_devices_whp(
             &mut pio_device_manager,
