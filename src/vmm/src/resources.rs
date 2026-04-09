@@ -7,7 +7,10 @@
 use std::fs::File;
 #[cfg(feature = "tee")]
 use std::io::BufReader;
+#[cfg(unix)]
 use std::os::fd::RawFd;
+#[cfg(target_os = "windows")]
+use utils::windows::SendHandle;
 use std::path::PathBuf;
 
 #[cfg(feature = "tee")]
@@ -17,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use crate::vmm_config::block::{BlockBuilder, BlockConfigError, BlockDeviceConfig};
 use crate::vmm_config::external_kernel::ExternalKernel;
 use crate::vmm_config::firmware::FirmwareConfig;
-#[cfg(not(feature = "tee"))]
+#[cfg(not(any(feature = "tee", target_os = "windows")))]
 use crate::vmm_config::fs::*;
 #[cfg(feature = "tee")]
 use crate::vmm_config::kernel_bundle::{InitrdBundle, QbootBundle, QbootBundleError};
@@ -84,15 +87,30 @@ impl Default for TeeConfig {
     }
 }
 
+#[cfg(unix)]
 pub struct SerialConsoleConfig {
     pub input_fd: RawFd,
     pub output_fd: RawFd,
 }
 
+#[cfg(windows)]
+pub struct SerialConsoleConfig {
+    pub input_handle: SendHandle,
+    pub output_handle: SendHandle,
+}
+
+#[cfg(unix)]
 pub struct DefaultVirtioConsoleConfig {
     pub input_fd: RawFd,
     pub output_fd: RawFd,
     pub err_fd: RawFd,
+}
+
+#[cfg(windows)]
+pub struct DefaultVirtioConsoleConfig {
+    pub input_handle: SendHandle,
+    pub output_handle: SendHandle,
+    pub err_handle: SendHandle,
 }
 
 pub enum VirtioConsoleConfigMode {
@@ -100,6 +118,7 @@ pub enum VirtioConsoleConfigMode {
     Explicit(Vec<PortConfig>),
 }
 
+#[cfg(unix)]
 pub enum PortConfig {
     Tty {
         name: String,
@@ -109,6 +128,19 @@ pub enum PortConfig {
         name: String,
         input_fd: RawFd,
         output_fd: RawFd,
+    },
+}
+
+#[cfg(windows)]
+pub enum PortConfig {
+    Tty {
+        name: String,
+        tty_handle: SendHandle,
+    },
+    InOut {
+        name: String,
+        input_handle: SendHandle,
+        output_handle: SendHandle,
     },
 }
 
@@ -145,7 +177,7 @@ pub struct VmResources {
     #[cfg(feature = "tee")]
     pub initrd_bundle: Option<InitrdBundle>,
     /// The fs device.
-    #[cfg(not(feature = "tee"))]
+    #[cfg(not(any(feature = "tee", target_os = "windows")))]
     pub fs: Vec<FsDeviceConfig>,
     /// The vsock device.
     pub vsock: VsockBuilder,
@@ -198,7 +230,9 @@ impl VmResources {
         // supplied by the user.
         VcpuConfig {
             vcpu_count: self.vm_config().vcpu_count.unwrap(),
+            #[cfg(not(target_os = "windows"))]
             ht_enabled: self.vm_config().ht_enabled.unwrap(),
+            #[cfg(not(target_os = "windows"))]
             cpu_template: self.vm_config().cpu_template,
         }
     }
@@ -262,7 +296,15 @@ impl VmResources {
 
     pub fn set_kernel_bundle(&mut self, kernel_bundle: KernelBundle) -> Result<KernelBundleError> {
         // Safe because this call just returns the page size and doesn't have any side effects.
+        #[cfg(unix)]
         let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize };
+        #[cfg(windows)]
+        let page_size = {
+            use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
+            let mut si: SYSTEM_INFO = unsafe { std::mem::zeroed() };
+            unsafe { GetSystemInfo(&mut si) };
+            si.dwPageSize as usize
+        };
 
         if kernel_bundle.host_addr == 0 || (kernel_bundle.host_addr as usize) & (page_size - 1) != 0
         {
@@ -315,7 +357,7 @@ impl VmResources {
         Ok(())
     }
 
-    #[cfg(not(feature = "tee"))]
+    #[cfg(not(any(feature = "tee", target_os = "windows")))]
     pub fn add_fs_device(&mut self, config: FsDeviceConfig) {
         self.fs.push(config)
     }
@@ -326,6 +368,7 @@ impl VmResources {
     }
 
     /// Sets a vsock device to be attached when the VM starts.
+    #[cfg(unix)]
     pub fn set_vsock_device(&mut self, config: VsockDeviceConfig) -> Result<VsockConfigError> {
         self.vsock.insert(config)
     }
@@ -409,6 +452,7 @@ mod tests {
             kernel_cmdline: default_kernel_cmdline(),
             kernel_bundle: Default::default(),
             external_kernel: None,
+            #[cfg(not(any(feature = "tee", target_os = "windows")))]
             fs: Default::default(),
             vsock: Default::default(),
             #[cfg(feature = "net")]
@@ -439,7 +483,9 @@ mod tests {
         let vm_resources = default_vm_resources();
         let expected_vcpu_config = VcpuConfig {
             vcpu_count: vm_resources.vm_config().vcpu_count.unwrap(),
+            #[cfg(not(target_os = "windows"))]
             ht_enabled: vm_resources.vm_config().ht_enabled.unwrap(),
+            #[cfg(not(target_os = "windows"))]
             cpu_template: vm_resources.vm_config().cpu_template,
         };
 

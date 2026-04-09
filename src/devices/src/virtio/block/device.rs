@@ -109,12 +109,36 @@ impl DiskProperties {
     fn build_device_id(disk_file: &File) -> result::Result<String, Error> {
         let blk_metadata = disk_file.metadata().map_err(Error::GetFileMetadata)?;
         // This is how kvmtool does it.
+        #[cfg(unix)]
         let device_id = format!(
             "{}{}{}",
             blk_metadata.st_dev(),
             blk_metadata.st_rdev(),
             blk_metadata.st_ino()
         );
+        #[cfg(windows)]
+        let device_id = {
+            use std::mem::MaybeUninit;
+            use std::os::windows::io::AsRawHandle;
+            let mut info = MaybeUninit::<windows_sys::Win32::Storage::FileSystem::BY_HANDLE_FILE_INFORMATION>::zeroed();
+            let ret = unsafe {
+                windows_sys::Win32::Storage::FileSystem::GetFileInformationByHandle(
+                    disk_file.as_raw_handle(),
+                    info.as_mut_ptr(),
+                )
+            };
+            if ret != 0 {
+                let info = unsafe { info.assume_init() };
+                format!(
+                    "{}{}{}",
+                    info.dwVolumeSerialNumber,
+                    info.nFileIndexHigh,
+                    info.nFileIndexLow
+                )
+            } else {
+                format!("{}", blk_metadata.len())
+            }
+        };
         Ok(device_id)
     }
 

@@ -93,11 +93,19 @@ impl Balloon {
                     "balloon: should release guest_addr={:?} host_addr={:p} len={}",
                     desc.addr, host_addr, desc.len
                 );
+                #[cfg(unix)]
                 unsafe {
                     libc::madvise(
                         host_addr as *mut libc::c_void,
                         desc.len.try_into().unwrap(),
                         libc::MADV_DONTNEED,
+                    )
+                };
+                #[cfg(windows)]
+                unsafe {
+                    windows_sys::Win32::System::Memory::DiscardVirtualMemory(
+                        host_addr as *mut core::ffi::c_void,
+                        desc.len as usize,
                     )
                 };
             }

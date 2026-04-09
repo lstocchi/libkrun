@@ -4,16 +4,21 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
+#[cfg(unix)]
 use std::sync::{Arc, Mutex};
 
-use devices::virtio::{TsiFlags, Vsock, VsockError};
+use devices::virtio::TsiFlags;
+#[cfg(unix)]
+use devices::virtio::{Vsock, VsockError};
 
+#[cfg(unix)]
 type MutexVsock = Arc<Mutex<Vsock>>;
 
 /// Errors associated with `NetworkInterfaceConfig`.
 #[derive(Debug)]
 pub enum VsockConfigError {
     /// Failed to create the vsock device.
+    #[cfg(unix)]
     CreateVsockDevice(VsockError),
 }
 
@@ -21,6 +26,7 @@ impl fmt::Display for VsockConfigError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         use self::VsockConfigError::*;
         match *self {
+            #[cfg(unix)]
             CreateVsockDevice(ref e) => write!(f, "Cannot create vsock device: {e:?}"),
         }
     }
@@ -44,6 +50,7 @@ pub struct VsockDeviceConfig {
     pub tsi_flags: TsiFlags,
 }
 
+#[cfg(unix)]
 struct VsockWrapper {
     vsock: MutexVsock,
 }
@@ -51,6 +58,7 @@ struct VsockWrapper {
 /// A builder of Vsock from 'VsockDeviceConfig'.
 #[derive(Default)]
 pub struct VsockBuilder {
+    #[cfg(unix)]
     inner: Option<VsockWrapper>,
     tsi_flags: TsiFlags,
 }
@@ -59,6 +67,7 @@ impl VsockBuilder {
     /// Creates an empty Vsock.
     pub fn new() -> Self {
         Self {
+            #[cfg(unix)]
             inner: None,
             tsi_flags: TsiFlags::empty(),
         }
@@ -66,6 +75,7 @@ impl VsockBuilder {
 
     /// Inserts a Vsock in the store.
     /// If an entry already exists, it will overwrite it.
+    #[cfg(unix)]
     pub fn insert(&mut self, cfg: VsockDeviceConfig) -> Result<()> {
         self.tsi_flags = cfg.tsi_flags;
         self.inner = Some(VsockWrapper {
@@ -75,6 +85,7 @@ impl VsockBuilder {
     }
 
     /// Provides a reference to the Vsock if present.
+    #[cfg(unix)]
     pub fn get(&self) -> Option<&MutexVsock> {
         self.inner.as_ref().map(|pair| &pair.vsock)
     }
@@ -84,6 +95,7 @@ impl VsockBuilder {
     }
 
     /// Creates a Vsock device from a VsockDeviceConfig.
+    #[cfg(unix)]
     pub fn create_vsock(cfg: VsockDeviceConfig) -> Result<Vsock> {
         Vsock::new(
             u64::from(cfg.guest_cid),

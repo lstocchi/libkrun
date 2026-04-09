@@ -12,9 +12,20 @@ use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use std::fs::File;
 use std::io::{self, IsTerminal, Read};
+#[cfg(unix)]
 use std::os::fd::AsRawFd;
+#[cfg(unix)]
 use std::os::fd::{BorrowedFd, FromRawFd};
+#[cfg(windows)]
+use std::os::windows::io::{AsRawHandle, BorrowedHandle, FromRawHandle};
 use std::path::PathBuf;
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+#[cfg(windows)]
+use windows_sys::Win32::System::Console::{
+    GetConsoleMode, GetConsoleScreenBufferInfo, GetStdHandle, CONSOLE_MODE,
+    CONSOLE_SCREEN_BUFFER_INFO, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+};
 use std::sync::atomic::AtomicI32;
 use std::sync::{Arc, Mutex};
 
@@ -23,9 +34,10 @@ use super::{Error, Vmm};
 #[cfg(target_arch = "x86_64")]
 use crate::device_manager::legacy::PortIODeviceManager;
 use crate::device_manager::mmio::MMIODeviceManager;
-use crate::resources::{
-    DefaultVirtioConsoleConfig, PortConfig, TsiFlags, VirtioConsoleConfigMode, VmResources,
-};
+use crate::resources::{DefaultVirtioConsoleConfig, PortConfig, VirtioConsoleConfigMode};
+#[cfg(unix)]
+use crate::resources::TsiFlags;
+use crate::resources::VmResources;
 use crate::vmm_config::external_kernel::{ExternalKernel, KernelFormat};
 #[cfg(feature = "net")]
 use crate::vmm_config::net::NetBuilder;
@@ -33,19 +45,23 @@ use crate::vmm_config::net::NetBuilder;
 use devices::legacy::Cmos;
 #[cfg(all(target_os = "linux", target_arch = "riscv64"))]
 use devices::legacy::KvmAia;
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 use devices::legacy::KvmIoapic;
 use devices::legacy::Serial;
 #[cfg(target_os = "macos")]
 use devices::legacy::VcpuList;
 #[cfg(target_os = "macos")]
 use devices::legacy::{GicV3, HvfGicV3};
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 use devices::legacy::{IoApic, IrqChipT};
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+use devices::legacy::{Pic, PicPort, PicSelect, Pit, WhpIoapic};
 use devices::legacy::{IrqChip, IrqChipDevice};
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 use devices::legacy::{KvmGicV2, KvmGicV3};
-use devices::virtio::{port_io, MmioTransport, PortDescription, VirtioDevice, Vsock};
+use devices::virtio::{port_io, MmioTransport, PortDescription, VirtioDevice};
+#[cfg(unix)]
+use devices::virtio::Vsock;
 
 #[cfg(feature = "tee")]
 use kbs_types::Tee;
@@ -58,7 +74,7 @@ use crate::signal_handler::register_sigwinch_handler;
 use crate::terminal::{term_restore_mode, term_set_raw_mode};
 #[cfg(feature = "blk")]
 use crate::vmm_config::block::BlockBuilder;
-#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+#[cfg(not(any(feature = "tee", feature = "aws-nitro", target_os = "windows")))]
 use crate::vmm_config::fs::FsDeviceConfig;
 use crate::vmm_config::kernel_cmdline::DEFAULT_KERNEL_CMDLINE;
 #[cfg(target_os = "linux")]
@@ -72,8 +88,10 @@ use device_manager::shm::ShmManager;
 use devices::virtio::display::DisplayInfo;
 #[cfg(feature = "gpu")]
 use devices::virtio::display::NoopDisplayBackend;
+#[cfg(not(any(feature = "tee", feature = "aws-nitro", target_os = "windows")))]
+use devices::virtio::fs::ExportTable;
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
-use devices::virtio::{fs::ExportTable, VirtioShmRegion};
+use devices::virtio::VirtioShmRegion;
 use flate2::read::GzDecoder;
 #[cfg(feature = "gpu")]
 use krun_display::DisplayBackend;
@@ -81,9 +99,11 @@ use krun_display::DisplayBackend;
 use krun_display::IntoDisplayBackend;
 #[cfg(feature = "amd-sev")]
 use kvm_bindings::KVM_MAX_CPUID_ENTRIES;
+#[cfg(not(target_os = "windows"))]
 use libc::{STDERR_FILENO, STDIN_FILENO, STDOUT_FILENO};
 #[cfg(target_arch = "x86_64")]
 use linux_loader::loader::{self, KernelLoader};
+#[cfg(not(target_os = "windows"))]
 use nix::unistd::isatty;
 use polly::event_manager::{Error as EventManagerError, EventManager};
 use utils::eventfd::EventFd;
@@ -98,6 +118,9 @@ use vm_memory::GuestMemory;
 #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
 use vm_memory::GuestRegionMmap;
 use vm_memory::{GuestAddress, GuestMemoryMmap};
+
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+use arch::x86_64::layout::AP_TRAMPOLINE_START;
 
 #[cfg(target_arch = "aarch64")]
 #[allow(dead_code)]
@@ -178,6 +201,8 @@ pub enum StartMicrovmError {
     OpenBlockDevice(io::Error),
     /// Cannot open console output file.
     OpenConsoleFile(io::Error),
+    /// Failed to set up a console port (e.g. handle duplication).
+    ConsolePortSetup(io::Error),
     /// The GZIP decoder couldn't decompress the kernel.
     PeGzDecoder(io::Error),
     /// Cannot open the file containing the kernel code.
@@ -363,6 +388,9 @@ impl Display for StartMicrovmError {
 
                 write!(f, "Cannot open the console output file. {err_msg}")
             }
+            ConsolePortSetup(ref err) => {
+                write!(f, "Failed to set up console port: {err}")
+            }
             PeGzDecoder(ref err) => {
                 write!(f, "The GZIP decoder couldn't decompress the kernel. {err}")
             }
@@ -517,7 +545,7 @@ impl Display for StartMicrovmError {
 }
 
 pub enum Payload {
-    #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
+    #[cfg(all(target_arch = "x86_64", not(feature = "tee"), not(target_os = "windows")))]
     KernelMmap,
     #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
     KernelCopy,
@@ -544,6 +572,9 @@ fn choose_payload(vm_resources: &VmResources) -> Result<Payload, StartMicrovmErr
 
         #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
         return Ok(Payload::KernelCopy);
+
+        #[cfg(target_os = "windows")]
+        return Err(StartMicrovmError::MissingKernelConfig);
     } else if let Some(external_kernel) = vm_resources.external_kernel() {
         Ok(Payload::ExternalKernel(external_kernel.clone()))
     } else if cfg!(feature = "efi") || vm_resources.firmware_config.is_some() {
@@ -609,9 +640,13 @@ pub fn build_microvm(
         kernel_cmdline.insert_str(cmdline).unwrap();
     }
 
-    #[cfg(not(feature = "tee"))]
+    #[cfg(all(not(feature = "tee"), not(target_os = "windows")))]
     #[allow(unused_mut)]
     let mut vm = setup_vm(&guest_memory, vm_resources.nested_enabled)?;
+
+    #[cfg(all(not(feature = "tee"), target_os = "windows"))]
+    #[allow(unused_mut)]
+    let mut vm = setup_vm(&guest_memory, vcpu_config.vcpu_count)?;
 
     #[cfg(feature = "tee")]
     let (_kvm, vm) = {
@@ -747,18 +782,38 @@ pub fn build_microvm(
     let mut serial_ttys = Vec::new();
 
     for s in &vm_resources.serial_consoles {
-        let input: Option<Box<dyn devices::legacy::ReadableFd + Send>> = if s.input_fd >= 0 {
+        #[cfg(unix)]
+        let has_input = s.input_fd >= 0;
+        #[cfg(windows)]
+        let has_input = !s.input_handle.as_raw_handle().is_null();
+
+        let input: Option<Box<dyn devices::legacy::ReadableFd + Send>> = if has_input {
+            #[cfg(unix)]
             let file = unsafe { File::from_raw_fd(s.input_fd) };
+            #[cfg(windows)]
+            let file = unsafe { File::from_raw_handle(s.input_handle.as_raw_handle()) };
             if file.is_terminal() {
+                #[cfg(unix)]
                 serial_ttys.push(unsafe { BorrowedFd::borrow_raw(file.as_raw_fd()) });
+                #[cfg(windows)]
+                serial_ttys.push(unsafe { BorrowedHandle::borrow_raw(file.as_raw_handle()) });
             }
             Some(Box::new(file))
         } else {
             None
         };
 
-        let output: Option<Box<dyn io::Write + Send>> = if s.output_fd >= 0 {
-            Some(Box::new(unsafe { File::from_raw_fd(s.output_fd) }))
+        #[cfg(unix)]
+        let has_output = s.output_fd >= 0;
+        #[cfg(windows)]
+        let has_output = !s.output_handle.as_raw_handle().is_null();
+
+        let output: Option<Box<dyn io::Write + Send>> = if has_output {
+            #[cfg(unix)]
+            let file = unsafe { File::from_raw_fd(s.output_fd) };
+            #[cfg(windows)]
+            let file = unsafe { File::from_raw_handle(s.output_handle.as_raw_handle()) };
+            Some(Box::new(file))
         } else {
             None
         };
@@ -806,7 +861,7 @@ pub fn build_microvm(
     let intc: IrqChip;
     // For x86_64 we need to create the interrupt controller before calling `KVM_CREATE_VCPUS`
     // while on aarch64 we need to do it the other way around.
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     {
         let ioapic: Box<dyn IrqChipT> = if vm_resources.split_irqchip {
             Box::new(
@@ -838,6 +893,55 @@ pub fn build_microvm(
             kernel_boot,
             #[cfg(feature = "tee")]
             _sender,
+        )
+        .map_err(StartMicrovmError::Internal)?;
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+    {
+        // WHP emulates the local APIC but not the IOAPIC, so we provide a
+        // software IOAPIC that injects interrupts via WHvRequestInterrupt.
+        // Unlike KVM there is no register_irqfd shortcut -- device interrupts
+        // go through WhpIoapic::set_irq() → WHvRequestInterrupt() entirely
+        // in userspace.
+        intc = Arc::new(Mutex::new(IrqChipDevice::new(Box::new(
+            WhpIoapic::new(vm.whp_vm().clone()),
+        ))));
+
+        // 8259 PIC emulation — required for early-boot timer interrupts
+        // before the kernel switches to APIC mode and programs the IOAPIC.
+        let pic = Arc::new(Mutex::new(Pic::new(vm.whp_vm().clone())));
+        pio_device_manager.pic_master =
+            Some(Arc::new(Mutex::new(PicPort::new(pic.clone(), PicSelect::Primary))));
+        pio_device_manager.pic_slave =
+            Some(Arc::new(Mutex::new(PicPort::new(pic.clone(), PicSelect::Secondary))));
+
+        // Create a userspace PIT (i8254) for timer interrupts.
+        // On Linux/KVM the PIT is emulated in-kernel; on WHP we need our own.
+        let pit = Pit::new_with_pic(intc.clone(), pic);
+        pio_device_manager
+            .i8042
+            .lock()
+            .unwrap()
+            .set_pit_counter2(pit.counter2());
+        pio_device_manager.pit = Some(Arc::new(Mutex::new(pit)));
+
+        attach_legacy_devices_whp(
+            &mut pio_device_manager,
+            &mut mmio_device_manager,
+            Some(intc.clone()),
+        )?;
+
+        let kernel_boot = vm_resources.firmware_config.is_none();
+
+        vcpus = create_vcpus_x86_64_whp(
+            &vm,
+            &vcpu_config,
+            &guest_memory,
+            payload_config.entry_addr,
+            &pio_device_manager.io_bus,
+            &exit_evt,
+            kernel_boot,
         )
         .map_err(StartMicrovmError::Internal)?;
     }
@@ -973,7 +1077,7 @@ pub fn build_microvm(
     attach_balloon_device(&mut vmm, event_manager, intc.clone())?;
     #[cfg(not(feature = "tee"))]
     attach_rng_device(&mut vmm, event_manager, intc.clone())?;
-    let mut console_id = 0;
+    let mut console_id: u32 = 0;
     if !vm_resources.disable_implicit_console {
         attach_console_devices(
             &mut vmm,
@@ -998,7 +1102,7 @@ pub fn build_microvm(
         console_id += 1;
     }
 
-    #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+    #[cfg(not(any(feature = "tee", feature = "aws-nitro", target_os = "windows")))]
     let export_table: Option<ExportTable> = if cfg!(feature = "gpu") {
         Some(Default::default())
     } else {
@@ -1030,7 +1134,7 @@ pub fn build_microvm(
         attach_input_devices(&mut vmm, &vm_resources.input_backends, intc.clone())?;
     }
 
-    #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+    #[cfg(not(any(feature = "tee", feature = "aws-nitro", target_os = "windows")))]
     attach_fs_devices(
         &mut vmm,
         &vm_resources.fs,
@@ -1045,6 +1149,7 @@ pub fn build_microvm(
     #[cfg(feature = "blk")]
     attach_block_devices(&mut vmm, &vm_resources.block, intc.clone())?;
 
+    #[cfg(unix)]
     if let Some(vsock) = vm_resources.vsock.get() {
         attach_unixsock_vsock_device(&mut vmm, vsock, event_manager, intc.clone())?;
         let tsi_flags = vm_resources.vsock.tsi_flags();
@@ -1316,7 +1421,7 @@ fn load_payload(
                 .unwrap();
             Ok((guest_mem, GuestAddress(kernel_entry_addr), None, None))
         }
-        #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
+        #[cfg(all(target_arch = "x86_64", not(feature = "tee"), not(target_os = "windows")))]
         Payload::KernelMmap => {
             let (kernel_entry_addr, kernel_host_addr, kernel_guest_addr, kernel_size) =
                 if let Some(kernel_bundle) = &_vm_resources.kernel_bundle {
@@ -1441,7 +1546,7 @@ pub fn create_guest_memory(
 
     #[cfg(target_arch = "x86_64")]
     let (arch_mem_info, mut arch_mem_regions) = match payload {
-        #[cfg(not(feature = "tee"))]
+        #[cfg(not(any(feature = "tee", target_os = "windows")))]
         Payload::KernelMmap => {
             let (kernel_guest_addr, kernel_size) =
                 if let Some(kernel_bundle) = &vm_resources.kernel_bundle {
@@ -1482,7 +1587,7 @@ pub fn create_guest_memory(
 
     let mut shm_manager = ShmManager::new(&arch_mem_info);
 
-    #[cfg(not(feature = "tee"))]
+    #[cfg(not(any(feature = "tee", target_os = "windows")))]
     for (index, fs) in vm_resources.fs.iter().enumerate() {
         if let Some(shm_size) = fs.shm_size {
             shm_manager
@@ -1585,6 +1690,19 @@ pub(crate) fn setup_vm(
         .map_err(StartMicrovmError::Internal)?;
     Ok(vm)
 }
+#[cfg(all(target_os = "windows", not(feature = "tee")))]
+pub(crate) fn setup_vm(
+    guest_memory: &GuestMemoryMmap,
+    vcpu_count: u8,
+) -> std::result::Result<Vm, StartMicrovmError> {
+    let mut vm = Vm::new(vcpu_count)
+        .map_err(Error::Vm)
+        .map_err(StartMicrovmError::Internal)?;
+    vm.memory_init(guest_memory)
+        .map_err(Error::Vm)
+        .map_err(StartMicrovmError::Internal)?;
+    Ok(vm)
+}
 
 /// Sets up the serial device.
 pub fn setup_serial_device(
@@ -1610,7 +1728,7 @@ pub fn setup_serial_device(
     Ok(serial)
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 fn attach_legacy_devices(
     vm: &Vm,
     split_irqchip: bool,
@@ -1715,7 +1833,7 @@ fn attach_legacy_devices(
     Ok(())
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[allow(clippy::too_many_arguments)]
 fn create_vcpus_x86_64(
     vm: &Vm,
@@ -1747,6 +1865,75 @@ fn create_vcpus_x86_64(
         vcpus.push(vcpu);
     }
     Ok(vcpus)
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+fn attach_legacy_devices_whp(
+    pio_device_manager: &mut PortIODeviceManager,
+    mmio_device_manager: &mut MMIODeviceManager,
+    intc: Option<Arc<Mutex<IrqChipDevice>>>,
+) -> std::result::Result<(), StartMicrovmError> {
+    pio_device_manager
+        .register_devices()
+        .map_err(Error::LegacyIOBus)
+        .map_err(StartMicrovmError::Internal)?;
+
+    mmio_device_manager
+        .register_mmio_ioapic(intc)
+        .map_err(Error::RegisterMMIODevice)
+        .map_err(StartMicrovmError::Internal)?;
+
+    Ok(())
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+fn create_vcpus_x86_64_whp(
+    vm: &Vm,
+    vcpu_config: &VcpuConfig,
+    guest_mem: &GuestMemoryMmap,
+    entry_addr: GuestAddress,
+    io_bus: &devices::Bus,
+    exit_evt: &EventFd,
+    kernel_boot: bool,
+) -> super::Result<Vec<Vcpu>> {
+    // WHP doesn't put AP vCPUs in "wait-for-SIPI" state automatically.
+    // Place a `cli; hlt; jmp` idle loop in low memory so APs park there
+    // in real mode until the BSP sends INIT+SIPI via the emulated APIC.
+    if kernel_boot && vcpu_config.vcpu_count > 1 {
+        write_ap_trampoline(guest_mem);
+    }
+
+    let mut vcpus = Vec::with_capacity(vcpu_config.vcpu_count as usize);
+    for cpu_index in 0..vcpu_config.vcpu_count {
+        let mut vcpu = Vcpu::new_x86_64(
+            cpu_index,
+            vm.whp_vm().clone(),
+            guest_mem.clone(),
+            io_bus.clone(),
+            exit_evt.try_clone().map_err(Error::EventFd)?,
+        )
+        .map_err(Error::Vcpu)?;
+
+        vcpu.configure_x86_64(guest_mem, entry_addr, kernel_boot)
+            .map_err(Error::Vcpu)?;
+
+        vcpus.push(vcpu);
+    }
+    Ok(vcpus)
+}
+
+/// Write a tiny `cli; hlt; jmp` loop at [`arch::x86_64::layout::AP_TRAMPOLINE_START`]
+/// so that AP vCPUs idle in real mode until the BSP sends INIT + SIPI.
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+fn write_ap_trampoline(guest_mem: &GuestMemoryMmap) {
+    const AP_IDLE_CODE: [u8; 4] = [
+        0xFA, // cli
+        0xF4, // hlt
+        0xEB, 0xFC, // jmp short $-4  (back to cli)
+    ];
+    guest_mem
+        .write_slice(&AP_IDLE_CODE, GuestAddress(AP_TRAMPOLINE_START))
+        .expect("AP trampoline address must be within guest memory");
 }
 
 #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
@@ -1860,7 +2047,7 @@ fn attach_mmio_device(
     let (_mmio_base, _irq) =
         vmm.mmio_device_manager
             .register_mmio_device(vmm.vm.fd(), mmio_device, type_id, id)?;
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     let (_mmio_base, _irq) =
         vmm.mmio_device_manager
             .register_mmio_device(mmio_device, type_id, id)?;
@@ -1872,7 +2059,7 @@ fn attach_mmio_device(
     Ok(())
 }
 
-#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+#[cfg(not(any(feature = "tee", feature = "aws-nitro", target_os = "windows")))]
 fn attach_fs_devices(
     vmm: &mut Vmm,
     fs_devs: &[FsDeviceConfig],
@@ -1923,6 +2110,7 @@ fn attach_fs_devices(
     Ok(())
 }
 
+#[cfg(unix)]
 fn autoconfigure_console_ports(
     vmm: &mut Vmm,
     vm_resources: &VmResources,
@@ -2038,6 +2226,138 @@ fn autoconfigure_console_ports(
     }
 }
 
+#[cfg(windows)]
+fn is_valid_handle(h: *mut core::ffi::c_void) -> bool {
+    !h.is_null() && h != INVALID_HANDLE_VALUE
+}
+
+#[cfg(windows)]
+fn autoconfigure_console_ports(
+    vmm: &mut Vmm,
+    vm_resources: &VmResources,
+    cfg: Option<&DefaultVirtioConsoleConfig>,
+    creating_implicit_console: bool,
+) -> std::result::Result<
+    (Vec<PortDescription>, Option<port_io::ConsoleInputReader>),
+    StartMicrovmError,
+> {
+    use self::StartMicrovmError::*;
+
+    let is_console_handle = |h: *mut core::ffi::c_void| -> bool {
+        if !is_valid_handle(h) {
+            return false;
+        }
+        unsafe {
+            let mut mode: CONSOLE_MODE = 0;
+            GetConsoleMode(h, &mut mode) != 0
+        }
+    };
+
+    let mut console_output_path: Option<PathBuf> = None;
+    if let Some(path) = vm_resources.console_output.clone() {
+        if !vm_resources.disable_implicit_console && creating_implicit_console {
+            console_output_path = Some(path)
+        }
+    }
+
+    if let Some(console_output_path) = console_output_path {
+        let file = File::create(console_output_path).map_err(OpenConsoleFile)?;
+        let stdin_h = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+        let term = if is_console_handle(stdin_h) {
+            port_io::term_handle(stdin_h).map_err(ConsolePortSetup)?
+        } else {
+            port_io::term_fixed_size(0, 0)
+        };
+        Ok((
+            vec![PortDescription::console(
+                Some(port_io::input_empty().map_err(ConsolePortSetup)?),
+                Some(port_io::output_file(file).map_err(ConsolePortSetup)?),
+                term,
+            )],
+            None,
+        ))
+    } else {
+        let (stdin_h, stdout_h, stderr_h) = match cfg {
+            Some(c) => (c.input_handle.as_raw_handle(), c.output_handle.as_raw_handle(), c.err_handle.as_raw_handle()),
+            None => unsafe {
+                (
+                    GetStdHandle(STD_INPUT_HANDLE),
+                    GetStdHandle(STD_OUTPUT_HANDLE),
+                    GetStdHandle(STD_ERROR_HANDLE),
+                )
+            },
+        };
+
+        let input_is_terminal = is_console_handle(stdin_h);
+        let output_is_terminal = is_console_handle(stdout_h);
+        let error_is_terminal = is_console_handle(stderr_h);
+
+        let term_handle: Option<*mut core::ffi::c_void> = if input_is_terminal {
+            Some(stdin_h)
+        } else if output_is_terminal {
+            Some(stdout_h)
+        } else if error_is_terminal {
+            Some(stderr_h)
+        } else {
+            None
+        };
+
+        let forwarding_sigint = false;
+        let (console_input, console_reader) = if input_is_terminal {
+            let reader = port_io::ConsoleInputReader::new(stdin_h).map_err(ConsolePortSetup)?;
+            let input = reader.create_port_input().map_err(ConsolePortSetup)?;
+            (Some(input), Some(reader))
+        } else {
+            (Some(port_io::input_empty().map_err(ConsolePortSetup)?), None)
+        };
+
+        let console_output = if output_is_terminal {
+            Some(port_io::output_to_handle_dup(stdout_h).map_err(ConsolePortSetup)?)
+        } else {
+            Some(port_io::output_to_log_as_err())
+        };
+
+        let terminal_properties = match term_handle {
+            Some(h) => port_io::term_handle(h).map_err(ConsolePortSetup)?,
+            None => port_io::term_fixed_size(0, 0),
+        };
+
+        let borrowed_term = term_handle
+            .map(|h| unsafe { BorrowedHandle::borrow_raw(h) });
+        setup_terminal_raw_mode(vmm, borrowed_term, forwarding_sigint);
+
+        let mut ports = vec![PortDescription::console(
+            console_input,
+            console_output,
+            terminal_properties,
+        )];
+
+        if is_valid_handle(stdin_h) && !input_is_terminal {
+            ports.push(PortDescription::input_pipe(
+                "krun-stdin",
+                port_io::input_to_handle_dup(stdin_h).map_err(ConsolePortSetup)?,
+            ));
+        }
+
+        if is_valid_handle(stdout_h) && !output_is_terminal {
+            ports.push(PortDescription::output_pipe(
+                "krun-stdout",
+                port_io::output_to_handle_dup(stdout_h).map_err(ConsolePortSetup)?,
+            ));
+        }
+
+        if is_valid_handle(stderr_h) && !error_is_terminal {
+            ports.push(PortDescription::output_pipe(
+                "krun-stderr",
+                port_io::output_to_handle_dup(stderr_h).map_err(ConsolePortSetup)?,
+            ));
+        }
+
+        Ok((ports, console_reader))
+    }
+}
+
+#[cfg(unix)]
 fn setup_terminal_raw_mode(
     vmm: &mut Vmm,
     term_fd: Option<BorrowedFd<'_>>,
@@ -2062,6 +2382,33 @@ fn setup_terminal_raw_mode(
     }
 }
 
+#[cfg(target_os = "windows")]
+fn setup_terminal_raw_mode(
+    vmm: &mut Vmm,
+    term_handle: Option<std::os::windows::io::BorrowedHandle<'_>>,
+    handle_signals_by_terminal: bool,
+) {
+    if let Some(term_handle) = term_handle {
+        match term_set_raw_mode(term_handle, handle_signals_by_terminal) {
+            Ok(old_mode) => {
+                let handle = utils::windows::SendHandle(term_handle.as_raw_handle());
+                vmm.exit_observers.push(Arc::new(Mutex::new(move || {
+                    if let Err(e) = term_restore_mode(
+                        unsafe { BorrowedHandle::borrow_raw(handle.as_raw_handle()) },
+                        &old_mode,
+                    ) {
+                        log::error!("Failed to restore terminal mode: {e}")
+                    }
+                })));
+            }
+            Err(e) => {
+                log::error!("Failed to set terminal to raw mode: {e}")
+            }
+        };
+    }
+}
+
+#[cfg(unix)]
 fn create_explicit_ports(
     vmm: &mut Vmm,
     port_configs: &[PortConfig],
@@ -2108,6 +2455,71 @@ fn create_explicit_ports(
     Ok(ports)
 }
 
+#[cfg(windows)]
+fn create_explicit_ports(
+    vmm: &mut Vmm,
+    port_configs: &[PortConfig],
+) -> std::result::Result<(Vec<PortDescription>, Option<port_io::ConsoleInputReader>), StartMicrovmError> {
+    use self::StartMicrovmError::*;
+
+    let mut ports = Vec::with_capacity(port_configs.len());
+    let mut reader = None;
+
+    for port_cfg in port_configs {
+        let port_desc = match port_cfg {
+            PortConfig::Tty { name, tty_handle } => {
+                let h = tty_handle.as_raw_handle();
+                let is_console = unsafe {
+                    let mut mode: CONSOLE_MODE = 0;
+                    GetConsoleMode(h, &mut mode) != 0
+                };
+
+                let borrowed = unsafe { BorrowedHandle::borrow_raw(h) };
+                setup_terminal_raw_mode(vmm, Some(borrowed), false);
+
+                let input: Box<dyn port_io::PortInput + Send> = if is_console && reader.is_none() {
+                    let r = port_io::ConsoleInputReader::new(h).map_err(ConsolePortSetup)?;
+                    let input = r.create_port_input().map_err(ConsolePortSetup)?;
+                    reader = Some(r);
+                    input
+                } else {
+                    port_io::input_to_handle_dup(h).map_err(ConsolePortSetup)?
+                };
+
+                PortDescription {
+                    name: name.clone().into(),
+                    input: Some(input),
+                    output: Some(port_io::output_to_handle_dup(h).map_err(ConsolePortSetup)?),
+                    terminal: Some(port_io::term_handle(h).map_err(ConsolePortSetup)?),
+                }
+            }
+            PortConfig::InOut {
+                name,
+                input_handle,
+                output_handle,
+            } => PortDescription {
+                name: name.clone().into(),
+                input: if input_handle.as_raw_handle().is_null() {
+                    None
+                } else {
+                    Some(port_io::input_to_handle_dup(input_handle.as_raw_handle()).map_err(ConsolePortSetup)?)
+                },
+                output: if output_handle.as_raw_handle().is_null() {
+                    None
+                } else {
+                    Some(port_io::output_to_handle_dup(output_handle.as_raw_handle()).map_err(ConsolePortSetup)?)
+                },
+                terminal: None,
+            },
+        };
+
+        ports.push(port_desc);
+    }
+
+    Ok((ports, reader))
+}
+
+#[cfg(unix)]
 fn attach_console_devices(
     vmm: &mut Vmm,
     event_manager: &mut EventManager,
@@ -2150,6 +2562,97 @@ fn attach_console_devices(
     Ok(())
 }
 
+#[cfg(windows)]
+fn attach_console_devices(
+    vmm: &mut Vmm,
+    event_manager: &mut EventManager,
+    intc: IrqChip,
+    vm_resources: &VmResources,
+    cfg: Option<&VirtioConsoleConfigMode>,
+    id_number: u32,
+) -> std::result::Result<(), StartMicrovmError> {
+    use self::StartMicrovmError::*;
+
+    let creating_implicit_console = cfg.is_none();
+
+    let (ports, console_reader) = match cfg {
+        None => autoconfigure_console_ports(vmm, vm_resources, None, creating_implicit_console)?,
+        Some(VirtioConsoleConfigMode::Autoconfigure(autocfg)) => {
+            autoconfigure_console_ports(vmm, vm_resources, Some(autocfg), creating_implicit_console)?
+        }
+        Some(VirtioConsoleConfigMode::Explicit(ports)) => create_explicit_ports(vmm, ports)?,
+    };
+
+    let console = Arc::new(Mutex::new(devices::virtio::Console::new(ports).unwrap()));
+    vmm.exit_observers.push(console.clone());
+    event_manager
+        .add_subscriber(console.clone())
+        .map_err(RegisterEvent)?;
+
+    let sigwinch_evt = console
+        .lock()
+        .unwrap()
+        .try_clone_sigwinch_evt()
+        .map_err(|e| RegisterConsoleDevice(device_manager::mmio::Error::EventFd(e)))?;
+
+    if let Some(reader) = console_reader {
+        reader.start(sigwinch_evt).map_err(ConsolePortSetup)?;
+    } else {
+        spawn_console_resize_monitor(sigwinch_evt);
+    }
+
+    // The device mutex mustn't be locked here otherwise it will deadlock.
+    attach_mmio_device(vmm, format!("hvc{id_number}"), intc, console)
+        .map_err(RegisterConsoleDevice)?;
+
+    Ok(())
+}
+
+/// Polls the console screen buffer for size changes at a fixed interval.
+///
+/// This is the fallback for when stdin is not a real console handle (e.g.
+/// piped or redirected), so `ConsoleInputReader` -- which gets resize
+/// notifications event-driven via `WINDOW_BUFFER_SIZE_EVENT` from
+/// `ReadConsoleInputW` -- cannot be used.  The output handle may still be
+/// a console, so we poll `GetConsoleScreenBufferInfo` on stdout instead.
+///
+/// 500 ms is a pragmatic trade-off: low CPU overhead at the cost of up to
+/// half a second of resize latency.
+#[cfg(windows)]
+fn spawn_console_resize_monitor(sigwinch_evt: EventFd) {
+    std::thread::Builder::new()
+        .name("console-resize".into())
+        .spawn(move || {
+            let stdout_h = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
+
+            let query_size = |h| -> Option<(i16, i16)> {
+                let mut info: CONSOLE_SCREEN_BUFFER_INFO = unsafe { std::mem::zeroed() };
+                if unsafe { GetConsoleScreenBufferInfo(h, &mut info) } == 0 {
+                    return None;
+                }
+                Some((
+                    info.srWindow.Right - info.srWindow.Left + 1,
+                    info.srWindow.Bottom - info.srWindow.Top + 1,
+                ))
+            };
+
+            let (mut last_cols, mut last_rows) = query_size(stdout_h).unwrap_or((0, 0));
+
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+
+                if let Some((cols, rows)) = query_size(stdout_h) {
+                    if cols != last_cols || rows != last_rows {
+                        last_cols = cols;
+                        last_rows = rows;
+                        let _ = sigwinch_evt.write(1);
+                    }
+                }
+            }
+        })
+        .expect("spawn console-resize monitor thread");
+}
+
 #[cfg(feature = "net")]
 fn attach_net_devices(
     vmm: &mut Vmm,
@@ -2165,6 +2668,7 @@ fn attach_net_devices(
     Ok(())
 }
 
+#[cfg(unix)]
 fn attach_unixsock_vsock_device(
     vmm: &mut Vmm,
     unix_vsock: &Arc<Mutex<Vsock>>,
@@ -2355,7 +2859,7 @@ pub mod tests {
     }
 
     #[test]
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     fn test_create_vcpus_x86_64() {
         let vcpu_count = 2;
 
