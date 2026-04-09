@@ -1,8 +1,13 @@
-use std::sync::{Arc, Mutex, Condvar};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use whp::WhpVm;
+use windows_sys::Win32::Foundation::HANDLE;
+use windows_sys::Win32::System::Threading::{
+    WaitForSingleObject, INFINITE,
+};
+use utils::windows::wake_event::WakeEvent;
 
 struct TimerState {
     config: u64,
@@ -12,7 +17,7 @@ struct TimerState {
 }
 
 pub struct SynicTimer {
-    state: Arc<(Mutex<TimerState>, Condvar)>,
+    state: Arc<(Mutex<TimerState>, WakeEvent)>,
     _thread: JoinHandle<()>,
 }
 
@@ -22,7 +27,7 @@ impl SynicTimer {
             Mutex::new(TimerState {
                 config: 0, count: 0, armed: false, stop: false,
             }),
-            Condvar::new(),
+            WakeEvent::new(),
         ));
 
         let thread_state = state.clone();
@@ -35,7 +40,7 @@ impl SynicTimer {
     }
 
     pub fn write_config(&self, config: u64) {
-        let (lock, cvar) = &*self.state;
+        let (lock, wake) = &*self.state;
         let mut s = lock.lock().unwrap();
         s.config = config;
         
@@ -43,11 +48,12 @@ impl SynicTimer {
         if config & 1 == 0 {
             s.armed = false;
         }
-        cvar.notify_one();
+        drop(s);
+        wake.signal();
     }
 
     pub fn write_count(&self, count: u64) {
-        let (lock, cvar) = &*self.state;
+        let (lock, wake) = &*self.state;
         let mut s = lock.lock().unwrap();
         s.count = count;
         
@@ -56,59 +62,83 @@ impl SynicTimer {
         if (s.config & (1 << 3)) != 0 || (s.config & 1) != 0 {
             s.armed = true;
         }
-        cvar.notify_one();
+        drop(s);
+        wake.signal();
     }
 
     pub fn stop(&self) {
-        let (lock, cvar) = &*self.state;
+        let (lock, wake) = &*self.state;
         let mut s = lock.lock().unwrap();
         s.stop = true;
-        cvar.notify_one();
+        drop(s);
+        wake.signal();
     }
 
-    fn timer_loop(vm: Arc<WhpVm>, vp_index: u32, state: Arc<(Mutex<TimerState>, Condvar)>) {
-        let (lock, cvar) = &*state;
-        let mut s = lock.lock().unwrap();
+    fn timer_loop(
+        vm: Arc<WhpVm>,
+        vp_index: u32,
+        state: Arc<(Mutex<TimerState>, WakeEvent)>,
+    ) {
+        let (lock, wake) = &*state;
 
         loop {
-            if s.stop { break; }
+            let (armed, stop, config, count) = {
+                let s = lock.lock().unwrap();
+                (s.armed, s.stop, s.config, s.count)
+            };
 
-            if !s.armed {
-                s = cvar.wait(s).unwrap();
+            if stop {
+                break;
+            }
+
+            if !armed {
+                unsafe { WaitForSingleObject(wake.handle(), INFINITE); }
                 continue;
             }
 
-            let is_periodic = (s.config & (1 << 1)) != 0;
-            // DirectMode (Bit 12) uses APIC Vector (Bits 4-11)
-            let vector = ((s.config >> 4) & 0xFF) as u32;
+            let is_periodic = (config & (1 << 1)) != 0;
+            let vector = ((config >> 4) & 0xFF) as u32;
 
-            let sleep_dur = if is_periodic {
-                Duration::from_nanos(s.count * 100)
+            let wait_ms = if is_periodic {
+                let nanos = count.saturating_mul(100);
+                Duration::from_nanos(nanos).as_millis().min(u32::MAX as u128) as u32
             } else {
                 let now_100ns = vm.hyperv().reference_time();
-                if s.count > now_100ns {
-                    Duration::from_nanos((s.count - now_100ns) * 100)
+                if count > now_100ns {
+                    let nanos = (count - now_100ns).saturating_mul(100);
+                    Duration::from_nanos(nanos).as_millis().min(u32::MAX as u128) as u32
                 } else {
-                    Duration::ZERO // Deadline passed
+                    0
                 }
             };
 
-            let (new_s, timeout_res) = cvar.wait_timeout(s, sleep_dur).unwrap();
-            s = new_s;
+            if wait_ms > 0 {
+                unsafe { WaitForSingleObject(wake.handle(), wait_ms); }
+            }
 
-            if s.stop { break; }
+            let mut s = lock.lock().unwrap();
+            if s.stop {
+                break;
+            }
+            if !s.armed {
+                continue;
+            }
 
-            // If we timed out, it means the sleep completed without being interrupted 
-            // by a new MSR write. Time to fire the interrupt!
-            if timeout_res.timed_out() && s.armed {
-                if vector > 0 {
-                    vm.inject_vector(vector);
-                    vm.cancel_vcpu(vp_index);
-                }
-                
+            let should_fire = if is_periodic {
+                true
+            } else {
+                let now_100ns = vm.hyperv().reference_time();
+                now_100ns >= s.count
+            };
+
+            if should_fire && vector > 0 {
                 if !is_periodic {
-                    s.armed = false; // One-shot timers disarm after firing
+                    s.armed = false;
                 }
+                drop(s);
+
+                vm.inject_vector(vector);
+                vm.cancel_vcpu(vp_index);
             }
         }
     }
