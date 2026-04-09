@@ -103,13 +103,7 @@ impl SynicTimer {
             if timeout_res.timed_out() && s.armed {
                 if vector > 0 {
                     vm.inject_vector(vector);
-                    unsafe {
-                        windows_sys::Win32::System::Hypervisor::WHvCancelRunVirtualProcessor(
-                            vm.partition_handle(),
-                            vp_index,
-                            0,
-                        );
-                    }
+                    vm.cancel_vcpu(vp_index);
                 }
                 
                 if !is_periodic {

@@ -35,13 +35,19 @@ impl fmt::Display for Error {
 type Result<T> = ::std::result::Result<T, Error>;
 
 /// The `PortIODeviceManager` is a wrapper that is used for registering legacy devices
-/// on an I/O Bus. It currently manages the uart and i8042 devices.
+/// on an I/O Bus. It currently manages the uart, i8042, and (optionally) the PIT.
 /// The `LegacyDeviceManger` should be initialized only by using the constructor.
 pub struct PortIODeviceManager {
     pub io_bus: devices::Bus,
     pub cmos: Arc<Mutex<devices::legacy::Cmos>>,
     pub stdio_serial: Vec<Arc<Mutex<devices::legacy::Serial>>>,
     pub i8042: Arc<Mutex<devices::legacy::I8042Device>>,
+    #[cfg(target_os = "windows")]
+    pub pit: Option<Arc<Mutex<devices::legacy::Pit>>>,
+    #[cfg(target_os = "windows")]
+    pub pic_master: Option<Arc<Mutex<devices::legacy::PicPort>>>,
+    #[cfg(target_os = "windows")]
+    pub pic_slave: Option<Arc<Mutex<devices::legacy::PicPort>>>,
 
     pub com_evt_1: EventFd,
     pub com_evt_2: EventFd,
@@ -84,6 +90,12 @@ impl PortIODeviceManager {
             cmos,
             stdio_serial,
             i8042,
+            #[cfg(target_os = "windows")]
+            pit: None,
+            #[cfg(target_os = "windows")]
+            pic_master: None,
+            #[cfg(target_os = "windows")]
+            pic_slave: None,
             com_evt_1: evts[0].try_clone().map_err(Error::EventFd)?,
             com_evt_2: evts[1].try_clone().map_err(Error::EventFd)?,
             com_evt_3: evts[2].try_clone().map_err(Error::EventFd)?,
@@ -141,7 +153,25 @@ impl PortIODeviceManager {
             .map_err(Error::BusError)?;
         self.io_bus
             .insert(self.i8042.clone(), 0x060, 0x5)
-            .map_err(Error::BusError)?;
+            .map_err(Error::BusError)?;        
+        #[cfg(target_os = "windows")]
+        {
+            if let Some(pit) = &self.pit {
+                self.io_bus
+                    .insert(pit.clone(), 0x40, 0x4)
+                    .map_err(Error::BusError)?;
+            }
+            if let Some(pic) = &self.pic_master {
+                self.io_bus
+                    .insert(pic.clone(), 0x20, 0x2)
+                    .map_err(Error::BusError)?;
+            }
+            if let Some(pic) = &self.pic_slave {
+                self.io_bus
+                    .insert(pic.clone(), 0xA0, 0x2)
+                    .map_err(Error::BusError)?;
+            }
+        }
         Ok(())
     }
 }
