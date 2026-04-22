@@ -15,9 +15,18 @@ mod backend;
 pub mod device;
 #[cfg(target_os = "linux")]
 mod tap;
+#[cfg(unix)]
 mod unixgram;
+#[cfg(unix)]
 mod unixstream;
+#[cfg(windows)]
+mod unixstream_windows;
 mod worker;
+
+#[cfg(unix)]
+pub type PlatformSocket = std::os::fd::RawFd;
+#[cfg(windows)]
+pub type PlatformSocket = std::os::windows::io::RawSocket;
 
 // https://docs.oasis-open.org/virtio/virtio/v1.1/csprd01/virtio-v1.1-csprd01.html#x1-2050006
 const VNET_HDR_LEN: usize = mem::size_of::<virtio_net_hdr_v1>();

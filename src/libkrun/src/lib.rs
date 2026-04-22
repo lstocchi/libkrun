@@ -10,6 +10,8 @@ use devices::virtio::block::{ImageType, SyncMode};
 use devices::virtio::gpu::display::DisplayInfo;
 #[cfg(feature = "net")]
 use devices::virtio::net::device::VirtioNetBackend;
+#[cfg(feature = "net")]
+use devices::virtio::net::PlatformSocket;
 use env_logger::{Env, Target};
 #[cfg(feature = "gpu")]
 use krun_display::DisplayBackend;
@@ -57,7 +59,7 @@ use vmm::vmm_config::block::{BlockDeviceConfig, BlockRootConfig};
 use vmm::vmm_config::external_kernel::{ExternalKernel, KernelFormat};
 #[cfg(not(feature = "tee"))]
 use vmm::vmm_config::firmware::FirmwareConfig;
-#[cfg(not(any(feature = "tee", target_os = "windows")))]
+#[cfg(not(feature = "tee"))]
 use vmm::vmm_config::fs::FsDeviceConfig;
 use vmm::vmm_config::kernel_bundle::KernelBundle;
 #[cfg(feature = "tee")]
@@ -162,6 +164,17 @@ impl KrunfwBindings {
     }
 }
 
+<<<<<<< HEAD
+=======
+#[derive(Clone)]
+#[cfg(feature = "net")]
+enum LegacyNetworkConfig {
+    #[cfg(unix)]
+    VirtioNetPasst(RawFd),
+    VirtioNetGvproxy(PathBuf),
+}
+
+>>>>>>> 1e6620e9 (support virtio-net on windows)
 #[derive(Default)]
 struct ContextConfig {
     krunfw: Option<KrunfwBindings>,
@@ -876,7 +889,7 @@ pub unsafe extern "C" fn krun_add_net_unixstream(
         let backend = if let Some(path) = path {
             VirtioNetBackend::UnixstreamPath(path)
         } else {
-            VirtioNetBackend::UnixstreamFd(fd)
+            VirtioNetBackend::UnixstreamFd(fd as PlatformSocket)
         };
 
         let mac: [u8; 6] = match slice::from_raw_parts(c_mac, 6).try_into() {
@@ -909,7 +922,7 @@ pub unsafe extern "C" fn krun_add_net_unixstream(
 
 #[allow(clippy::missing_safety_doc)]
 #[unsafe(no_mangle)]
-#[cfg(feature = "net")]
+#[cfg(all(unix, feature = "net"))]
 pub unsafe extern "C" fn krun_add_net_unixgram(
     ctx_id: u32,
     c_path: *const c_char,
@@ -2922,8 +2935,15 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         if let Some(legacy_net_cfg) = ctx_cfg.legacy_net_cfg.clone() {
             let backend = match legacy_net_cfg {
                 LegacyNetworkConfig::VirtioNetGvproxy(path) => {
-                    VirtioNetBackend::UnixgramPath(path, true)
+                    #[cfg(unix)]
+                    let backend = VirtioNetBackend::UnixgramPath(path, true);
+                    
+                    #[cfg(windows)]
+                    let backend = VirtioNetBackend::UnixstreamPath(path);
+                    
+                    backend
                 }
+                #[cfg(unix)]
                 LegacyNetworkConfig::VirtioNetPasst(fd) => VirtioNetBackend::UnixstreamFd(fd),
             };
             let mac = ctx_cfg

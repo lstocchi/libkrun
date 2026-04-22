@@ -15,7 +15,7 @@ pub mod kernel_cmdline;
 pub mod external_kernel;
 
 /// Wrapper for configuring the Fs devices attached to the microVM.
-#[cfg(not(any(feature = "tee", target_os = "windows")))]
+#[cfg(not(feature = "tee"))]
 pub mod fs;
 
 /// Wrapper over the microVM general information attached to the microVM.
