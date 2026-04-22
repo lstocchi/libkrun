@@ -14,11 +14,11 @@ use crate::virtio::{
 use crate::Error as DeviceError;
 
 use super::backend::{ReadError, WriteError};
+use super::PlatformSocket;
 use super::worker::NetWorker;
 
 use std::cmp;
 use std::io::Write;
-use std::os::fd::RawFd;
 use std::path::PathBuf;
 use virtio_bindings::virtio_net::VIRTIO_NET_F_MAC;
 use virtio_bindings::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
@@ -61,9 +61,11 @@ unsafe impl ByteValued for VirtioNetConfig {}
 
 #[derive(Clone)]
 pub enum VirtioNetBackend {
-    UnixstreamFd(RawFd),
+    UnixstreamFd(PlatformSocket),
     UnixstreamPath(PathBuf),
-    UnixgramFd(RawFd),
+    #[cfg(unix)]
+    UnixgramFd(PlatformSocket),
+    #[cfg(unix)]
     UnixgramPath(PathBuf, bool),
     #[cfg(target_os = "linux")]
     Tap(String),

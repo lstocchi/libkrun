@@ -8,6 +8,7 @@ use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
 
 use super::backend::{ConnectError, NetBackend, ReadError, WriteError};
+use super::PlatformSocket;
 use super::write_virtio_net_hdr;
 #[cfg(target_os = "macos")]
 use super::{MAX_BUFFER_SIZE, VNET_HDR_LEN};
@@ -147,7 +148,7 @@ impl NetBackend for Unixgram {
         Ok(())
     }
 
-    fn raw_socket_fd(&self) -> RawFd {
+    fn raw_socket_fd(&self) -> PlatformSocket {
         self.fd.as_raw_fd()
     }
 }

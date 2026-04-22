@@ -41,6 +41,10 @@ use super::{AsRawFd, RawFd};
 use windows_sys::Win32::Foundation::{
     CloseHandle, HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT as WAIT_TIMEOUT_CODE,
 };
+use windows_sys::Win32::Networking::WinSock::{
+    WSACloseEvent, WSACreateEvent, WSAEnumNetworkEvents, WSAEventSelect, INVALID_SOCKET, SOCKET,
+    SOCKET_ERROR, WSANETWORKEVENTS,
+};
 use windows_sys::Win32::System::IO::{
     CreateIoCompletionPort, GetQueuedCompletionStatusEx, OVERLAPPED_ENTRY,
 };
@@ -50,6 +54,15 @@ use windows_sys::Win32::System::Threading::INFINITE;
 // https://learn.microsoft.com/en-us/windows/win32/secauthz/access-mask
 const MAXIMUM_ALLOWED: u32 = 0x0200_0000;
 const GC_THRESHOLD: Duration = Duration::from_secs(5);
+
+// WSAEventSelect network-event bits (FD_READ etc. may not be exported by all
+// windows-sys versions, so define them here for robustness).
+// https://github.com/tpn/winsdk-10/blob/master/Include/10.0.10240.0/um/WinSock2.h#L548
+const NET_FD_READ: i32 = 0x01;
+const NET_FD_WRITE: i32 = 0x02;
+const NET_FD_ACCEPT: i32 = 0x08;
+const NET_FD_CONNECT: i32 = 0x10;
+const NET_FD_CLOSE: i32 = 0x20;
 
 #[repr(i32)]
 pub enum ControlOperation {
@@ -135,6 +148,22 @@ struct Watch {
     /// Cleared by [`ControlOperation::Delete`] so that in-flight completion
     /// packets already queued by the kernel are silently ignored.
     is_active: AtomicBool,
+    /// For socket watches created via [`Epoll::ctl_socket`]: the Winsock
+    /// `SOCKET` handle.  Set to [`INVALID_SOCKET`] for regular event-handle
+    /// watches.  Immutable after creation.
+    socket: SOCKET,
+}
+
+// Ensure internal handles are cleaned up only when the Watch is truly destroyed
+impl Drop for Watch {
+    fn drop(&mut self) {
+        unsafe {
+            if self.socket != INVALID_SOCKET {
+                // Safe to close WSAEvent now because the 5s safety delay has passed
+                WSACloseEvent(self.fd as isize);
+            }
+        }
+    }
 }
 
 /// The I/O Completion Port and the set of handles it is watching.
@@ -166,6 +195,9 @@ impl Drop for CompletionPort {
                 let w = Box::from_raw(ptr);
                 let _ = NtCancelWaitCompletionPacket(w.wcp, 1);
                 CloseHandle(w.wcp);
+                if w.socket != INVALID_SOCKET {
+                    WSAEventSelect(w.socket, 0, 0);
+                }
             }
         }
         for (_, ptr) in self.zombies.get_mut().unwrap().drain(..) {
@@ -267,6 +299,7 @@ impl Epoll {
                     events: AtomicU32::new(event.events()),
                     data: AtomicU64::new(event.data()),
                     is_active: AtomicBool::new(true),
+                    socket: INVALID_SOCKET,
                 }));
 
                 if let Err(e) = associate_wcp(wcp, self.iocp.handle, fd, watch_ptr as *mut _) {
@@ -303,6 +336,10 @@ impl Epoll {
                 unsafe {
                     let _ = NtCancelWaitCompletionPacket(watch.wcp, 1);
                     CloseHandle(watch.wcp);
+                    if watch.socket != INVALID_SOCKET {
+                        // Detach immediately so no new events are recorded
+                        WSAEventSelect(watch.socket, 0, 0);
+                    }
                 }
 
                 // Add the Watch to the zombies list with the current time
@@ -323,6 +360,86 @@ impl Epoll {
                 });
             }
         }
+        Ok(())
+    }
+
+    /// Register a Winsock socket for event notification.
+    ///
+    /// Internally creates a `WSAEvent`, calls `WSAEventSelect` to bridge
+    /// network events (read/write/close) into the event object, and watches
+    /// that event via the IOCP.  When [`wait`](Self::wait) returns an event
+    /// for this socket, the [`EventSet`] will reflect the actual network
+    /// events (IN / OUT / HANG_UP) obtained via `WSAEnumNetworkEvents`.
+    ///
+    /// * `socket` – the Winsock `SOCKET` handle.
+    /// * `events` – the [`EventSet`] interest mask (IN, OUT, READ_HANG_UP …).
+    /// * `data`   – opaque `u64` payload returned by [`wait`](Self::wait).
+    pub fn ctl_socket(
+        &self,
+        socket: SOCKET,
+        events: EventSet,
+        data: u64,
+    ) -> io::Result<()> {
+        super::ensure_wsa_init();
+
+        let mut watches = self.iocp.watches.lock().unwrap();
+
+        // WSACreateEvent returns a WSAEVENT (isize); we store it as
+        // HANDLE (*mut c_void) so it fits the existing Watch/IOCP.
+        let wsa_event = unsafe { WSACreateEvent() };
+        if wsa_event == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let wsa_handle = wsa_event as HANDLE;
+
+        let mut net_events: i32 = 0;
+        if events.contains(EventSet::IN) {
+            net_events |= NET_FD_READ | NET_FD_ACCEPT;
+        }
+        if events.contains(EventSet::OUT) {
+            net_events |= NET_FD_WRITE | NET_FD_CONNECT;
+        }
+        if events.intersects(EventSet::HANG_UP | EventSet::READ_HANG_UP) {
+            net_events |= NET_FD_CLOSE;
+        }
+
+        if unsafe { WSAEventSelect(socket, wsa_event, net_events) } == SOCKET_ERROR {
+            let err = io::Error::last_os_error();
+            unsafe { WSACloseEvent(wsa_event); }
+            return Err(err);
+        }
+
+        let mut wcp: HANDLE = ptr::null_mut();
+        let status =
+            unsafe { NtCreateWaitCompletionPacket(&mut wcp, MAXIMUM_ALLOWED, ptr::null()) };
+        if !nt_success(status) {
+            unsafe {
+                WSAEventSelect(socket, 0, 0);
+                WSACloseEvent(wsa_event);
+            }
+            return Err(nt_status_err(status));
+        }
+
+        let watch_ptr = Box::into_raw(Box::new(Watch {
+            fd: wsa_handle,
+            wcp,
+            events: AtomicU32::new(events.bits()),
+            data: AtomicU64::new(data),
+            is_active: AtomicBool::new(true),
+            socket,
+        }));
+
+        if let Err(e) = associate_wcp(wcp, self.iocp.handle, wsa_handle, watch_ptr as *mut _) {
+            unsafe {
+                CloseHandle(wcp);
+                WSAEventSelect(socket, 0, 0);
+                WSACloseEvent(wsa_event);
+                let _ = Box::from_raw(watch_ptr);
+            }
+            return Err(e);
+        }
+
+        watches.insert(wsa_handle, watch_ptr);
         Ok(())
     }
 
@@ -394,17 +511,58 @@ impl Epoll {
 
             let current_events = watch.events.load(Ordering::Acquire);
             let event_set = EventSet::from_bits_truncate(current_events);
+            
 
-            events[result_count] = EpollEvent {
-                events: (event_set & (EventSet::IN | EventSet::OUT)).bits(),
-                u64: watch.data.load(Ordering::Acquire),
-            };
-            result_count += 1;
+            if watch.socket != INVALID_SOCKET {
+                // ── Socket watch ──
+                // WSAEnumNetworkEvents atomically retrieves the pending
+                // network events AND resets the WSAEvent object so the
+                // next WSAEventSelect notification can re-signal it.
+                let mut net_ev: WSANETWORKEVENTS = unsafe { std::mem::zeroed() };
+                let ret = unsafe {
+                    WSAEnumNetworkEvents(watch.socket, watch.fd as isize, &mut net_ev)
+                };
 
-            if !event_set.contains(EventSet::EDGE_TRIGGERED) {
-                // Level-triggered: re-associate the WCP so the next signal
-                // on this handle produces another completion packet.
+                let mut actual = EventSet::empty();
+                if ret == 0 {
+                    if net_ev.lNetworkEvents & (NET_FD_READ | NET_FD_ACCEPT) != 0 {
+                        actual |= EventSet::IN;
+                    }
+                    if net_ev.lNetworkEvents & (NET_FD_WRITE | NET_FD_CONNECT) != 0 {
+                        actual |= EventSet::OUT;
+                    }
+                    if net_ev.lNetworkEvents & NET_FD_CLOSE != 0 {
+                        actual |= EventSet::HANG_UP | EventSet::READ_HANG_UP;
+                    }
+                } else {
+                    debug!("WSAEnumNetworkEvents failed: {}", io::Error::last_os_error());
+                }
+
+                // Always re-arm the WCP — WSAEnumNetworkEvents already
+                // reset the event, so the WCP will wait for the next signal.
                 let _ = associate_wcp(watch.wcp, iocp_handle, watch.fd, watch_ptr as *mut _);
+
+                let reported = actual & event_set;
+                if reported.is_empty() {
+                    continue;
+                }
+
+                events[result_count] = EpollEvent {
+                    events: reported.bits(),
+                    u64: watch.data.load(Ordering::Acquire),
+                };
+                result_count += 1;
+            } else {
+                // ── Regular event-handle watch ──
+                events[result_count] = EpollEvent {
+                    events: (event_set & (EventSet::IN | EventSet::OUT)).bits(),
+                    u64: watch.data.load(Ordering::Acquire),
+                };
+                result_count += 1;
+
+                if !event_set.contains(EventSet::EDGE_TRIGGERED) {
+                    let _ = associate_wcp(watch.wcp, iocp_handle, watch.fd, watch_ptr as *mut _);
+                }
             }
         }
 

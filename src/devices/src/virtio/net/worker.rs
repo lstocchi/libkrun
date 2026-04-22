@@ -1,8 +1,12 @@
 use crate::virtio::net::backend::ConnectError;
 #[cfg(target_os = "linux")]
 use crate::virtio::net::tap::Tap;
+#[cfg(unix)]
 use crate::virtio::net::unixgram::Unixgram;
+#[cfg(unix)]
 use crate::virtio::net::unixstream::Unixstream;
+#[cfg(windows)]
+use crate::virtio::net::unixstream_windows::Unixstream;
 use crate::virtio::net::{MAX_BUFFER_SIZE, QUEUE_SIZE};
 use crate::virtio::{DeviceQueue, InterruptTransport};
 
@@ -10,11 +14,18 @@ use super::backend::{NetBackend, ReadError, WriteError};
 use super::device::{FrontendError, RxError, TxError, VirtioNetBackend};
 use super::VNET_HDR_LEN;
 
+#[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::thread;
 use std::{cmp, result};
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
+#[cfg(windows)]
+use utils::windows::AsRawFd;
+
+const RX_TOKEN: u64 = 1;
+const TX_TOKEN: u64 = 2;
+const BACKEND_TOKEN: u64 = 3;
 
 pub struct NetWorker {
     rx_q: DeviceQueue,
@@ -44,20 +55,29 @@ impl NetWorker {
     ) -> Result<Self, ConnectError> {
         let backend = match cfg_backend {
             VirtioNetBackend::UnixstreamFd(fd) => {
-                // SAFETY: we need to trust that the library user has configured
-                // the backend with a healthy file descriptor.
-                let owned_fd = unsafe { OwnedFd::from_raw_fd(fd) };
-                Box::new(Unixstream::new(owned_fd)) as Box<dyn NetBackend + Send>
+                #[cfg(unix)]
+                {
+                    // SAFETY: we need to trust that the library user has configured
+                    // the backend with a healthy file descriptor.
+                    let owned_fd = unsafe { OwnedFd::from_raw_fd(fd) };
+                    Box::new(Unixstream::new(owned_fd)) as Box<dyn NetBackend + Send>
+                }
+                #[cfg(windows)]
+                {
+                    Box::new(Unixstream::from_raw_socket(fd)) as Box<dyn NetBackend + Send>
+                }
             }
             VirtioNetBackend::UnixstreamPath(path) => {
                 Box::new(Unixstream::open(path)?) as Box<dyn NetBackend + Send>
             }
+            #[cfg(unix)]
             VirtioNetBackend::UnixgramFd(fd) => {
                 // SAFETY: we need to trust that the library user has configured
                 // the backend with a healthy file descriptor.
                 let owned_fd = unsafe { OwnedFd::from_raw_fd(fd) };
                 Box::new(Unixgram::new(owned_fd)) as Box<dyn NetBackend + Send>
             }
+            #[cfg(unix)]
             VirtioNetBackend::UnixgramPath(path, vfkit_magic) => {
                 Box::new(Unixgram::open(path, vfkit_magic)?) as Box<dyn NetBackend + Send>
             }
@@ -95,44 +115,60 @@ impl NetWorker {
     fn work(mut self) {
         let virtq_rx_ev_fd = self.rx_q.event.as_raw_fd();
         let virtq_tx_ev_fd = self.tx_q.event.as_raw_fd();
-        let backend_socket = self.backend.raw_socket_fd();
 
         let epoll = Epoll::new().unwrap();
 
         let _ = epoll.ctl(
             ControlOperation::Add,
             virtq_rx_ev_fd,
-            &EpollEvent::new(EventSet::IN, virtq_rx_ev_fd as u64),
+            &EpollEvent::new(EventSet::IN, RX_TOKEN),
         );
         let _ = epoll.ctl(
             ControlOperation::Add,
             virtq_tx_ev_fd,
-            &EpollEvent::new(EventSet::IN, virtq_tx_ev_fd as u64),
+            &EpollEvent::new(EventSet::IN, TX_TOKEN),
         );
-        let _ = epoll.ctl(
-            ControlOperation::Add,
-            backend_socket,
-            &EpollEvent::new(
-                EventSet::IN | EventSet::OUT | EventSet::EDGE_TRIGGERED | EventSet::READ_HANG_UP,
-                backend_socket as u64,
-            ),
-        );
+
+        #[cfg(unix)]
+        {
+            let backend_socket = self.backend.raw_socket_fd() as utils::RawFd;
+            let _ = epoll.ctl(
+                ControlOperation::Add,
+                backend_socket,
+                &EpollEvent::new(
+                    EventSet::IN | EventSet::OUT | EventSet::EDGE_TRIGGERED | EventSet::READ_HANG_UP,
+                    BACKEND_TOKEN,
+                ),
+            );
+        }
+
+        #[cfg(windows)]
+        {
+            let backend_socket = self.backend.raw_socket_fd();
+            epoll
+                .ctl_socket(
+                    backend_socket as usize,
+                    EventSet::IN | EventSet::OUT | EventSet::READ_HANG_UP,
+                    BACKEND_TOKEN,
+                )
+                .unwrap();
+        }
 
         loop {
             let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
             match epoll.wait(epoll_events.len(), -1, epoll_events.as_mut_slice()) {
                 Ok(ev_cnt) => {
                     for event in &epoll_events[0..ev_cnt] {
-                        let source = event.fd();
+                        let token = event.data();
                         let event_set = event.event_set();
-                        match event_set {
-                            EventSet::IN if source == virtq_rx_ev_fd => {
+                        match token {
+                            RX_TOKEN => {
                                 self.process_rx_queue_event();
                             }
-                            EventSet::IN if source == virtq_tx_ev_fd => {
+                            TX_TOKEN => {
                                 self.process_tx_queue_event();
                             }
-                            _ if source == backend_socket => {
+                            BACKEND_TOKEN => {
                                 if event_set.contains(EventSet::HANG_UP)
                                     || event_set.contains(EventSet::READ_HANG_UP)
                                 {
@@ -150,14 +186,14 @@ impl NetWorker {
                             }
                             _ => {
                                 log::warn!(
-                                    "Received unknown event: {event_set:?} from fd: {source:?}"
+                                    "Received unknown event: {event_set:?} token={token}"
                                 );
                             }
                         }
                     }
                 }
                 Err(e) => {
-                    debug!("vsock: failed to consume muxer epoll event: {e}");
+                    debug!("virtio-net: failed to consume epoll event: {e}");
                 }
             }
         }

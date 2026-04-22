@@ -1,5 +1,7 @@
-use windows_sys::Win32::Foundation::HANDLE;
 use std::os::windows::io::AsRawHandle;
+use std::sync::Once;
+
+use windows_sys::Win32::Foundation::HANDLE;
 
 pub(crate) mod bindings;
 pub mod epoll;
@@ -9,6 +11,19 @@ pub mod wake_event;
 /// Cross-platform alias used by the rest of the codebase.  On Windows this
 /// is just [`HANDLE`] — the two names are interchangeable.
 pub type RawFd = HANDLE;
+
+static WSA_INIT: Once = Once::new();
+
+/// Ensure that `WSAStartup` has been called exactly once for this process.
+/// Safe to call from any thread, any number of times.
+pub fn ensure_wsa_init() {
+    WSA_INIT.call_once(|| {
+        use windows_sys::Win32::Networking::WinSock::{WSAStartup, WSADATA};
+        let mut data: WSADATA = unsafe { std::mem::zeroed() };
+        let ret = unsafe { WSAStartup(0x0202, &mut data) };
+        assert!(ret == 0, "WSAStartup failed: {ret}");
+    });
+}
 
 /// Windows equivalent of [`std::os::unix::io::AsRawFd`].
 pub trait AsRawFd {

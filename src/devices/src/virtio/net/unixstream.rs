@@ -10,6 +10,7 @@ use std::{
 use crate::virtio::net::backend::ConnectError;
 
 use super::backend::{NetBackend, ReadError, WriteError};
+use super::PlatformSocket;
 use super::write_virtio_net_hdr;
 
 /// Each frame the network proxy is prepended by a 4 byte "header".
@@ -216,7 +217,7 @@ impl NetBackend for Unixstream {
         Ok(())
     }
 
-    fn raw_socket_fd(&self) -> RawFd {
+    fn raw_socket_fd(&self) -> PlatformSocket {
         self.fd.as_raw_fd()
     }
 }

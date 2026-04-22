@@ -8,6 +8,8 @@ use devices::virtio::block::{ImageType, SyncMode};
 use devices::virtio::gpu::display::DisplayInfo;
 #[cfg(feature = "net")]
 use devices::virtio::net::device::VirtioNetBackend;
+#[cfg(feature = "net")]
+use devices::virtio::net::PlatformSocket;
 #[cfg(feature = "blk")]
 use devices::virtio::CacheType;
 use env_logger::{Env, Target};
@@ -52,7 +54,7 @@ use vmm::vmm_config::block::{BlockDeviceConfig, BlockRootConfig};
 use vmm::vmm_config::external_kernel::{ExternalKernel, KernelFormat};
 #[cfg(not(feature = "tee"))]
 use vmm::vmm_config::firmware::FirmwareConfig;
-#[cfg(not(any(feature = "tee", target_os = "windows")))]
+#[cfg(not(feature = "tee"))]
 use vmm::vmm_config::fs::FsDeviceConfig;
 use vmm::vmm_config::kernel_bundle::KernelBundle;
 #[cfg(feature = "tee")]
@@ -134,6 +136,7 @@ impl KrunfwBindings {
 #[derive(Clone)]
 #[cfg(feature = "net")]
 enum LegacyNetworkConfig {
+    #[cfg(unix)]
     VirtioNetPasst(RawFd),
     VirtioNetGvproxy(PathBuf),
 }
@@ -975,7 +978,7 @@ pub unsafe extern "C" fn krun_add_net_unixstream(
     let backend = if let Some(path) = path {
         VirtioNetBackend::UnixstreamPath(path)
     } else {
-        VirtioNetBackend::UnixstreamFd(fd)
+        VirtioNetBackend::UnixstreamFd(fd as PlatformSocket)
     };
 
     let mac: [u8; 6] = match slice::from_raw_parts(c_mac, 6).try_into() {
@@ -1004,7 +1007,7 @@ pub unsafe extern "C" fn krun_add_net_unixstream(
 
 #[allow(clippy::missing_safety_doc)]
 #[no_mangle]
-#[cfg(feature = "net")]
+#[cfg(all(unix, feature = "net"))]
 pub unsafe extern "C" fn krun_add_net_unixgram(
     ctx_id: u32,
     c_path: *const c_char,
@@ -1123,7 +1126,7 @@ pub unsafe extern "C" fn krun_add_net_tap(
 
 #[allow(clippy::missing_safety_doc)]
 #[no_mangle]
-#[cfg(feature = "net")]
+#[cfg(all(unix, feature = "net"))]
 pub unsafe extern "C" fn krun_set_passt_fd(ctx_id: u32, fd: c_int) -> i32 {
     if fd < 0 {
         return -libc::EINVAL;
@@ -2232,7 +2235,7 @@ pub extern "C" fn krun_setgid(ctx_id: u32, gid: libc::gid_t) -> i32 {
     KRUN_SUCCESS
 }
 
-#[cfg(all(feature = "blk", not(any(feature = "tee", target_os = "windows"))))]
+#[cfg(all(feature = "blk", not(feature = "tee")))]
 #[allow(clippy::missing_safety_doc)]
 #[no_mangle]
 pub unsafe extern "C" fn krun_set_root_disk_remount(
@@ -2283,6 +2286,7 @@ pub unsafe extern "C" fn krun_set_root_disk_remount(
         Entry::Occupied(mut ctx_cfg) => {
             let ctx_cfg = ctx_cfg.get_mut();
 
+            #[cfg(not(target_os = "windows"))]
             if ctx_cfg.vmr.fs.iter().any(|fs| fs.fs_id == "/dev/root") {
                 error!("Root filesystem already configured");
                 return -libc::EINVAL;
@@ -2772,8 +2776,15 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         if let Some(legacy_net_cfg) = ctx_cfg.legacy_net_cfg.clone() {
             let backend = match legacy_net_cfg {
                 LegacyNetworkConfig::VirtioNetGvproxy(path) => {
-                    VirtioNetBackend::UnixgramPath(path, true)
+                    #[cfg(unix)]
+                    let backend = VirtioNetBackend::UnixgramPath(path, true);
+                    
+                    #[cfg(windows)]
+                    let backend = VirtioNetBackend::UnixstreamPath(path);
+                    
+                    backend
                 }
+                #[cfg(unix)]
                 LegacyNetworkConfig::VirtioNetPasst(fd) => VirtioNetBackend::UnixstreamFd(fd),
             };
             let mac = ctx_cfg

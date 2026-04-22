@@ -74,7 +74,7 @@ use crate::signal_handler::register_sigwinch_handler;
 use crate::terminal::{term_restore_mode, term_set_raw_mode};
 #[cfg(feature = "blk")]
 use crate::vmm_config::block::BlockBuilder;
-#[cfg(not(any(feature = "tee", feature = "aws-nitro", target_os = "windows")))]
+#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 use crate::vmm_config::fs::FsDeviceConfig;
 use crate::vmm_config::kernel_cmdline::DEFAULT_KERNEL_CMDLINE;
 #[cfg(target_os = "linux")]
