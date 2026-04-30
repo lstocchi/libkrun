@@ -452,7 +452,7 @@ mod tests {
             kernel_cmdline: default_kernel_cmdline(),
             kernel_bundle: Default::default(),
             external_kernel: None,
-            #[cfg(not(any(feature = "tee", target_os = "windows")))]
+            #[cfg(not(feature = "tee"))]
             fs: Default::default(),
             vsock: Default::default(),
             #[cfg(feature = "net")]

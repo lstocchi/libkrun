@@ -33,6 +33,25 @@ pub const LINUX_XATTR_REPLACE: libc::c_int = 2;
 pub type stat64 = libc::stat;
 #[cfg(target_os = "linux")]
 pub use libc::stat64;
+#[cfg(target_os = "windows")]
+// We create a custom stat64 type for Windows because the Windows C-Runtime still use 16-bit for the inode field.
+#[repr(C)]
+pub struct stat64 {
+    pub st_ino: u64,
+    pub st_size: i64,
+    pub st_atime: i64,
+    pub st_mtime: i64,
+    pub st_ctime: i64,
+    pub st_mode: u32,
+    pub st_nlink: u32,
+    pub st_uid: u32,
+    pub st_gid: u32,
+    pub st_rdev: u32,
+    pub st_dev: u32,
+    pub st_atime_nsec: u32,
+    pub st_mtime_nsec: u32,
+    pub st_ctime_nsec: u32,
+}
 
 #[cfg(target_os = "macos")]
 pub type off64_t = libc::off_t;
@@ -43,11 +62,29 @@ pub use libc::off64_t;
 pub type statvfs64 = libc::statvfs;
 #[cfg(target_os = "linux")]
 pub use libc::statvfs64;
+#[cfg(target_os = "windows")]
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone)]
+pub struct statvfs64 {
+    pub f_bsize: u64,
+    pub f_frsize: u64,
+    pub f_blocks: u64,
+    pub f_bfree: u64,
+    pub f_bavail: u64,
+    pub f_files: u64,
+    pub f_ffree: u64,
+    pub f_favail: u64,
+    pub f_fsid: u64,
+    pub f_flag: u64,
+    pub f_namemax: u64,
+}
 
 #[cfg(target_os = "macos")]
 pub type ino64_t = libc::ino_t;
 #[cfg(target_os = "linux")]
 pub use libc::ino64_t;
+#[cfg(target_os = "windows")]
+pub type ino64_t = u64;
 
 #[cfg(target_os = "linux")]
 pub unsafe fn pread64(

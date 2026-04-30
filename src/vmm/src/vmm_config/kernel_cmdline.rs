@@ -16,7 +16,7 @@ pub const DEFAULT_KERNEL_CMDLINE: &str = "reboot=k panic=-1 panic_print=0 nomodu
 // so we add the no_timer_check flag to skip the timer check to avoid panics.
 #[cfg(target_os = "windows")]
 pub const DEFAULT_KERNEL_CMDLINE: &str = "reboot=k panic=-1 panic_print=0 nomodule console=hvc0 \
-                                          rw quiet no_timer_check";
+                                          rootfstype=virtiofs rw quiet no_timer_check";
 
 /// Strongly typed data structure used to configure the boot source of the
 /// microvm.

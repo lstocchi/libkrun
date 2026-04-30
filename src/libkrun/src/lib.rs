@@ -592,7 +592,7 @@ pub extern "C" fn krun_set_vm_config(ctx_id: u32, num_vcpus: u8, ram_mib: u32) -
 
 #[allow(clippy::missing_safety_doc)]
 #[no_mangle]
-#[cfg(not(any(feature = "tee", target_os = "windows")))]
+#[cfg(not(feature = "tee"))]
 pub unsafe extern "C" fn krun_set_root(ctx_id: u32, c_root_path: *const c_char) -> i32 {
     let root_path = match CStr::from_ptr(c_root_path).to_str() {
         Ok(root) => root,
@@ -609,7 +609,7 @@ pub unsafe extern "C" fn krun_set_root(ctx_id: u32, c_root_path: *const c_char) 
                 fs_id,
                 shared_dir,
                 // Default to a conservative 512 MB window.
-                shm_size: Some(1 << 29),
+                shm_size: None, // Some(1 << 29),
                 allow_root_dir_delete: false,
             });
         }
@@ -621,7 +621,7 @@ pub unsafe extern "C" fn krun_set_root(ctx_id: u32, c_root_path: *const c_char) 
 
 #[allow(clippy::missing_safety_doc)]
 #[no_mangle]
-#[cfg(not(any(feature = "tee", target_os = "windows")))]
+#[cfg(not(feature = "tee"))]
 pub unsafe extern "C" fn krun_add_virtiofs(
     ctx_id: u32,
     c_tag: *const c_char,
@@ -654,7 +654,7 @@ pub unsafe extern "C" fn krun_add_virtiofs(
 
 #[allow(clippy::missing_safety_doc)]
 #[no_mangle]
-#[cfg(not(any(feature = "tee", target_os = "windows")))]
+#[cfg(not(feature = "tee"))]
 pub unsafe extern "C" fn krun_add_virtiofs2(
     ctx_id: u32,
     c_tag: *const c_char,
@@ -688,7 +688,7 @@ pub unsafe extern "C" fn krun_add_virtiofs2(
 
 #[allow(clippy::missing_safety_doc)]
 #[no_mangle]
-#[cfg(not(any(feature = "tee", target_os = "windows")))]
+#[cfg(not(feature = "tee"))]
 pub unsafe extern "C" fn krun_set_mapped_volumes(
     _ctx_id: u32,
     _c_mapped_volumes: *const *const c_char,
@@ -2170,6 +2170,7 @@ unsafe fn load_krunfw_payload(
     let mut kernel_guest_addr: u64 = 0;
     let mut kernel_entry_addr: u64 = 0;
     let mut kernel_size: usize = 0;
+    eprintln!("DEBUG: About to call krunfw_get_kernel in the DLL");
     let kernel_host_addr = unsafe {
         (krunfw.get_kernel)(
             &mut kernel_guest_addr as *mut u64,
@@ -2177,6 +2178,7 @@ unsafe fn load_krunfw_payload(
             &mut kernel_size as *mut usize,
         )
     };
+    eprintln!("DEBUG: Survived krunfw_get_kernel!");
     let kernel_bundle = KernelBundle {
         host_addr: kernel_host_addr as u64,
         guest_addr: kernel_guest_addr,
@@ -2286,7 +2288,6 @@ pub unsafe extern "C" fn krun_set_root_disk_remount(
         Entry::Occupied(mut ctx_cfg) => {
             let ctx_cfg = ctx_cfg.get_mut();
 
-            #[cfg(not(target_os = "windows"))]
             if ctx_cfg.vmr.fs.iter().any(|fs| fs.fs_id == "/dev/root") {
                 error!("Root filesystem already configured");
                 return -libc::EINVAL;
@@ -2313,7 +2314,7 @@ pub unsafe extern "C" fn krun_set_root_disk_remount(
                 fs_id: "/dev/root".into(),
                 shared_dir: empty_root.to_string_lossy().into(),
                 // Default to a conservative 512 MB window.
-                shm_size: Some(1 << 29),
+                shm_size: None, // Some(1 << 29),
                 allow_root_dir_delete: true,
             });
 
@@ -2511,11 +2512,11 @@ pub unsafe extern "C" fn krun_add_console_port_tty(
         return -libc::EINVAL;
     }
 
-    let mut mode: windows_sys::Win32::System::Console::CONSOLE_MODE = 0;
+    /* let mut mode: windows_sys::Win32::System::Console::CONSOLE_MODE = 0;
     // We leverage the Windows API to check if the file descriptor is a terminal
     if windows_sys::Win32::System::Console::GetConsoleMode(tty_handle, &mut mode) == 0 {
         return -libc::ENOTTY;
-    }
+    } */
 
     let name_str = if name.is_null() {
         String::new()

@@ -19,7 +19,7 @@ fn build_default_init() -> PathBuf {
         libkrun_root.join("init/jsmn.h").display()
     );
 
-    let mut init_cc_flags = vec!["-O2", "-static", "-Wall"];
+    let mut init_cc_flags = vec!["-O2", "-static", "-fno-PIE", "-no-pie", "-Wall"];
     if std::env::var_os("TIMESYNC").as_deref() == Some(OsStr::new("1")) {
         init_cc_flags.push("-D__TIMESYNC__");
     }
