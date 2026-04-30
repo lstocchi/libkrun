@@ -4,7 +4,10 @@ use crossbeam_channel::Sender;
 use utils::worker_message::WorkerMessage;
 
 use std::io;
+#[cfg(unix)]
 use std::os::fd::AsRawFd;
+#[cfg(windows)]
+use utils::windows::AsRawFd;
 use std::sync::Arc;
 use std::sync::atomic::AtomicI32;
 use std::thread;

@@ -304,6 +304,7 @@ impl<W: ZeroCopyWriter> ZeroCopyWriter for &mut W {
     }
 }
 
+#[cfg(unix)]
 /// Additional context associated with requests.
 #[derive(Clone, Copy, Debug)]
 pub struct Context {
@@ -315,6 +316,19 @@ pub struct Context {
 
     /// The thread group ID of the calling process.
     pub pid: libc::pid_t,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug)]
+pub struct Context {
+    /// The user ID of the calling process.
+    pub uid: u32,
+
+    /// The group ID of the calling process.
+    pub gid: u32,
+
+    /// The thread group ID of the calling process.
+    pub pid: i32,
 }
 
 impl From<fuse::InHeader> for Context {
@@ -864,10 +878,18 @@ pub trait FileSystem {
         // Safe because we are zero-initializing a struct with only POD fields.
         let mut st: bindings::statvfs64 = unsafe { mem::zeroed() };
 
-        // This matches the behavior of libfuse as it returns these values if the
-        // filesystem doesn't implement this method.
-        st.f_namemax = 255;
-        st.f_bsize = 512;
+        #[cfg(unix)]
+        {
+            // This matches the behavior of libfuse as it returns these values if the
+            // filesystem doesn't implement this method.
+            st.f_namemax = 255;
+            st.f_bsize = 512;
+        }
+        #[cfg(windows)]
+        {
+            st.f_namemax = 255;
+            st.f_bsize = 4096;
+        }
 
         Ok(st)
     }

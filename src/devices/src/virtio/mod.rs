@@ -12,7 +12,6 @@ use std::io::Error as IOError;
 
 #[cfg(not(feature = "tee"))]
 pub mod balloon;
-#[cfg(unix)]
 #[allow(dead_code)]
 #[allow(non_camel_case_types)]
 pub mod bindings;
@@ -22,7 +21,7 @@ pub mod console;
 pub mod descriptor_utils;
 pub mod device;
 pub mod file_traits;
-#[cfg(not(any(feature = "tee", feature = "aws-nitro", target_os = "windows")))]
+#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 pub mod fs;
 #[cfg(feature = "gpu")]
 pub mod gpu;
@@ -45,7 +44,7 @@ pub use self::balloon::*;
 pub use self::block::{Block, CacheType};
 pub use self::console::*;
 pub use self::device::*;
-#[cfg(not(any(feature = "tee", feature = "aws-nitro", target_os = "windows")))]
+#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 pub use self::fs::*;
 #[cfg(feature = "gpu")]
 pub use self::gpu::*;

@@ -164,8 +164,6 @@ impl KrunfwBindings {
     }
 }
 
-<<<<<<< HEAD
-=======
 #[derive(Clone)]
 #[cfg(feature = "net")]
 enum LegacyNetworkConfig {
@@ -174,7 +172,6 @@ enum LegacyNetworkConfig {
     VirtioNetGvproxy(PathBuf),
 }
 
->>>>>>> 1e6620e9 (support virtio-net on windows)
 #[derive(Default)]
 struct ContextConfig {
     krunfw: Option<KrunfwBindings>,
@@ -2144,6 +2141,7 @@ unsafe fn load_krunfw_payload(
     let mut kernel_guest_addr: u64 = 0;
     let mut kernel_entry_addr: u64 = 0;
     let mut kernel_size: usize = 0;
+    eprintln!("DEBUG: About to call krunfw_get_kernel in the DLL");
     let kernel_host_addr = unsafe {
         (krunfw.get_kernel)(
             &mut kernel_guest_addr as *mut u64,
@@ -2151,6 +2149,7 @@ unsafe fn load_krunfw_payload(
             &mut kernel_size as *mut usize,
         )
     };
+    eprintln!("DEBUG: Survived krunfw_get_kernel!");
     let kernel_bundle = KernelBundle {
         host_addr: kernel_host_addr as u64,
         guest_addr: kernel_guest_addr,
@@ -2665,6 +2664,12 @@ pub unsafe extern "C" fn krun_add_console_port_tty(
         if tty_handle.is_null() {
             return -libc::EINVAL;
         }
+
+        /* let mut mode: windows_sys::Win32::System::Console::CONSOLE_MODE = 0;
+        // We leverage the Windows API to check if the file descriptor is a terminal
+        if windows_sys::Win32::System::Console::GetConsoleMode(tty_handle, &mut mode) == 0 {
+            return -libc::ENOTTY;
+        } */
 
         let name_str = if name.is_null() {
             String::new()

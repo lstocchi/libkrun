@@ -101,7 +101,7 @@ use device_manager::shm::ShmManager;
 use devices::virtio::display::DisplayInfo;
 #[cfg(feature = "gpu")]
 use devices::virtio::display::NoopDisplayBackend;
-#[cfg(not(any(feature = "tee", feature = "aws-nitro", target_os = "windows")))]
+#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 use devices::virtio::fs::ExportTable;
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 use devices::virtio::VirtioShmRegion;
@@ -558,7 +558,7 @@ impl Display for StartMicrovmError {
 pub enum Payload {
     #[cfg(all(target_arch = "x86_64", not(feature = "tee"), not(target_os = "windows")))]
     KernelMmap,
-    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64", target_os = "windows"))]
     KernelCopy,
     ExternalKernel(ExternalKernel),
     #[cfg(test)]
@@ -581,11 +581,8 @@ fn choose_payload(vm_resources: &VmResources) -> Result<Payload, StartMicrovmErr
         #[cfg(all(target_os = "linux", target_arch = "x86_64", not(feature = "tee")))]
         return Ok(Payload::KernelMmap);
 
-        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64", target_os = "windows"))]
         return Ok(Payload::KernelCopy);
-
-        #[cfg(target_os = "windows")]
-        return Err(StartMicrovmError::MissingKernelConfig);
     } else if let Some(external_kernel) = vm_resources.external_kernel() {
         Ok(Payload::ExternalKernel(external_kernel.clone()))
     } else if vm_resources.firmware_config.is_some() {
@@ -859,6 +856,7 @@ pub fn build_microvm(
         Arc::new(Mutex::new(Cmos::new(
             arch_memory_info.ram_below_gap,
             arch_memory_info.ram_above_gap,
+            
         ))),
         serial_devices,
         exit_evt
@@ -1139,7 +1137,7 @@ pub fn build_microvm(
         )?;
     }
 
-    #[cfg(not(any(feature = "tee", feature = "aws-nitro", target_os = "windows")))]
+    #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
     let export_table: Option<ExportTable> = if cfg!(feature = "gpu") {
         Some(Default::default())
     } else {
@@ -1171,7 +1169,7 @@ pub fn build_microvm(
         attach_input_devices(&mut vmm, &vm_resources.input_backends, intc.clone())?;
     }
 
-    #[cfg(not(any(feature = "tee", feature = "aws-nitro", target_os = "windows")))]
+    #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
     attach_fs_devices(
         &mut vmm,
         &vm_resources.fs,
@@ -1185,7 +1183,6 @@ pub fn build_microvm(
     )?;
     #[cfg(feature = "blk")]
     attach_block_devices(&mut vmm, &vm_resources.block, intc.clone())?;
-
     #[cfg(unix)]
     if let Some(vsock) = vm_resources.vsock.get() {
         attach_unixsock_vsock_device(&mut vmm, vsock, event_manager, intc.clone())?;
@@ -1204,7 +1201,6 @@ pub fn build_microvm(
     if vm_resources.dhcp_client {
         vmm.kernel_cmdline.insert_str("KRUN_DHCP=1")?;
     }
-
     if let Some(s) = &vm_resources.kernel_cmdline.epilog {
         vmm.kernel_cmdline.insert_str(s).unwrap();
     };
@@ -1335,11 +1331,22 @@ fn load_external_kernel(
         KernelFormat::ImageBz2 => {
             let data: Vec<u8> = std::fs::read(external_kernel.path.clone())
                 .map_err(StartMicrovmError::ImageBz2OpenKernel)?;
-            if let Some(magic) = data
+            /* if let Some(magic) = data
                 .windows(3)
                 .position(|window| window == [b'B', b'Z', b'h'])
             {
-                debug!("Found BZIP2 header on Image file at: 0x{magic:x}");
+                debug!("Found BZIP2 header on Image file at: 0x{magic:x}"); */
+            
+            // Search for the full 10-byte BZIP2 header to avoid false positives 
+            // in the uncompressed kernel setup code.
+            let magic = data.windows(10).position(|window| {
+                window[0..3] == [b'B', b'Z', b'h'] && 
+                window[3] >= b'1' && window[3] <= b'9' && 
+                window[4..10] == [0x31, 0x41, 0x59, 0x26, 0x53, 0x59]
+            });
+        
+            if let Some(magic) = magic {
+                debug!("Found exact BZIP2 block header on Image file at: 0x{magic:x}");
                 let (_, compressed) = data.split_at(magic);
                 let mut kernel_data: Vec<u8> = Vec::new();
                 let mut bz2 = bzip2::read::BzDecoder::new(compressed);
@@ -1448,7 +1455,7 @@ fn load_payload(
     payload: &Payload,
 ) -> std::result::Result<LoadedPayload, StartMicrovmError> {
     match payload {
-        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64", target_os = "windows"))]
         Payload::KernelCopy => {
             let (kernel_entry_addr, kernel_host_addr, kernel_guest_addr, kernel_size) =
                 if let Some(kernel_bundle) = &_vm_resources.kernel_bundle {
@@ -1725,6 +1732,10 @@ pub fn create_guest_memory(
                 };
             arch::arch_memory_regions(mem_size, Some(kernel_guest_addr), kernel_size, 0, None)
         }
+        #[cfg(target_os = "windows")]
+        Payload::KernelCopy => {
+            arch::arch_memory_regions(mem_size, None, 0, 0, None)
+        }
         #[cfg(test)]
         Payload::Empty => arch::arch_memory_regions(mem_size, None, 0, 0, None),
         Payload::Firmware => arch::arch_memory_regions(mem_size, None, 0, 0, firmware_size),
@@ -1739,7 +1750,7 @@ pub fn create_guest_memory(
 
     let mut shm_manager = ShmManager::new(&arch_mem_info);
 
-    #[cfg(not(any(feature = "tee", target_os = "windows")))]
+    #[cfg(not(feature = "tee"))]
     for (index, fs) in vm_resources.fs.iter().enumerate() {
         if let Some(shm_size) = fs.shm_size {
             shm_manager
@@ -2296,7 +2307,7 @@ fn attach_mmio_device(
     Ok(())
 }
 
-#[cfg(not(any(feature = "tee", feature = "aws-nitro", target_os = "windows")))]
+#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 fn attach_fs_devices(
     vmm: &mut Vmm,
     fs_devs: &[FsDeviceConfig],
@@ -2774,7 +2785,7 @@ fn attach_console_devices(
     if let Some(reader) = console_reader {
         reader.start(sigwinch_evt).map_err(ConsolePortSetup)?;
     } else {
-        spawn_console_resize_monitor(sigwinch_evt);
+        //spawn_console_resize_monitor(sigwinch_evt);
     }
 
     // The device mutex mustn't be locked here otherwise it will deadlock.
