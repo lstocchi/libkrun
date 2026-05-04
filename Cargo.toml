@@ -14,7 +14,7 @@ members = [
     "src/devices",
     "src/vmm",
     "src/aws_nitro",
-    "src/rutabaga_gfx",
+    "src/rutabaga_gfx", "src/whp",
 ]
 exclude = ["examples/gtk_display"]
 resolver = "2"
