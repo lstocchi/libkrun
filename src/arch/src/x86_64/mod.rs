@@ -31,10 +31,6 @@ pub mod interrupts;
 pub mod linux;
 #[cfg(target_os = "windows")]
 pub mod windows;
-#[cfg(target_os = "windows")]
-use std::mem::MaybeUninit;
-#[cfg(target_os = "windows")]
-use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
 
 use crate::x86_64::layout::{EBDA_START, FIRST_ADDR_PAST_32BITS, MMIO_MEM_START};
 #[cfg(feature = "tee")]

@@ -712,7 +712,11 @@ dependencies = [
  "linux-loader",
  "tdx",
  "vm-memory",
+<<<<<<< HEAD
  "vmm-sys-util 0.15.0",
+=======
+ "vmm-sys-util 0.14.0",
+>>>>>>> 66f2e022 (build(arch): infrastructure for Windows/WHP support)
  "windows-sys",
 ]
 
