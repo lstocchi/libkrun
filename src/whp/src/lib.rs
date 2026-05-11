@@ -697,7 +697,7 @@ impl WhpVcpu {
     /// from the exit context.
     pub fn advance_rip(&self) -> Result<(), Error> {
         let new_rip = self.exit_context.VpContext.Rip + self.instruction_length() as u64;
-        self.set_registers([(WHvX64RegisterRip, new_rip)])
+        self.set_registers64([(WHvX64RegisterRip, new_rip)])
     }
 
     /// Sets RAX, RBX, RCX, RDX and advances RIP in a single register write.
@@ -711,7 +711,7 @@ impl WhpVcpu {
     ) -> Result<(), Error> {
         let new_rip = self.exit_context.VpContext.Rip + self.instruction_length() as u64;
 
-        self.set_registers([
+        self.set_registers64([
             (WHvX64RegisterRax, eax),
             (WHvX64RegisterRbx, ebx),
             (WHvX64RegisterRcx, ecx),
@@ -724,7 +724,7 @@ impl WhpVcpu {
     pub fn complete_msr_read(&self, rax: u64, rdx: u64) -> Result<(), Error> {
         let new_rip = self.exit_context.VpContext.Rip + self.instruction_length() as u64;
 
-        self.set_registers([
+        self.set_registers64([
             (WHvX64RegisterRax, rax),
             (WHvX64RegisterRdx, rdx),
             (WHvX64RegisterRip, new_rip),
@@ -758,9 +758,12 @@ impl WhpVcpu {
         }
     }
 
-    pub fn get_reg64(&self, name: WHV_REGISTER_NAME) -> Result<u64, Error> {
-        let values = self.get_registers([name])?;
-        Ok(unsafe { values[0].Reg64 })
+    pub fn get_registers64<const N: usize>(
+        &self,
+        names: [WHV_REGISTER_NAME; N],
+    ) -> Result<[u64; N], Error> {        
+        let values = self.get_registers(names)?;
+        Ok(values.map(|v| unsafe { v.Reg64 }))
     }
 
     fn set_whp_registers(
@@ -789,6 +792,21 @@ impl WhpVcpu {
 
     pub fn set_registers<const N: usize>(
         &self,
+        pairs: [(WHV_REGISTER_NAME, WHV_REGISTER_VALUE); N],
+    ) -> Result<(), Error> {
+        let mut names: [WHV_REGISTER_NAME; N] = unsafe { mem::zeroed() };
+        let mut values: [WHV_REGISTER_VALUE; N] = unsafe { mem::zeroed() };
+
+        for i in 0..N {
+            names[i] = pairs[i].0;
+            values[i] = pairs[i].1;
+        }
+
+        self.set_whp_registers(&names, &values)
+    }
+
+    pub fn set_registers64<const N: usize>(
+        &self,
         pairs: [(WHV_REGISTER_NAME, u64); N],
     ) -> Result<(), Error> {
         let mut names: [WHV_REGISTER_NAME; N] = unsafe { mem::zeroed() };
@@ -796,7 +814,10 @@ impl WhpVcpu {
 
         for i in 0..N {
             names[i] = pairs[i].0;
-            values[i] = WHV_REGISTER_VALUE { Reg64: pairs[i].1 };
+            // Field assignment preserves zero-initialized upper bytes.
+            // Constructing a new union (WHV_REGISTER_VALUE { Reg64: .. }) would
+            // leave padding bytes uninitialized, which corrupts 128-bit registers.
+            values[i].Reg64 = pairs[i].1;
         }
 
         self.set_whp_registers(&names, &values)
@@ -826,9 +847,9 @@ impl WhpVcpu {
     /// https://github.com/qemu/qemu/blob/master/target/i386/whpx/whpx-all.c#L2045
     /// https://github.com/google/crosvm/blob/main/hypervisor/src/whpx/whpx_sys/WinHvPlatformDefs.h#L833
     pub fn clear_halt_suspend(&self) -> Result<(), Error> {
-        let activity = self.get_reg64(WHvRegisterInternalActivityState)?;
+        let [activity] = self.get_registers64([WHvRegisterInternalActivityState])?;
         if activity & 0x2 != 0 {
-            self.set_registers([(WHvRegisterInternalActivityState, activity & !0x2)])?;
+            self.set_registers64([(WHvRegisterInternalActivityState, activity & !0x2)])?;
         }
         Ok(())
     }
@@ -837,10 +858,10 @@ impl WhpVcpu {
     /// on every STI instruction. Called after an InterruptWindow exit.
     /// https://github.com/google/crosvm/blob/main/hypervisor/src/whpx/whpx_sys/WinHvPlatformDefs.h#L773
     pub fn clear_interrupt_window(&self) -> Result<(), Error> {
-        let notifications = self.get_reg64(WHvX64RegisterDeliverabilityNotifications)?;
+        let [notifications] = self.get_registers64([WHvX64RegisterDeliverabilityNotifications])?;
         if notifications & 0x2 != 0 {
             // Clear Bit 1 (InterruptNotification) while preserving NMI and Priority bits
-            self.set_registers([(WHvX64RegisterDeliverabilityNotifications, notifications & !0x2)])?;
+            self.set_registers64([(WHvX64RegisterDeliverabilityNotifications, notifications & !0x2)])?;
         }
         Ok(())
     }
