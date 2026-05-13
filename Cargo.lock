@@ -670,6 +670,7 @@ dependencies = [
  "krun-polly",
  "krun-rutabaga-gfx",
  "krun-utils",
+ "krun-whp",
  "kvm-bindings",
  "kvm-ioctls",
  "libc",
