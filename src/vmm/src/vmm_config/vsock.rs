@@ -1,5 +1,6 @@
 // Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
+#![cfg(target_os = "unix")]
 
 use std::collections::HashMap;
 use std::fmt;
@@ -7,9 +8,8 @@ use std::path::PathBuf;
 #[cfg(unix)]
 use std::sync::{Arc, Mutex};
 
-use devices::virtio::TsiFlags;
 #[cfg(unix)]
-use devices::virtio::{Vsock, VsockError};
+use devices::virtio::{TsiFlags, Vsock, VsockError};
 
 #[cfg(unix)]
 type MutexVsock = Arc<Mutex<Vsock>>;

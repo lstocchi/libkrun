@@ -23,6 +23,7 @@ use super::descriptor_utils::{Reader, Writer};
 use super::inode_alloc::InodeAllocator;
 use super::null_fs::NullFs;
 use super::passthrough::{self, PassthroughFs};
+#[cfg(target_os = "linux")]
 use super::read_only::PassthroughFsRo;
 use super::server::Server;
 use super::virtual_entry::VirtualDirEntry;

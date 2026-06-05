@@ -84,7 +84,7 @@ fn write_gdt_table(table: &[u64], guest_mem: &GuestMemoryMmap) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn write_idt_value(val: u64, guest_mem: &GuestMemoryMmap) -> Result<()> {
+fn write_idt_value(val: u64, guest_mem: &GuestMemoryMmap) -> Result<()> {
     let boot_idt_addr = GuestAddress(BOOT_IDT_OFFSET);
     guest_mem
         .write_obj(val, boot_idt_addr)
@@ -194,6 +194,7 @@ mod tests {
         for i in 0..512 {
             assert_eq!((i << 21) + 0x83u64, read_u64(gm, PDE_START + (i * 8)));
         }
+
         assert_eq!(PML4_START, cr3);
         assert!(cr4 & X86_CR4_PAE != 0);
         assert!(cr0 & X86_CR0_PG != 0);

@@ -11,15 +11,6 @@ pub mod layout;
 #[cfg(not(feature = "tee"))]
 mod mptable;
 
-#[cfg(target_os = "linux")]
-pub mod linux;
-#[cfg(target_os = "windows")]
-pub mod windows;
-#[cfg(target_os = "windows")]
-use std::mem::MaybeUninit;
-#[cfg(target_os = "windows")]
-use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
-
 /// Logic for configuring x86_64 model specific registers (MSRs).
 pub mod msr;
 /// Logic for configuring x86_64 registers.

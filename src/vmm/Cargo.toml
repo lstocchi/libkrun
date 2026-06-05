@@ -23,7 +23,7 @@ vhost-user = ["devices/vhost-user"]
 crossbeam-channel = ">=0.5.15"
 flate2 = "1.0.35"
 libc = ">=0.2.39"
-linux-loader = { version = "0.13.2", features = ["bzimage", "elf", "pe"] }
+linux-loader = { git = "https://github.com/rust-vmm/linux-loader", rev = "9e91456afd7abed130939b755499977a739bb5f8", default-features = false, features = ["bzimage", "elf", "pe"] }
 log = "0.4.0"
 vm-memory = { version = "0.17.0", default-features = false, features = ["backend-mmap"] }
 vmm-sys-util = "0.14"
@@ -64,6 +64,7 @@ kvm-ioctls = "0.24"
 hvf = { package = "krun-hvf", version = "=0.1.0-1.18.0", path = "../hvf" }
 
 [target.'cfg(target_os = "windows")'.dependencies]
+whp = { package = "krun-whp", version = "=0.1.0-1.18.0", path = "../whp" }
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_System_Console",

@@ -42,12 +42,6 @@ pub struct PortIODeviceManager {
     pub cmos: Arc<Mutex<devices::legacy::Cmos>>,
     pub stdio_serial: Vec<Arc<Mutex<devices::legacy::Serial>>>,
     pub i8042: Arc<Mutex<devices::legacy::I8042Device>>,
-    #[cfg(target_os = "windows")]
-    pub pit: Option<Arc<Mutex<devices::legacy::Pit>>>,
-    #[cfg(target_os = "windows")]
-    pub pic_master: Option<Arc<Mutex<devices::legacy::PicPort>>>,
-    #[cfg(target_os = "windows")]
-    pub pic_slave: Option<Arc<Mutex<devices::legacy::PicPort>>>,
 
     pub com_evt_1: EventFd,
     pub com_evt_2: EventFd,
@@ -90,12 +84,6 @@ impl PortIODeviceManager {
             cmos,
             stdio_serial,
             i8042,
-            #[cfg(target_os = "windows")]
-            pit: None,
-            #[cfg(target_os = "windows")]
-            pic_master: None,
-            #[cfg(target_os = "windows")]
-            pic_slave: None,
             com_evt_1: evts[0].try_clone().map_err(Error::EventFd)?,
             com_evt_2: evts[1].try_clone().map_err(Error::EventFd)?,
             com_evt_3: evts[2].try_clone().map_err(Error::EventFd)?,
@@ -154,7 +142,7 @@ impl PortIODeviceManager {
         self.io_bus
             .insert(self.i8042.clone(), 0x060, 0x5)
             .map_err(Error::BusError)?;        
-        #[cfg(target_os = "windows")]
+        /* #[cfg(target_os = "windows")]
         {
             if let Some(pit) = &self.pit {
                 self.io_bus
@@ -171,7 +159,7 @@ impl PortIODeviceManager {
                     .insert(pic.clone(), 0xA0, 0x2)
                     .map_err(Error::BusError)?;
             }
-        }
+        } */
         Ok(())
     }
 }

@@ -30,6 +30,7 @@ use crate::vmm_config::kernel_cmdline::{KernelCmdlineConfig, KernelCmdlineConfig
 use crate::vmm_config::machine_config::{VmConfig, VmConfigError};
 #[cfg(feature = "net")]
 use crate::vmm_config::net::{NetBuilder, NetworkInterfaceConfig, NetworkInterfaceError};
+#[cfg(target_os = "unix")]
 use crate::vmm_config::vsock::*;
 use crate::vstate::VcpuConfig;
 #[cfg(feature = "gpu")]
@@ -42,6 +43,7 @@ use krun_display::DisplayBackend;
 type Result<E> = std::result::Result<(), E>;
 
 // Re-export TsiFlags from devices crate
+#[cfg(unix)]
 pub use devices::virtio::TsiFlags;
 
 #[cfg(feature = "vhost-user")]
@@ -76,6 +78,7 @@ pub enum Error {
     /// microVM vCpus or memory configuration error.
     VmConfig(VmConfigError),
     /// Vsock device configuration error.
+    #[cfg(unix)]
     VsockDevice(VsockConfigError),
 }
 
@@ -161,6 +164,7 @@ pub enum PortConfig {
     },
 }
 
+#[cfg(unix)]
 /// Configuration for the vsock device
 #[derive(Debug, Default, Clone, Eq, PartialEq)]
 pub enum VsockConfig {
@@ -195,6 +199,7 @@ pub struct VmResources {
     #[cfg(not(feature = "tee"))]
     pub fs: Vec<FsDeviceConfig>,
     /// The vsock device.
+    #[cfg(target_os = "unix")]
     pub vsock: VsockBuilder,
     /// The virtio-blk device.
     #[cfg(feature = "blk")]
@@ -458,6 +463,7 @@ mod tests {
             external_kernel: None,
             #[cfg(not(feature = "tee"))]
             fs: Default::default(),
+            #[cfg(target_os = "unix")]
             vsock: Default::default(),
             #[cfg(feature = "blk")]
             block: Default::default(),

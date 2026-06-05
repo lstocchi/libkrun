@@ -35,7 +35,7 @@ pub mod pic;
 #[cfg(target_arch = "aarch64")]
 mod rtc_pl031;
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-mod whp_split_ioapic;
+mod ioapic_whp;
 #[cfg(target_os = "macos")]
 mod vcpu;
 #[cfg(target_arch = "x86_64")]
@@ -85,7 +85,7 @@ pub use self::kvmioapic::KvmIoapic;
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 pub use self::pic::{Pic, PicPort, PicSelect};
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-pub use self::whp_split_ioapic::WhpIoapic;
+pub use self::ioapic_whp::WhpIoapic;
 #[cfg(target_arch = "aarch64")]
 pub use self::rtc_pl031::RTC;
 pub use self::serial::Serial;

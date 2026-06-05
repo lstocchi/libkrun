@@ -45,13 +45,11 @@ use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicI32, Ordering};
 use utils::eventfd::EventFd;
-#[cfg(target_os = "windows")]
-use utils::windows::AsRawFd;
-#[cfg(target_os = "windows")]
-use utils::windows::SendHandle;
+#[cfg(target_os = "unix")]
+use vmm::resources::{TsiFlags, VsockConfig};
 use vmm::resources::{
-    DefaultVirtioConsoleConfig, PortConfig, SerialConsoleConfig, TsiFlags, VirtioConsoleConfigMode,
-    VmResources, VsockConfig,
+    DefaultVirtioConsoleConfig, PortConfig, SerialConsoleConfig, VirtioConsoleConfigMode,
+    VmResources
 };
 #[cfg(feature = "blk")]
 use vmm::vmm_config::block::{BlockDeviceConfig, BlockRootConfig};
@@ -183,6 +181,7 @@ struct ContextConfig {
     rlimits: Option<String>,
     net_index: u8,
     tsi_port_map: Option<HashMap<u16, u16>>,
+    #[cfg(target_os = "unix")]
     vsock_config: VsockConfig,
     #[cfg(feature = "blk")]
     block_cfgs: Vec<BlockDeviceConfig>,
@@ -1088,6 +1087,7 @@ pub unsafe extern "C" fn krun_set_port_map(ctx_id: u32, c_port_map: *const *cons
             }
         }
 
+        #[cfg(target_os = "unix")]
         match CTX_MAP.lock().unwrap().entry(ctx_id) {
             Entry::Occupied(mut ctx_cfg) => {
                 let cfg = ctx_cfg.get_mut();
@@ -1329,6 +1329,7 @@ pub unsafe extern "C" fn krun_add_vsock_port2(
             }
         }
 
+        #[cfg(target_os = "unix")]
         match CTX_MAP.lock().unwrap().entry(ctx_id) {
             Entry::Occupied(mut ctx_cfg) => {
                 let cfg = ctx_cfg.get_mut();
@@ -2150,6 +2151,7 @@ unsafe fn load_krunfw_payload(
         )
     };
     eprintln!("DEBUG: Survived krunfw_get_kernel!");
+    eprintln!("DEBUG: kernel_guest_addr=0x{kernel_guest_addr:x} kernel_entry_addr=0x{kernel_entry_addr:x} kernel_size=0x{kernel_size:x} ({} MB)", kernel_size >> 20);
     let kernel_bundle = KernelBundle {
         host_addr: kernel_host_addr as u64,
         guest_addr: kernel_guest_addr,
@@ -2931,6 +2933,7 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         epilog: Some(format!(" -- {}", ctx_cfg.get_args())),
     };
 
+    eprintln!("kernel_cmdline: {kernel_cmdline:?}");
     if ctx_cfg.vmr.set_kernel_cmdline(kernel_cmdline).is_err() {
         return -libc::EINVAL;
     }
@@ -2980,6 +2983,11 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         ctx_cfg.vmr.set_gpu_shm_size(shm_size);
     }
 
+    /* eprintln!("console_output:");
+    if let Some(console_output) = ctx_cfg.console_output {
+        ctx_cfg.vmr.set_console_output(console_output);
+    } */
+
     #[cfg(unix)]
     if let Some(gid) = ctx_cfg.vmm_gid {
         if unsafe { libc::setgid(gid) } != 0 {
@@ -3024,6 +3032,7 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
     #[cfg(any(feature = "amd-sev", feature = "tdx"))]
     vmm::worker::start_worker_thread(_vmm.clone(), _receiver.clone()).unwrap();
 
+    eprint!("event_manager:");
     loop {
         match event_manager.run() {
             Ok(_) => {}

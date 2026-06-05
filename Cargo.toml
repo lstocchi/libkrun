@@ -22,9 +22,6 @@ members = [
 exclude = ["examples/gtk_display"]
 resolver = "2"
 
-[patch.crates-io]
-vm-memory = { path = "patches/vm-memory" }
-
 [profile.dev]
 #panic = "abort"
 

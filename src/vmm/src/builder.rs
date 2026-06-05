@@ -66,7 +66,7 @@ use devices::legacy::{GicV3, HvfGicV3};
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 use devices::legacy::{IoApic, IrqChipT};
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-use devices::legacy::{Pic, PicPort, PicSelect, Pit, WhpIoapic};
+use devices::legacy::WhpIoapic;
 use devices::legacy::{IrqChip, IrqChipDevice};
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 use devices::legacy::{KvmGicV2, KvmGicV3};
@@ -652,6 +652,7 @@ pub fn build_microvm(
     #[allow(unused_mut)]
     let mut vm = setup_vm(&guest_memory, vm_resources.nested_enabled)?;
 
+    eprintln!("vm");
     #[cfg(all(not(feature = "tee"), target_os = "windows"))]
     #[allow(unused_mut)]
     let mut vm = setup_vm(&guest_memory, vcpu_config.vcpu_count)?;
@@ -881,7 +882,7 @@ pub fn build_microvm(
         let cpu_count = vm_resources.vm_config().vcpu_count.unwrap();
         Arc::new(VcpuList::new(cpu_count as u64))
     };
-
+    eprintln!("vcpu_list");
     let vcpus;
     let intc: IrqChip;
     // For x86_64 we need to create the interrupt controller before calling `KVM_CREATE_VCPUS`
@@ -934,14 +935,16 @@ pub fn build_microvm(
             WhpIoapic::new(vm.whp_vm().clone()),
         ))));
 
+        eprintln!("intc");
         // 8259 PIC emulation — required for early-boot timer interrupts
         // before the kernel switches to APIC mode and programs the IOAPIC.
-        let pic = Arc::new(Mutex::new(Pic::new(vm.whp_vm().clone())));
+        /* let pic = Arc::new(Mutex::new(Pic::new(vm.whp_vm().clone())));
         pio_device_manager.pic_master =
             Some(Arc::new(Mutex::new(PicPort::new(pic.clone(), PicSelect::Primary))));
         pio_device_manager.pic_slave =
             Some(Arc::new(Mutex::new(PicPort::new(pic.clone(), PicSelect::Secondary))));
 
+        eprintln!("pic");
         // Create a userspace PIT (i8254) for timer interrupts.
         // On Linux/KVM the PIT is emulated in-kernel; on WHP we need our own.
         let pit = Pit::new_with_pic(intc.clone(), pic);
@@ -950,16 +953,19 @@ pub fn build_microvm(
             .lock()
             .unwrap()
             .set_pit_counter2(pit.counter2());
-        pio_device_manager.pit = Some(Arc::new(Mutex::new(pit)));
+        pio_device_manager.pit = Some(Arc::new(Mutex::new(pit))); */
 
+        eprintln!("attach_legacy_devices_whp");
         attach_legacy_devices_whp(
             &mut pio_device_manager,
             &mut mmio_device_manager,
             Some(intc.clone()),
         )?;
 
+        eprintln!("kernel_boot");
         let kernel_boot = vm_resources.firmware_config.is_none();
 
+        eprintln!("create_vcpus_x86_64_whp");
         vcpus = create_vcpus_x86_64_whp(
             &vm,
             &vcpu_config,
@@ -972,6 +978,7 @@ pub fn build_microvm(
         .map_err(StartMicrovmError::Internal)?;
     }
 
+    eprintln!("vcpus3");
     #[cfg(feature = "tdx")]
     {
         for vcpu in &vcpus {
@@ -1095,6 +1102,7 @@ pub fn build_microvm(
         pio_device_manager,
     };
 
+    eprintln!("vmm:");
     // Set raw mode for FDs that are connected to legacy serial devices.
     for serial_tty in serial_ttys {
         setup_terminal_raw_mode(&mut vmm, Some(serial_tty), false);
@@ -1169,6 +1177,7 @@ pub fn build_microvm(
         attach_input_devices(&mut vmm, &vm_resources.input_backends, intc.clone())?;
     }
 
+    eprintln!("attach_fs_devices");
     #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
     attach_fs_devices(
         &mut vmm,
@@ -1210,6 +1219,7 @@ pub fn build_microvm(
     #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
     load_cmdline(&vmm)?;
 
+    eprintln!("load_cmdline");
     vmm.configure_system(
         vcpus.as_slice(),
         &intc,
@@ -1256,6 +1266,7 @@ pub fn build_microvm(
     vmm.start_vcpus(vcpus)
         .map_err(StartMicrovmError::Internal)?;
 
+    eprintln!("start_vcpus");
     // Clippy thinks we don't need Arc<Mutex<...
     // but we don't want to change the event_manager interface
     #[allow(clippy::arc_with_non_send_sync)]
@@ -1288,7 +1299,7 @@ fn load_external_kernel(
             guest_mem.write(&data, GuestAddress(0x8000_0000)).unwrap();
             GuestAddress(0x8000_0000)
         }
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
         KernelFormat::Elf => {
             let mut file = File::options()
                 .read(true)
@@ -1694,6 +1705,7 @@ pub fn create_guest_memory(
     StartMicrovmError,
 > {
     let mem_size = mem_size << 20;
+    eprintln!("create_guest_memory: mem_size={} bytes ({} MB)", mem_size, mem_size >> 20);
 
     let (firmware_data, firmware_size) = if let Some(firmware) = &vm_resources.firmware_config {
         let data = std::fs::read(firmware.path.clone()).map_err(StartMicrovmError::FirmwareRead)?;
@@ -2147,12 +2159,15 @@ fn create_vcpus_x86_64_whp(
     // WHP doesn't put AP vCPUs in "wait-for-SIPI" state automatically.
     // Place a `cli; hlt; jmp` idle loop in low memory so APs park there
     // in real mode until the BSP sends INIT+SIPI via the emulated APIC.
+    eprintln!("write_ap_trampoline");
     if kernel_boot && vcpu_config.vcpu_count > 1 {
         write_ap_trampoline(guest_mem);
     }
-
+    eprintln!("vcpus");
     let mut vcpus = Vec::with_capacity(vcpu_config.vcpu_count as usize);
+    eprintln!("vcpus2");
     for cpu_index in 0..vcpu_config.vcpu_count {
+        eprintln!("vcpu");
         let mut vcpu = Vcpu::new_x86_64(
             cpu_index,
             vm.whp_vm().clone(),
@@ -2161,10 +2176,10 @@ fn create_vcpus_x86_64_whp(
             exit_evt.try_clone().map_err(Error::EventFd)?,
         )
         .map_err(Error::Vcpu)?;
-
+        eprintln!("vcpu2");
         vcpu.configure_x86_64(guest_mem, entry_addr, kernel_boot)
             .map_err(Error::Vcpu)?;
-
+        eprintln!("vcpu3");
         vcpus.push(vcpu);
     }
     Ok(vcpus)

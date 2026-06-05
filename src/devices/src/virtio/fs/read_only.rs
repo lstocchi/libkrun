@@ -8,6 +8,7 @@
 // Unoverridden methods fall back to the trait defaults (which return ENOSYS),
 // so the wrapper fails closed -- but new methods should still be explicitly
 // handled here for correct error semantics.
+#![cfg(target_os = "linux")]
 
 #[cfg(target_os = "macos")]
 use crossbeam_channel::Sender;

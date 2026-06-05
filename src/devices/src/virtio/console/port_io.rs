@@ -41,6 +41,8 @@ use windows_sys::Win32::{
         Threading::{WaitForMultipleObjects, WaitForSingleObject, INFINITE},
     },
 };
+#[cfg(windows)]
+use std::mem::MaybeUninit;
 
 pub trait PortInput {
     fn read_volatile(&mut self, buf: &mut VolatileSlice) -> Result<usize, io::Error>;
@@ -525,12 +527,13 @@ struct PortTerminalPropertiesHandle(OwnedHandle);
 #[cfg(windows)]
 impl PortTerminalProperties for PortTerminalPropertiesHandle {
     fn get_win_size(&self) -> (u16, u16) {
-        let mut info: CONSOLE_SCREEN_BUFFER_INFO = unsafe { std::mem::zeroed() };
-        let ret = unsafe { GetConsoleScreenBufferInfo(self.0.as_raw_handle(), &mut info) };
+        let mut info = MaybeUninit::<CONSOLE_SCREEN_BUFFER_INFO>::uninit();
+        let ret = unsafe { GetConsoleScreenBufferInfo(self.0.as_raw_handle(), info.as_mut_ptr()) };
         if ret == 0 {
             log::error!("GetConsoleScreenBufferInfo failed: {}", io::Error::last_os_error());
             return (0, 0);
         }
+        let info = unsafe { info.assume_init() };
         let cols = (info.srWindow.Right - info.srWindow.Left + 1) as u16;
         let rows = (info.srWindow.Bottom - info.srWindow.Top + 1) as u16;
         (cols, rows)

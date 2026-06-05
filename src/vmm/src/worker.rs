@@ -59,6 +59,7 @@ impl super::Vmm {
                     .send(self.vm.fd().set_irq_line(irq, active).is_ok())
                     .unwrap();
             }
+            #[cfg(not(target_os = "windows"))]
             WorkerMessage::ConvertMemory(_sender, _properties) => {
                 #[cfg(all(feature = "tee", target_arch = "x86_64"))]
                 {
