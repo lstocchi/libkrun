@@ -13,7 +13,6 @@ use nix::ioctl_read_bad;
 use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 #[cfg(unix)]
 use nix::unistd::{dup, isatty};
-#[cfg(unix)]
 use std::fs::File;
 use std::io::{self, ErrorKind};
 #[cfg(unix)]
@@ -108,7 +107,12 @@ pub fn term_fd(
 pub fn term_handle(
     handle: *mut core::ffi::c_void,
 ) -> io::Result<Box<dyn PortTerminalProperties + Send + Sync>> {
-    Ok(Box::new(PortTerminalPropertiesHandle(dup_handle(handle)?)))
+    let handle = dup_handle(handle)?;
+    assert!(
+        handle.is_terminal(),
+        "Expected handle {handle:?}, to be a tty, to query the window size!"
+    );
+    Ok(Box::new(PortTerminalPropertiesHandle(handle)))
 }
 
 pub fn term_fixed_size(width: u16, height: u16) -> Box<dyn PortTerminalProperties + Send + Sync> {
@@ -125,7 +129,7 @@ pub fn output_file(file: File) -> Result<Box<dyn PortOutput + Send>, nix::Error>
 }
 
 #[cfg(windows)]
-pub fn output_file(file: std::fs::File) -> io::Result<Box<dyn PortOutput + Send>> {
+pub fn output_file(file: File) -> io::Result<Box<dyn PortOutput + Send>> {
     output_to_handle_dup(file.as_raw_handle())
 }
 
@@ -228,7 +232,6 @@ impl PortOutput for PortOutputFd {
     }
 }
 
-#[cfg(unix)]
 fn dup_raw_fd_into_owned(raw_fd: RawFd) -> Result<OwnedFd, nix::Error> {
     // SAFETY: if raw_fd is invalid the `dup` call below will fail
     let borrowed_fd = unsafe { BorrowedFd::borrow_raw(raw_fd) };
@@ -316,7 +319,7 @@ impl PortInput for PortInputHandle {
 /// Key-down events are translated from UTF-16 to UTF-8 and buffered for
 /// [`PortInputConsole`].  `WINDOW_BUFFER_SIZE_EVENT` events signal the
 /// provided `sigwinch_evt` so the virtio console can update the guest.
-#[cfg(windows)]
+/* #[cfg(windows)]
 pub struct ConsoleInputReader {
     handle: OwnedHandle,
     buf: Arc<Mutex<VecDeque<u8>>>,
@@ -363,9 +366,9 @@ impl ConsoleInputReader {
             })?;
         Ok(())
     }
-}
+} */
 
-#[cfg(windows)]
+/* #[cfg(windows)]
 fn console_input_reader_loop(
     handle: OwnedHandle,
     buf: Arc<Mutex<VecDeque<u8>>>,
@@ -448,12 +451,12 @@ fn console_input_reader_loop(
             let _ = data_evt.write(1);
         }
     }
-}
+} */
 
 /// Reads from a shared buffer fed by [`ConsoleInputReader`].
 /// The data event stays signaled as long as the buffer is non-empty (manual-
 /// reset semantics), and is reset only when `read_volatile` fully drains it.
-#[cfg(windows)]
+/* #[cfg(windows)]
 struct PortInputConsole {
     buf: Arc<Mutex<VecDeque<u8>>>,
     data_evt: EventFd,
@@ -489,7 +492,7 @@ impl PortInput for PortInputConsole {
         }
         wait_for_handles(&handles);
     }
-}
+} */
 
 #[cfg(windows)]
 struct PortOutputHandle(OwnedHandle);
@@ -517,7 +520,9 @@ impl PortOutput for PortOutputHandle {
     }
 
     fn wait_until_writable(&self) {
-        // Console/pipe output handles are always writable; nothing to wait for.
+        // Because WriteFile is blocking, `write_volatile` will natively pause the 
+        // thread until space is available. It will never return io::ErrorKind::WouldBlock.
+        // Therefore, `process_tx` will never invoke this function on Windows.
     }
 }
 

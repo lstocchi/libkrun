@@ -33,6 +33,8 @@ use std::io::IsTerminal;
 use std::os::fd::AsRawFd;
 #[cfg(target_os = "windows")]
 use utils::windows::AsRawFd;
+#[cfg(windows)]
+use std::os::windows::io::{BorrowedHandle};
 #[cfg(unix)]
 use std::os::fd::{BorrowedFd, FromRawFd, RawFd};
 #[cfg(windows)]
@@ -2705,6 +2707,7 @@ pub unsafe extern "C" fn krun_add_console_port_tty(
         }
     }
 }
+
 
 #[cfg(unix)]
 #[allow(clippy::missing_safety_doc)]

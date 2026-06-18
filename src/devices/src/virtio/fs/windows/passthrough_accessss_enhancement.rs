@@ -160,6 +160,11 @@ struct InodeData {
     path: RwLock<Arc<PathBuf>>,
     wide_path: RwLock<Arc<Vec<u16>>>,
     refcount: AtomicU64,
+    // Cache attributes to avoid reading from disk on every operation
+    cached_uid: RwLock<u32>,
+    cached_gid: RwLock<u32>,
+    cached_mode: RwLock<u32>,
+    last_updated: RwLock<Instant>,
 }
 
 impl InodeData {
@@ -176,6 +181,33 @@ impl InodeData {
             *self.path.write().unwrap() = Arc::new(new_path.to_path_buf());
             *self.wide_path.write().unwrap() = Arc::new(path_to_wide(new_path));
         }
+    }
+
+    pub fn is_stale(&self) -> bool {
+        self.last_updated.read().unwrap().elapsed() > Duration::from_secs(5)
+    }
+
+    pub fn refresh(&self) -> io::Result<()> {
+        // Attempt to read from the host disk
+        // read_override_stat_from_disk should return io::Error if the file is gone
+        let path = self.path.read().unwrap();
+
+        let meta = fs::symlink_metadata(&path).map_err(win_err_to_linux)?;
+        let stat = metadata_to_stat64(&meta, self.inode, &path, 1);
+
+        drop(path);
+            
+        // Update the cache
+        let mut uid = self.cached_uid.write().unwrap();
+        let mut gid = self.cached_gid.write().unwrap();
+        let mut mode = self.cached_mode.write().unwrap();
+        let mut last_updated = self.last_updated.write().unwrap();
+
+        *uid = stat.st_uid;
+        *gid = stat.st_gid;
+        *mode = stat.st_mode;
+        *last_updated = Instant::now();
+        Ok(())
     }
 }
 
@@ -1144,6 +1176,7 @@ impl PassthroughFs {
             let handle_existing = |existing: &Arc<InodeData>| {
                 existing.refcount.fetch_add(1, Ordering::Acquire);
                 existing.update_path_if_changed(&child_path);
+                existing.refresh().map_err(win_err_to_linux)?;
                 existing.inode
             };
 
@@ -1162,6 +1195,9 @@ impl PassthroughFs {
                 } else {
                     // Safe to create a new one now
                     let inode = self.next_inode.fetch_add(1, Ordering::Relaxed);
+                    let meta = fs::symlink_metadata(&child_path).map_err(win_err_to_linux)?;
+                    let st = metadata_to_stat64(&meta, inode, &child_path, file_info.n_number_of_links);
+
                     write_map.insert(
                         inode,
                         alt_key,
@@ -1172,6 +1208,10 @@ impl PassthroughFs {
                             path: RwLock::new(Arc::new(child_path.clone())),
                             wide_path: RwLock::new(Arc::new(path_to_wide(&child_path))),
                             refcount: AtomicU64::new(1),
+                            cached_uid: RwLock::new(st.st_uid),
+                            cached_gid: RwLock::new(st.st_gid),
+                            cached_mode: RwLock::new(st.st_mode),
+                            last_updated: RwLock::new(Instant::now()),
                         }),
                     );
                     inode
@@ -1495,6 +1535,10 @@ impl FileSystem for PassthroughFs {
                 path: RwLock::new(Arc::new(root_path.clone())),
                 wide_path: RwLock::new(Arc::new(path_to_wide(&root_path))),
                 refcount: AtomicU64::new(2),
+                cached_uid: RwLock::new(0),
+                cached_gid: RwLock::new(0),
+                cached_mode: RwLock::new(0),
+                last_updated: RwLock::new(Instant::now()),
             }),
         );
 
@@ -2338,6 +2382,26 @@ impl FileSystem for PassthroughFs {
             return Ok(());
         }
 
+        let data = self.inode_data(inode)?;
+
+        // Check staleness and refresh if necessary
+        if data.is_stale() {
+            if let Err(e) = data.refresh() {
+                // Check if the error is "File Not Found"
+                if e.raw_os_error() == Some(libc::ENOENT) {
+                    // Remove the stale/invalid entry from the Inode map
+                    self.inodes.write().unwrap().remove(&inode);
+                }
+                // Propagate the error so the guest knows the access failed
+                return Err(e);
+            }
+        }
+
+        // Access cached values (these are now guaranteed to be "fresh enough")
+        let uid = *data.cached_uid.read().unwrap();
+        let gid = *data.cached_gid.read().unwrap();
+        let mode = *data.cached_mode.read().unwrap();
+
         // POSIX access mode constants (since Windows libc doesn't define them)
         const F_OK: u32 = 0;
         const X_OK: u32 = 1;
@@ -2345,7 +2409,7 @@ impl FileSystem for PassthroughFs {
         const R_OK: u32 = 4;
 
         // Get the emulated POSIX stats from the ADS override stream
-        let (st, _) = self.do_getattr(inode, None)?;
+        //let (st, _) = self.do_getattr(inode, None)?;
 
         let mode = mask & (R_OK | W_OK | X_OK);
 
@@ -2357,27 +2421,27 @@ impl FileSystem for PassthroughFs {
         // Emulate Linux's POSIX access checks based on Context UID/GID        
         if (mode & R_OK) != 0
             && ctx.uid != 0
-            && (st.st_uid != ctx.uid || st.st_mode & 0o400 == 0)
-            && (st.st_gid != ctx.gid || st.st_mode & 0o040 == 0)
-            && st.st_mode & 0o004 == 0
+            && (uid != ctx.uid || mode & 0o400 == 0)
+            && (gid != ctx.gid || mode & 0o040 == 0)
+            && mode & 0o004 == 0
         {
             return Err(io::Error::from_raw_os_error(linux_errno_raw(libc::EACCES)));
         }
 
         if (mode & W_OK) != 0
             && ctx.uid != 0
-            && (st.st_uid != ctx.uid || st.st_mode & 0o200 == 0)
-            && (st.st_gid != ctx.gid || st.st_mode & 0o020 == 0)
-            && st.st_mode & 0o002 == 0
+            && (uid != ctx.uid || mode & 0o200 == 0)
+            && (gid != ctx.gid || mode & 0o020 == 0)
+            && mode & 0o002 == 0
         {
             return Err(io::Error::from_raw_os_error(linux_errno_raw(libc::EACCES)));
         }
         
         if (mode & X_OK) != 0
             && (ctx.uid != 0 || st.st_mode & 0o111 == 0)
-            && (st.st_uid != ctx.uid || st.st_mode & 0o100 == 0)
-            && (st.st_gid != ctx.gid || st.st_mode & 0o010 == 0)
-            && st.st_mode & 0o001 == 0
+            && (uid != ctx.uid || mode & 0o100 == 0)
+            && (gid != ctx.gid || mode & 0o010 == 0)
+            && mode & 0o001 == 0
         {
             return Err(io::Error::from_raw_os_error(linux_errno_raw(libc::EACCES)));
         }
@@ -2452,10 +2516,7 @@ impl FileSystem for PassthroughFs {
         let data = fs::read(&stream).map_err(|e| {
             let code = e.raw_os_error().unwrap_or(0) as u32;
             if code == 2 || code == 3 {
-                // Windows treats ADS as part of the path, so if the ADS has not been set it 
-                // returns ERROR_FILE_NOT_FOUND (2) or ERROR_PATH_NOT_FOUND (3).
-                // This is normally mapped to ENOENT, but we map it to ENODATA instead to match Linux behavior.
-                // If we return ENOENT, the guest will think the file does not exist, which is not what we want.
+                // ERROR_FILE_NOT_FOUND or ERROR_PATH_NOT_FOUND cleanly maps to ENODATA
                 io::Error::from_raw_os_error(linux_errno_raw(libc::ENODATA))
             } else {
                 win_err_to_linux(e)
@@ -2525,10 +2586,7 @@ impl FileSystem for PassthroughFs {
 
         fs::remove_file(&stream).map_err(|e| {
             let code = e.raw_os_error().unwrap_or(0) as u32;
-            // Windows treats ADS as part of the path, so if the ADS has not been set it 
-            // returns ERROR_FILE_NOT_FOUND (2) or ERROR_PATH_NOT_FOUND (3).
-            // This is normally mapped to ENOENT, but we map it to ENODATA instead to match Linux behavior.
-            // If we return ENOENT, the guest will think the file does not exist, which is not what we want.
+            // ERROR_FILE_NOT_FOUND (2) or ERROR_PATH_NOT_FOUND (3) map to ENODATA
             if code == 2 || code == 3 {
                 io::Error::from_raw_os_error(linux_errno_raw(libc::ENODATA))
             } else {
@@ -2550,15 +2608,14 @@ impl FileSystem for PassthroughFs {
             return Err(io::Error::from_raw_os_error(linux_errno_raw(libc::EPERM)));
         }
 
-        // EBADF - fd is not a valid file descriptor, or is not opened for writing.
+        // POSIX Compliance: Allocating space on a Read-Only FD should return EBADF
         if is_handle_read_only(handle) {
             return Err(ebadf());
         }
 
         let file = self.reopen_inode(inode, handle, GENERIC_READ | GENERIC_WRITE).map_err(win_err_to_linux)?;
 
-        // EFBIG - offset+size exceeds the maximum file size.
-        let target = offset.checked_add(length).ok_or_else(|| io::Error::from_raw_os_error(linux_errno_raw(libc::EFBIG)))?;
+        let target = offset + length;
         let current = file.metadata().map_err(win_err_to_linux)?.len();
         if target > current {
             file.set_len(target).map_err(win_err_to_linux)?;
@@ -2603,7 +2660,7 @@ impl FileSystem for PassthroughFs {
         }
     }
 
-    /* fn setupmapping_copy(
+    fn setupmapping(
         &self,
         _ctx: Context,
         inode: Inode,
@@ -2626,7 +2683,7 @@ impl FileSystem for PassthroughFs {
         debug!("setupmapping: ino {inode:?} addr={addr:x} len={len}");
 
         // The host_shm_base memory is already reserved by the VMM for the DAX window.
-        // We just need to commit the pages and copy the data
+        // We just need to commit the pages and copy the data. No MapViewOfFileEx needed!
         let ret = unsafe {
             VirtualAlloc(
                 addr as *mut _,
@@ -2658,9 +2715,9 @@ impl FileSystem for PassthroughFs {
         }
 
         Ok(())
-    } */
+    }
 
-    /* fn removemapping(
+    fn removemapping(
         &self,
         _ctx: Context,
         requests: Vec<fuse::RemovemappingOne>,
@@ -2683,10 +2740,10 @@ impl FileSystem for PassthroughFs {
         }
 
         Ok(())
-    } */
+    }
 
-    
-    fn setupmapping(
+    /*
+    fn setupmapping2(
         &self,
         _ctx: Context,
         inode: Inode,
@@ -2706,24 +2763,14 @@ impl FileSystem for PassthroughFs {
         use std::ptr;
         use std::os::windows::io::AsRawHandle;
 
-        let mut sys_info: SYSTEM_INFO = unsafe { std::mem::zeroed() };
-        unsafe { GetSystemInfo(&mut sys_info) };
-        let granularity = sys_info.dwAllocationGranularity as u64;
-
-        if foffset % granularity != 0 {
-            error!("foffset {foffset} is not aligned to {granularity}");
-            return Err(io::Error::from_raw_os_error(libc::EINVAL));
-        }
-    
-        if (moffset + len) > shm_size {
-            return Err(io::Error::from_raw_os_error(libc::EINVAL));
-        }
-
         let is_write = (flags & (fuse::SetupmappingFlags::WRITE.bits() as u64)) != 0;
         let page_flags = if is_write { PAGE_READWRITE } else { PAGE_READONLY };
         let map_flags = if is_write { FILE_MAP_READ | FILE_MAP_WRITE } else { FILE_MAP_READ };
 
-        
+        if (moffset + len) > shm_size {
+            return Err(einval());
+        }
+
         let addr = host_shm_base + moffset;
         debug!("setupmapping: ino {inode:?} addr={addr:x} len={len}");
 
@@ -2796,7 +2843,7 @@ impl FileSystem for PassthroughFs {
         Ok(())
     }
 
-    fn removemapping(
+    fn removemapping2(
         &self,
         _ctx: Context,
         requests: Vec<fuse::RemovemappingOne>,
@@ -2822,6 +2869,7 @@ impl FileSystem for PassthroughFs {
         Ok(())
     }
 
+    */
     fn ioctl(
         &self,
         _ctx: Context,

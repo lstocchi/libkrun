@@ -24,6 +24,9 @@ resolver = "2"
 
 [profile.dev]
 #panic = "abort"
+opt-level = 0
+debug = "full"
+split-debuginfo = "packed"
 
 [profile.release]
 #panic = "abort"

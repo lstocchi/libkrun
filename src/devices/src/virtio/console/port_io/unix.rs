@@ -1,74 +1,39 @@
-#[cfg(unix)]
 use libc::{
     F_GETFL, F_SETFL, O_NONBLOCK, STDERR_FILENO, STDIN_FILENO, STDOUT_FILENO, TIOCGWINSZ, fcntl,
 };
 use nix::errno::Errno;
-#[cfg(windows)]
-use std::os::windows::io::{AsRawHandle, BorrowedHandle, OwnedHandle};
-#[cfg(unix)]
 use nix::ioctl_read_bad;
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::unistd::{dup, isatty};
-#[cfg(unix)]
 use std::fs::File;
 use std::io::{self, ErrorKind};
-#[cfg(unix)]
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use utils::eventfd::{EFD_NONBLOCK, EventFd};
 use vm_memory::bitmap::Bitmap;
 use vm_memory::{VolatileMemoryError, VolatileSlice, WriteVolatile};
-#[cfg(windows)]
-use std::collections::VecDeque;
-#[cfg(windows)]
-use std::sync::{Arc, Mutex};
-#[cfg(windows)]
-use windows_sys::Win32::{
-    Foundation::FALSE,
-    Storage::FileSystem::{ReadFile, WriteFile},
-    System::{
-        Console::{
-            GetConsoleMode, GetConsoleScreenBufferInfo, ReadConsoleInputW, SetConsoleMode,
-            CONSOLE_MODE, CONSOLE_SCREEN_BUFFER_INFO, ENABLE_WINDOW_INPUT, INPUT_RECORD,
-            KEY_EVENT, WINDOW_BUFFER_SIZE_EVENT,
-        },
-        Threading::{WaitForMultipleObjects, WaitForSingleObject, INFINITE},
-    },
-};
 
 use super::{PortInput, PortInputEmpty, PortOutput, PortTerminalProperties};
 
-#[cfg(unix)]
 pub fn stdin() -> Result<Box<dyn PortInput + Send>, nix::Error> {
     let fd = dup_raw_fd_into_owned(STDIN_FILENO)?;
     make_non_blocking(&fd)?;
     Ok(Box::new(PortInputFd(fd)))
 }
 
-#[cfg(unix)]
 pub fn input_to_raw_fd_dup(fd: RawFd) -> Result<Box<dyn PortInput + Send>, nix::Error> {
     let fd = dup_raw_fd_into_owned(fd)?;
     make_non_blocking(&fd)?;
     Ok(Box::new(PortInputFd(fd)))
 }
 
-#[cfg(windows)]
-pub fn input_to_handle_dup(
-    handle: *mut core::ffi::c_void,
-) -> io::Result<Box<dyn PortInput + Send>> {
-    Ok(Box::new(PortInputHandle(dup_handle(handle)?)))
-}
-
-#[cfg(unix)]
 pub fn stdout() -> Result<Box<dyn PortOutput + Send>, nix::Error> {
     output_to_raw_fd_dup(STDOUT_FILENO)
 }
 
-#[cfg(unix)]
 pub fn stderr() -> Result<Box<dyn PortOutput + Send>, nix::Error> {
     output_to_raw_fd_dup(STDERR_FILENO)
 }
 
-#[cfg(unix)]
 pub fn term_fd(
     term_fd: RawFd,
 ) -> Result<Box<dyn PortTerminalProperties + Send + Sync>, nix::Error> {
@@ -84,17 +49,10 @@ pub fn input_empty() -> Result<Box<dyn PortInput + Send>, nix::Error> {
     Ok(Box::new(PortInputEmpty {}))
 }
 
-#[cfg(unix)]
 pub fn output_file(file: File) -> Result<Box<dyn PortOutput + Send>, nix::Error> {
     output_to_raw_fd_dup(file.as_raw_fd())
 }
 
-#[cfg(windows)]
-pub fn output_file(file: std::fs::File) -> io::Result<Box<dyn PortOutput + Send>> {
-    output_to_handle_dup(file.as_raw_handle())
-}
-
-#[cfg(unix)]
 pub fn output_to_raw_fd_dup(fd: RawFd) -> Result<Box<dyn PortOutput + Send>, nix::Error> {
     let fd = dup_raw_fd_into_owned(fd)?;
     make_non_blocking(&fd)?;
@@ -103,14 +61,12 @@ pub fn output_to_raw_fd_dup(fd: RawFd) -> Result<Box<dyn PortOutput + Send>, nix
 
 struct PortInputFd(OwnedFd);
 
-#[cfg(unix)]
 impl AsRawFd for PortInputFd {
     fn as_raw_fd(&self) -> RawFd {
         self.0.as_raw_fd()
     }
 }
 
-#[cfg(unix)]
 impl PortInput for PortInputFd {
     fn read_volatile(&mut self, buf: &mut VolatileSlice) -> io::Result<usize> {
         // This source code is copied from vm-memory, except it fixes an issue, where
@@ -172,14 +128,12 @@ impl PortInput for PortInputEmpty {
 
 struct PortOutputFd(OwnedFd);
 
-#[cfg(unix)]
 impl AsRawFd for PortOutputFd {
     fn as_raw_fd(&self) -> RawFd {
         self.0.as_raw_fd()
     }
 }
 
-#[cfg(unix)]
 impl PortOutput for PortOutputFd {
     fn write_volatile(&mut self, buf: &VolatileSlice) -> Result<usize, io::Error> {
         self.0.write_volatile(buf).map_err(|e| match e {
@@ -197,7 +151,6 @@ impl PortOutput for PortOutputFd {
     }
 }
 
-#[cfg(unix)]
 fn dup_raw_fd_into_owned(raw_fd: RawFd) -> Result<OwnedFd, nix::Error> {
     // SAFETY: if raw_fd is invalid the `dup` call below will fail
     let borrowed_fd = unsafe { BorrowedFd::borrow_raw(raw_fd) };
@@ -205,7 +158,6 @@ fn dup_raw_fd_into_owned(raw_fd: RawFd) -> Result<OwnedFd, nix::Error> {
     Ok(fd)
 }
 
-#[cfg(unix)]
 fn make_non_blocking(as_rw_fd: &impl AsRawFd) -> Result<(), nix::Error> {
     let fd = as_rw_fd.as_raw_fd();
     unsafe {
@@ -266,7 +218,6 @@ impl PortInput for PortInputSigInt {
         Ok(1)
     }
 
-    #[cfg(unix)]
     fn wait_until_readable(&self, stopfd: Option<&EventFd>) {
         let mut poll_fds = Vec::with_capacity(2);
         // SAFETY: we trust sigint_evt won't go away to avoid a dup call here.
@@ -279,15 +230,6 @@ impl PortInput for PortInputSigInt {
         }
 
         poll(&mut poll_fds, PollTimeout::NONE).expect("Failed to poll");
-    }
-
-    #[cfg(windows)]
-    fn wait_until_readable(&self, stopfd: Option<&EventFd>) {
-        let mut handles = vec![self.sigint_evt.as_raw_fd()];
-        if let Some(s) = stopfd {
-            handles.push(s.as_raw_fd());
-        }
-        wait_for_handles(&handles);
     }
 }
 

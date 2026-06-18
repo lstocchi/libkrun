@@ -121,10 +121,6 @@ impl Console {
         self.sigwinch_evt.as_raw_fd()
     }
 
-    pub fn try_clone_sigwinch_evt(&self) -> Result<EventFd, std::io::Error> {
-        self.sigwinch_evt.try_clone()
-    }
-
     pub fn update_console_size(&mut self, port_id: u32, cols: u16, rows: u16) {
         log::debug!("update_console_size {port_id}: {cols} {rows}");
         self.control
