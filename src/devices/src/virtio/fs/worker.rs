@@ -6,11 +6,11 @@ use utils::worker_message::WorkerMessage;
 use std::io;
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
-#[cfg(windows)]
-use utils::windows::AsRawFd;
 use std::sync::Arc;
 use std::sync::atomic::AtomicI32;
 use std::thread;
+#[cfg(windows)]
+use utils::windows::AsRawFd;
 
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use utils::eventfd::EventFd;
@@ -23,7 +23,6 @@ use super::descriptor_utils::{Reader, Writer};
 use super::inode_alloc::InodeAllocator;
 use super::null_fs::NullFs;
 use super::passthrough::{self, PassthroughFs};
-#[cfg(target_os = "linux")]
 use super::read_only::PassthroughFsRo;
 use super::server::Server;
 use super::virtual_entry::VirtualDirEntry;

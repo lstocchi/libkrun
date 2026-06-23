@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::{mem, thread};
@@ -66,6 +67,7 @@ enum PortState {
         stop: Arc<AtomicBool>,
         rx_thread: Option<JoinHandle<()>>,
         tx_thread: Option<JoinHandle<()>>,
+        tx_notifier: Option<Sender<()>>,
     },
 }
 
@@ -113,11 +115,11 @@ impl Port {
 
     pub fn notify_tx(&self) {
         if let PortState::Active {
-            tx_thread: Some(handle),
+            tx_notifier: Some(sender),
             ..
         } = &self.state
         {
-            handle.thread().unpark()
+            let _ = sender.send(());
         }
     }
 
@@ -140,6 +142,8 @@ impl Port {
             .expect("Failed to create EventFd for interrupt_evt");
         let stop = Arc::new(AtomicBool::new(false));
 
+        let (tx_sender, tx_receiver) = channel();
+
         let rx_thread = input.map(|input| {
             let mem = mem.clone();
             let interrupt = interrupt.clone();
@@ -158,7 +162,7 @@ impl Port {
 
         let tx_thread = output.map(|output| {
             let stop = stop.clone();
-            thread::spawn(move || process_tx(mem, tx_queue, interrupt, output, stop))
+            thread::spawn(move || process_tx(mem, tx_queue, interrupt, output, stop, tx_receiver))
         });
 
         self.state = PortState::Active {
@@ -166,6 +170,7 @@ impl Port {
             stop,
             rx_thread,
             tx_thread,
+            tx_notifier: Some(tx_sender),
         }
     }
 
@@ -175,11 +180,14 @@ impl Port {
             stop,
             tx_thread,
             rx_thread,
+            tx_notifier,
         } = &mut self.state
         {
             stop.store(true, Ordering::Release);
+
+            drop(tx_notifier.take());
             if let Some(tx_thread) = mem::take(tx_thread) {
-                tx_thread.thread().unpark();
+                
                 if let Err(e) = tx_thread.join() {
                     log::error!(
                         "Failed to flush tx for port {port_id}, thread panicked: {e:?}",

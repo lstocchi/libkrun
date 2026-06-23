@@ -9,8 +9,8 @@ use std::path::PathBuf;
 use std::process;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use super::backend::{ConnectError, NetBackend, ReadError, WriteError};
 use super::PlatformSocket;
+use super::backend::{ConnectError, NetBackend, ReadError, WriteError};
 use super::write_virtio_net_hdr;
 #[cfg(target_os = "macos")]
 use super::{MAX_BUFFER_SIZE, VNET_HDR_LEN};

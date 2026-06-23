@@ -13,8 +13,8 @@ use crate::virtio::{
     TYPE_NET, VirtioDevice,
 };
 
-use super::backend::{ReadError, WriteError};
 use super::PlatformSocket;
+use super::backend::{ReadError, WriteError};
 use super::worker::NetWorker;
 
 use std::cmp;

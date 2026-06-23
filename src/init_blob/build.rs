@@ -11,6 +11,12 @@ fn musl_target_for_host() -> &'static str {
     }
 }
 
+fn host_is_linux() -> bool {
+    env::var("HOST")
+        .unwrap_or_default()
+        .contains("-linux-")
+}
+
 fn musl_supported(rustc: &str) -> bool {
     let musl_target = musl_target_for_host();
     let output = Command::new(rustc)
@@ -31,7 +37,7 @@ fn musl_supported(rustc: &str) -> bool {
 
 /// Return a rustc binary that has the musl target's std library available.
 ///
-/// Tries the active rustc first. If that fails, searches ~/.rustup/toolchains/
+/// Tries the active rustc first. If that fails, searches rustup toolchains
 /// for a stable toolchain that does support musl — covering the common case
 /// where the system package manager's rustc (e.g. Fedora's /usr/bin/rustc)
 /// is used as the workspace compiler but the user also has a rustup toolchain
@@ -43,12 +49,17 @@ fn find_musl_rustc(default_rustc: &str) -> Option<PathBuf> {
 
     let rustup_home = env::var_os("RUSTUP_HOME")
         .map(PathBuf::from)
-        .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".rustup")))?;
+        .or_else(|| {
+            env::var_os("HOME")
+                .or_else(|| env::var_os("USERPROFILE"))
+                .map(|h| PathBuf::from(h).join(".rustup"))
+        })?;
     let toolchains = rustup_home.join("toolchains");
+    let rustc_name = rustc_bin_name();
     let mut candidates: Vec<PathBuf> = std::fs::read_dir(&toolchains)
         .ok()?
         .flatten()
-        .map(|e| e.path().join("bin").join("rustc"))
+        .map(|e| e.path().join("bin").join(rustc_name))
         .filter(|p| p.exists())
         .collect();
 
@@ -58,6 +69,22 @@ fn find_musl_rustc(default_rustc: &str) -> Option<PathBuf> {
     candidates
         .into_iter()
         .find(|rustc| musl_supported(rustc.to_str().unwrap_or("")))
+}
+
+fn rustc_bin_name() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "rustc.exe"
+    } else {
+        "rustc"
+    }
+}
+
+fn cargo_bin_name() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "cargo.exe"
+    } else {
+        "cargo"
+    }
 }
 
 fn build_rust_init() -> PathBuf {
@@ -80,25 +107,34 @@ fn build_rust_init() -> PathBuf {
         workspace_root.join("init/src").display()
     );
     println!("cargo:rerun-if-changed={}", init_manifest.display());
+
     // Resolve which rustc (and paired cargo) to use for the init binary.
-    let (rustc, cargo, use_musl) = match find_musl_rustc(&default_rustc) {
+    // On non-Linux hosts we MUST cross-compile for Linux — falling back to
+    // the host target would produce a non-Linux binary.
+    let (rustc, cargo, use_cross) = match find_musl_rustc(&default_rustc) {
         Some(musl_rustc) => {
             // Use the cargo from the same toolchain bin/ directory so that
             // it inherits the same sysroot and target support.
             let cargo = musl_rustc
                 .parent()
-                .map(|bin| bin.join("cargo"))
+                .map(|bin| bin.join(cargo_bin_name()))
                 .filter(|p| p.exists())
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or(default_cargo);
             (musl_rustc.to_string_lossy().into_owned(), cargo, true)
         }
-        None => {
+        None if host_is_linux() => {
             println!(
                 "cargo:warning=musl target not available; krun-init will be dynamically linked. \
                  Run `rustup target add $(uname -m)-unknown-linux-musl` for a static binary."
             );
             (default_rustc, default_cargo, false)
+        }
+        None => {
+            panic!(
+                "Cannot cross-compile krun-init: the `{musl_target}` target is not installed.\n\
+                 Run `rustup target add {musl_target}` and try again."
+            );
         }
     };
 
@@ -114,8 +150,19 @@ fn build_rust_init() -> PathBuf {
         cmd.arg("--release");
     }
 
-    if use_musl {
+    if use_cross {
         cmd.arg("--target").arg(musl_target);
+
+        // When cross-compiling from a non-Linux host, the host linker cannot
+        // produce Linux ELF binaries. Use rust-lld which ships with Rust and
+        // works everywhere.
+        if !host_is_linux() {
+            let linker_env = format!(
+                "CARGO_TARGET_{}_LINKER",
+                musl_target.to_uppercase().replace('-', "_")
+            );
+            cmd.env(linker_env, "rust-lld");
+        }
     }
 
     let mut features: Vec<&str> = Vec::new();
@@ -139,7 +186,7 @@ fn build_rust_init() -> PathBuf {
         panic!("failed to build krun-init");
     }
 
-    let built = if use_musl {
+    let built = if use_cross {
         // Cross-compilation: cargo places the binary at <target-dir>/<triple>/<profile>/
         init_target_dir
             .join(musl_target)

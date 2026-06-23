@@ -55,6 +55,8 @@ pub struct stat64 {
     pub st_atime_nsec: u32,
     pub st_mtime_nsec: u32,
     pub st_ctime_nsec: u32,
+    pub st_blksize: i64,
+    pub st_blocks: i64,
 }
 
 #[cfg(target_os = "macos")]

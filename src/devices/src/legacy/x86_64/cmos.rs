@@ -49,7 +49,7 @@ impl BusDevice for Cmos {
             assert!(v < 100);
             ((v / 10) << 4) | (v % 10)
         }
-        
+
         if data.len() != 1 {
             error!("cmos: unsupported read length");
             return;
@@ -63,7 +63,7 @@ impl BusDevice for Cmos {
             DATA_OFFSET => {
                 // Fetch current UTC time using chrono
                 let now = Utc::now();
-                
+
                 let seconds = now.second();
                 let minutes = now.minute();
                 let hours = now.hour();
@@ -74,14 +74,15 @@ impl BusDevice for Cmos {
 
                 // Update in Progress bit (UIP)
                 const NANOSECONDS_PER_SECOND: u32 = 1_000_000_000;
-                
-                // FIX 2: Widen the UIP hold length from ~244 microseconds to 16 milliseconds. 
-                // This ensures the Windows timer (which ticks roughly every 1-15ms) won't 
-                // completely skip over the UIP window, preventing the guest kernel from 
+
+                // FIX 2: Widen the UIP hold length from ~244 microseconds to 16 milliseconds.
+                // This ensures the Windows timer (which ticks roughly every 1-15ms) won't
+                // completely skip over the UIP window, preventing the guest kernel from
                 // getting stuck in an infinite polling loop.
-                const UIP_HOLD_LENGTH: u32 = 16_000_000; 
-                
-                let update_in_progress = now.nanosecond() >= (NANOSECONDS_PER_SECOND - UIP_HOLD_LENGTH);
+                const UIP_HOLD_LENGTH: u32 = 16_000_000;
+
+                let update_in_progress =
+                    now.nanosecond() >= (NANOSECONDS_PER_SECOND - UIP_HOLD_LENGTH);
 
                 match self.index {
                     0x00 => to_bcd(seconds as u8),
@@ -119,8 +120,8 @@ impl BusDevice for Cmos {
                 if self.index == 0x8f && data[0] == 0 {
                     info!("CMOS reset");
                     // .signal() is the cross-platform way to trigger the event
-                    /* self.reset_evt.write(1).unwrap(); 
-                    
+                    /* self.reset_evt.write(1).unwrap();
+
                     if let Some(vcpus_kill_signalled) = self.vcpus_kill_signalled.take() {
                         while !vcpus_kill_signalled.load(Ordering::SeqCst) {
                             thread::sleep(std::time::Duration::from_millis(1));

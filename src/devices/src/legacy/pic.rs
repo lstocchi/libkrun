@@ -488,9 +488,7 @@ impl Pic {
         if let Some(cmd) = Ocw2::from_u8(value & OCW2_COMMAND_MASK) {
             match cmd {
                 Ocw2::RotateAutoEoiSet => self.pics[pic_type as usize].rotate_on_auto_eoi = true,
-                Ocw2::RotateAutoEoiClear => {
-                    self.pics[pic_type as usize].rotate_on_auto_eoi = false
-                }
+                Ocw2::RotateAutoEoiClear => self.pics[pic_type as usize].rotate_on_auto_eoi = false,
                 Ocw2::NonSpecificEoi | Ocw2::RotateNonSpecificEoi => {
                     if let Some(priority) = Pic::get_priority(
                         &self.pics[pic_type as usize],
@@ -646,7 +644,10 @@ mod tests {
         pic.pic_write_data(PicSelect::Primary, 0x08);
         pic.pic_write_data(PicSelect::Primary, 0xff);
 
-        assert_eq!(pic.pics[PicSelect::Primary as usize].init_state, PicInitState::Icw1);
+        assert_eq!(
+            pic.pics[PicSelect::Primary as usize].init_state,
+            PicInitState::Icw1
+        );
         assert_eq!(pic.pics[PicSelect::Primary as usize].irq_base, 0x08);
         assert!(!pic.pics[PicSelect::Primary as usize].use_4_byte_icw);
     }

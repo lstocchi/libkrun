@@ -20,9 +20,9 @@ use super::bindings::{off64_t, pread64, preadv64, pwrite64, pwritev64};
 use super::block::device::DiskProperties;
 
 #[cfg(windows)]
-use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
-#[cfg(windows)]
 use std::os::windows::io::AsRawHandle;
+#[cfg(windows)]
+use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 #[cfg(windows)]
 use windows_sys::Win32::System::IO::OVERLAPPED;
 
@@ -453,7 +453,9 @@ macro_rules! volatile_impl {
             fn read_vectored_volatile(&mut self, bufs: &[VolatileSlice]) -> Result<usize> {
                 let mut total = 0;
                 for buf in bufs {
-                    if buf.is_empty() { continue; }
+                    if buf.is_empty() {
+                        continue;
+                    }
                     let n = self.read_volatile(*buf)?;
                     total += n;
                     // If we didn't fill this buffer, don't try to fill the next ones.
@@ -491,7 +493,9 @@ macro_rules! volatile_impl {
                 for buf in bufs {
                     let n = self.write_volatile(*buf)?;
                     total += n;
-                    if n < buf.len() { break; }
+                    if n < buf.len() {
+                        break;
+                    }
                 }
                 Ok(total)
             }
@@ -532,7 +536,9 @@ macro_rules! volatile_impl {
                     let n = self.read_at_volatile(*buf, current_offset)?;
                     total += n;
                     current_offset += n as u64;
-                    if n < buf.len() { break; }
+                    if n < buf.len() {
+                        break;
+                    }
                 }
                 Ok(total)
             }
@@ -552,7 +558,11 @@ macro_rules! volatile_impl {
                         &mut overlapped,
                     )
                 };
-                if res != 0 { Ok(bytes_written as usize) } else { Err(Error::last_os_error()) }
+                if res != 0 {
+                    Ok(bytes_written as usize)
+                } else {
+                    Err(Error::last_os_error())
+                }
             }
 
             fn write_vectored_at_volatile(
@@ -566,7 +576,9 @@ macro_rules! volatile_impl {
                     let n = self.write_at_volatile(*buf, current_offset)?;
                     total += n;
                     current_offset += n as u64;
-                    if n < buf.len() { break; }
+                    if n < buf.len() {
+                        break;
+                    }
                 }
                 Ok(total)
             }

@@ -21,9 +21,9 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::thread;
 use std::{cmp, result};
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
-use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 #[cfg(windows)]
 use utils::windows::AsRawFd;
+use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 
 const RX_TOKEN: u64 = 1;
 const TX_TOKEN: u64 = 2;
@@ -144,7 +144,10 @@ impl NetWorker {
                 ControlOperation::Add,
                 backend_socket,
                 &EpollEvent::new(
-                    EventSet::IN | EventSet::OUT | EventSet::EDGE_TRIGGERED | EventSet::READ_HANG_UP,
+                    EventSet::IN
+                        | EventSet::OUT
+                        | EventSet::EDGE_TRIGGERED
+                        | EventSet::READ_HANG_UP,
                     BACKEND_TOKEN,
                 ),
             );
@@ -200,9 +203,7 @@ impl NetWorker {
                                 self.process_tx_loop();
                             }
                             _ => {
-                                log::warn!(
-                                    "Received unknown event: {event_set:?} token={token}"
-                                );
+                                log::warn!("Received unknown event: {event_set:?} token={token}");
                             }
                         }
                     }

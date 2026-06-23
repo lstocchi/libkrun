@@ -1,4 +1,5 @@
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::{io, thread};
 
@@ -13,9 +14,10 @@ pub(crate) fn process_tx(
     interrupt: InterruptTransport,
     output: Arc<Mutex<Box<dyn PortOutput + Send>>>,
     stop: Arc<AtomicBool>,
+    tx_receiver: Receiver<()>,
 ) {
     loop {
-        let Some(head) = pop_head_blocking(&mut queue, &mem, &interrupt, &stop) else {
+        let Some(head) = pop_head_blocking(&mut queue, &mem, &interrupt, &stop, &tx_receiver) else {
             return;
         };
 
@@ -62,17 +64,25 @@ fn pop_head_blocking<'mem>(
     mem: &'mem GuestMemoryMmap,
     interrupt: &InterruptTransport,
     stop: &AtomicBool,
+    tx_receiver: &Receiver<()>,
 ) -> Option<DescriptorChain<'mem>> {
     loop {
         match queue.pop(mem) {
             Some(descriptor) => break Some(descriptor),
             None => {
                 interrupt.signal_used_queue();
-                if stop.load(Ordering::Acquire) {
-                    break None;
+
+                match tx_receiver.recv() {
+                    Ok(_) => {
+                        continue;
+                    }
+                    Err(_) => {
+                        if let Some(descriptor) = queue.pop(mem) {
+                            break Some(descriptor); // Pass it back to be processed!
+                        }
+                        break None;
+                    }
                 }
-                thread::park();
-                log::trace!("tx unparked, queue len {}", queue.len(mem))
             }
         }
     }

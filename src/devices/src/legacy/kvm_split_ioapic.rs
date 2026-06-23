@@ -7,10 +7,10 @@
 
 use crossbeam_channel::unbounded;
 #[cfg(not(feature = "tdx"))]
-use kvm_bindings::{kvm_enable_cap, KVM_CAP_SPLIT_IRQCHIP};
+use kvm_bindings::{KVM_CAP_SPLIT_IRQCHIP, kvm_enable_cap};
 use kvm_bindings::{
-    kvm_irq_routing_entry, kvm_irq_routing_entry__bindgen_ty_1, kvm_irq_routing_msi,
-    KvmIrqRouting, KVM_IRQ_ROUTING_MSI,
+    KVM_IRQ_ROUTING_MSI, KvmIrqRouting, kvm_irq_routing_entry, kvm_irq_routing_entry__bindgen_ty_1,
+    kvm_irq_routing_msi,
 };
 use kvm_ioctls::{Error, VmFd};
 
@@ -19,9 +19,9 @@ use utils::eventfd::EventFd;
 use utils::worker_message::WorkerMessage;
 
 use super::ioapic::{
-    Ioapic, IoapicBackend, IoapicRegs, IOAPIC_DM_EXTINT, IOAPIC_DM_MASK,
-    IOAPIC_LVT_DELIV_MODE_SHIFT, IOAPIC_LVT_DEST_MODE_SHIFT, IOAPIC_LVT_MASKED_SHIFT,
-    IOAPIC_LVT_REMOTE_IRR, IOAPIC_LVT_TRIGGER_MODE_SHIFT, IOAPIC_NUM_PINS, IOAPIC_VECTOR_MASK,
+    IOAPIC_DM_EXTINT, IOAPIC_DM_MASK, IOAPIC_LVT_DELIV_MODE_SHIFT, IOAPIC_LVT_DEST_MODE_SHIFT,
+    IOAPIC_LVT_MASKED_SHIFT, IOAPIC_LVT_REMOTE_IRR, IOAPIC_LVT_TRIGGER_MODE_SHIFT, IOAPIC_NUM_PINS,
+    IOAPIC_VECTOR_MASK, Ioapic, IoapicBackend, IoapicRegs,
 };
 
 const APIC_DEFAULT_ADDRESS: u32 = 0xfee0_0000;
@@ -119,8 +119,7 @@ impl KvmSplitIoapicBackend {
 
             addr: ((APIC_DEFAULT_ADDRESS as u64)
                 | ((dest_idx as u64) << MSI_ADDR_DEST_IDX_SHIFT)
-                | ((dest_mode as u64) << MSI_ADDR_DEST_MODE_SHIFT))
-                as u32,
+                | ((dest_mode as u64) << MSI_ADDR_DEST_MODE_SHIFT)) as u32,
             data: (((vector as u64) << MSI_DATA_VECTOR_SHIFT)
                 | ((trig_mode as u64) << MSI_DATA_TRIGGER_SHIFT)
                 | ((delivery_mode as u64) << MSI_DATA_DELIVERY_MODE_SHIFT))

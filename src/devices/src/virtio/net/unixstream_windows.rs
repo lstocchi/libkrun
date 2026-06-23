@@ -3,13 +3,13 @@ use std::os::windows::io::RawSocket;
 use std::path::PathBuf;
 
 use windows_sys::Win32::Networking::WinSock::{
-    connect, ioctlsocket, recv, send, setsockopt, socket, WSAGetLastError, AF_UNIX, FIONBIO,
-    INVALID_SOCKET, SOCKADDR_UN, SOCKET_ERROR, SOCK_STREAM, SOL_SOCKET, SO_RCVBUF, SO_SNDBUF,
-    WSAECONNABORTED, WSAECONNRESET, WSAESHUTDOWN, WSAEWOULDBLOCK,
+    AF_UNIX, FIONBIO, INVALID_SOCKET, SO_SNDBUF, SOCK_STREAM, SOCKADDR_UN, SOCKET_ERROR,
+    SOL_SOCKET, WSAECONNABORTED, WSAECONNRESET, WSAESHUTDOWN, WSAEWOULDBLOCK, WSAGetLastError,
+    connect, ioctlsocket, recv, send, setsockopt, socket,
 };
 
-use super::backend::{ConnectError, NetBackend, ReadError, WriteError};
 use super::PlatformSocket;
+use super::backend::{ConnectError, NetBackend, ReadError, WriteError};
 use super::write_virtio_net_hdr;
 
 const FRAME_HEADER_LEN: usize = 4;

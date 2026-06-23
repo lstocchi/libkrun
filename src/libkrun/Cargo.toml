@@ -39,11 +39,6 @@ polly = { package = "krun-polly", version = "=0.1.0-1.18.0", path = "../polly" }
 utils = { package = "krun-utils", version = "=0.1.0-1.18.0", path = "../utils" }
 vmm = { package = "krun-vmm", version = "=0.1.0-1.18.0", path = "../vmm" }
 
-[target.'cfg(target_os = "windows")'.dependencies]
-windows-sys = { version = "0.61.2", features = [
-    "Win32_System_Console",
-] }
-
 [target.'cfg(target_os = "macos")'.dependencies]
 hvf = { package = "krun-hvf", version = "=0.1.0-1.18.0", path = "../hvf" }
 

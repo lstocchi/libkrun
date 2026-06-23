@@ -32,14 +32,6 @@ use windows_sys::Win32::System::Console::{
 };
 use std::sync::atomic::AtomicI32;
 use std::sync::{Arc, Mutex};
-#[cfg(windows)]
-use utils::windows::SendHandle;
-#[cfg(windows)]
-use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
-#[cfg(windows)]
-use windows_sys::Win32::System::Console::{
-    GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
-};
 
 use super::{Error, Vmm};
 
@@ -2478,113 +2470,85 @@ fn is_valid_handle(h: *mut core::ffi::c_void) -> bool {
 #[cfg(target_os = "windows")]
 fn autoconfigure_console_ports(
     vmm: &mut Vmm,
-    vm_resources: &VmResources,
+    _vm_resources: &VmResources,
     cfg: Option<&DefaultVirtioConsoleConfig>,
-    creating_implicit_console: bool,
 ) -> std::result::Result<Vec<PortDescription>, StartMicrovmError> {
-    use self::StartMicrovmError::*;
+    
+    let (input_h, output_h, err_h) = match cfg {
+        Some(c) => (c.input_handle.as_raw_handle(), c.output_handle.as_raw_handle(), c.err_handle.as_raw_handle()),
+        None => unsafe { 
+            (
+                GetStdHandle(STD_INPUT_HANDLE), 
+                GetStdHandle(STD_OUTPUT_HANDLE), 
+                GetStdHandle(STD_ERROR_HANDLE)
+            ) 
+        },
+    };
+    let input_is_terminal =
+        (unsafe { BorrowedHandle::borrow_raw(input_h) }).is_terminal();
+    let output_is_terminal =
+        (unsafe { BorrowedHandle::borrow_raw(output_h) }).is_terminal();
+    let error_is_terminal =
+        (unsafe { BorrowedHandle::borrow_raw(err_h) }).is_terminal();
 
-    let mut console_output_path: Option<PathBuf> = None;
-    if let Some(path) = vm_resources.console_output.clone() {
-        if !vm_resources.disable_implicit_console && creating_implicit_console {
-            console_output_path = Some(path)
-        }
-    }
-
-    if let Some(console_output_path) = console_output_path {
-        let file = File::create(console_output_path).map_err(OpenConsoleFile)?;
-        // Manually emulate our Legacy behavior: In the case of output_path we have always used the
-        // stdin to determine the console size
-        let stdin_h = unsafe { 
-            let raw = GetStdHandle(STD_INPUT_HANDLE);
-            BorrowedHandle::borrow_raw(raw)
-        };
-        let term_h = if stdin_h.is_terminal() {
-            port_io::term_handle(stdin_h.as_raw_handle()).unwrap()
-        } else {
-            port_io::term_fixed_size(0, 0)
-        };
-        Ok(vec![PortDescription::console(
-            Some(port_io::input_empty().unwrap()),
-            Some(port_io::output_file(file).unwrap()),
-            term_h,
-        )])
+    let term_h = if input_is_terminal {
+        Some(SendHandle::new(input_h))
+    } else if output_is_terminal {
+        Some(SendHandle::new(output_h))
+    } else if error_is_terminal {
+        Some(SendHandle::new(err_h))
     } else {
-        let (input_h, output_h, err_h) = match cfg {
-            Some(c) => (c.input_handle.as_raw_handle(), c.output_handle.as_raw_handle(), c.err_handle.as_raw_handle()),
-            None => unsafe { 
-                (
-                    GetStdHandle(STD_INPUT_HANDLE), 
-                    GetStdHandle(STD_OUTPUT_HANDLE), 
-                    GetStdHandle(STD_ERROR_HANDLE)
-                ) 
-            },
-        };
-        let input_is_terminal =
-            (unsafe { BorrowedHandle::borrow_raw(input_h) }).is_terminal();
-        let output_is_terminal =
-            (unsafe { BorrowedHandle::borrow_raw(output_h) }).is_terminal();
-        let error_is_terminal =
-            (unsafe { BorrowedHandle::borrow_raw(err_h) }).is_terminal();
+        None
+    };
 
-        let term_h = if input_is_terminal {
-            Some(SendHandle::new(input_h))
-        } else if output_is_terminal {
-            Some(SendHandle::new(output_h))
-        } else if error_is_terminal {
-            Some(SendHandle::new(err_h))
-        } else {
-            None
-        };
+    let forwarding_sigint = false;
+    let console_input = if input_is_terminal {
+        Some(port_io::input_to_handle_dup(input_h).unwrap())
+    } else {            
+        Some(port_io::input_empty().unwrap())
+    };
 
-        let forwarding_sigint = false;
-        let console_input = if input_is_terminal {
-            Some(port_io::input_to_handle_dup(input_h).unwrap())
-        } else {            
-            Some(port_io::input_empty().unwrap())
-        };
+    let console_output = if output_is_terminal {
+        Some(port_io::output_to_handle_dup(output_h).unwrap())
+    } else {
+        Some(port_io::output_to_log_as_err())
+    };
 
-        let console_output = if output_is_terminal {
-            Some(port_io::output_to_handle_dup(output_h).unwrap())
-        } else {
-            Some(port_io::output_to_log_as_err())
-        };
+    let terminal_properties = term_h
+        .map(|h| port_io::term_handle(h.as_raw_handle()).unwrap())
+        .unwrap_or_else(|| port_io::term_fixed_size(0, 0));
 
-        let terminal_properties = term_h
-            .map(|h| port_io::term_handle(h.as_raw_handle()).unwrap())
-            .unwrap_or_else(|| port_io::term_fixed_size(0, 0));
+    setup_terminal_raw_mode(vmm, term_h, forwarding_sigint);
 
-        setup_terminal_raw_mode(vmm, term_h, forwarding_sigint);
+    let mut ports = vec![PortDescription::console(
+        console_input,
+        console_output,
+        terminal_properties,
+    )];
 
-        let mut ports = vec![PortDescription::console(
-            console_input,
-            console_output,
-            terminal_properties,
-        )];
-
-        if is_valid_handle(input_h) && !input_is_terminal {
-            ports.push(PortDescription::input_pipe(
-                "krun-stdin",
-                port_io::input_to_handle_dup(input_h).unwrap(),
-            ));
-        }
-
-        if is_valid_handle(output_h) && !output_is_terminal {
-            ports.push(PortDescription::output_pipe(
-                "krun-stdout",
-                port_io::output_to_handle_dup(output_h).unwrap(),
-            ));
-        };
-
-        if is_valid_handle(err_h) && !error_is_terminal {
-            ports.push(PortDescription::output_pipe(
-                "krun-stderr",
-                port_io::output_to_handle_dup(err_h).unwrap(),
-            ));
-        }
-
-        Ok(ports)
+    if is_valid_handle(input_h) && !input_is_terminal {
+        ports.push(PortDescription::input_pipe(
+            "krun-stdin",
+            port_io::input_to_handle_dup(input_h).unwrap(),
+        ));
     }
+
+    if is_valid_handle(output_h) && !output_is_terminal {
+        ports.push(PortDescription::output_pipe(
+            "krun-stdout",
+            port_io::output_to_handle_dup(output_h).unwrap(),
+        ));
+    };
+
+    if is_valid_handle(err_h) && !error_is_terminal {
+        ports.push(PortDescription::output_pipe(
+            "krun-stderr",
+            port_io::output_to_handle_dup(err_h).unwrap(),
+        ));
+    }
+
+    Ok(ports)
+    
 }
 
 /* #[cfg(windows)]
@@ -3355,8 +3319,11 @@ pub mod tests {
         let err = Internal(Error::Serial(io::Error::from_raw_os_error(0)));
         let _ = format!("{err}{err:?}");
 
-        let err = InvalidKernelBundle(vm_memory::mmap::MmapRegionError::InvalidPointer);
-        let _ = format!("{err}{err:?}");
+        #[cfg(not(target_os = "windows"))] {
+            let err = InvalidKernelBundle(vm_memory::mmap::MmapRegionError::InvalidPointer);
+            let _ = format!("{err}{err:?}");
+        }
+        
 
         let err = KernelCmdline(String::from("dummy --cmdline"));
         let _ = format!("{err}{err:?}");

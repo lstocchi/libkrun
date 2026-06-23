@@ -48,7 +48,6 @@ use windows_sys::Win32::Networking::WinSock::{
 use windows_sys::Win32::System::IO::{
     CreateIoCompletionPort, GetQueuedCompletionStatusEx, OVERLAPPED_ENTRY,
 };
-use windows_sys::Win32::System::Threading::INFINITE;
 
 // Generic access mask requesting all permissions the caller is allowed.
 // https://learn.microsoft.com/en-us/windows/win32/secauthz/access-mask

@@ -29,6 +29,13 @@ use virtio_bindings::{
 };
 use vm_memory::{ByteValued, GuestMemoryMmap};
 
+#[cfg(target_os = "windows")]
+use std::mem::MaybeUninit;
+#[cfg(target_os = "windows")]
+use std::os::windows::io::AsRawHandle;
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION};
+
 use super::worker::BlockWorker;
 use super::{
     super::{ActivateResult, DeviceQueue, DeviceState, QueueConfig, TYPE_BLOCK, VirtioDevice},
@@ -106,37 +113,30 @@ impl DiskProperties {
         &self.image_id
     }
 
-    fn build_device_id(disk_file: &File) -> result::Result<String, Error> {
-        let blk_metadata = disk_file.metadata().map_err(Error::GetFileMetadata)?;
+    fn build_device_id(disk_file: &File) -> result::Result<String, Error> {        
         // This is how kvmtool does it.
         #[cfg(unix)]
-        let device_id = format!(
+        let device_id = {
+            let blk_metadata = disk_file.metadata().map_err(Error::GetFileMetadata)?;
+            format!(
             "{}{}{}",
             blk_metadata.st_dev(),
             blk_metadata.st_rdev(),
             blk_metadata.st_ino()
-        );
-        #[cfg(windows)]
+            )
+        };
+        #[cfg(target_os = "windows")]
         let device_id = {
-            use std::mem::MaybeUninit;
-            use std::os::windows::io::AsRawHandle;
-            let mut info = MaybeUninit::<windows_sys::Win32::Storage::FileSystem::BY_HANDLE_FILE_INFORMATION>::zeroed();
-            let ret = unsafe {
-                windows_sys::Win32::Storage::FileSystem::GetFileInformationByHandle(
-                    disk_file.as_raw_handle(),
-                    info.as_mut_ptr(),
-                )
-            };
+            let mut info = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
+            let ret = unsafe { GetFileInformationByHandle(disk_file.as_raw_handle(), info.as_mut_ptr()) };
             if ret != 0 {
                 let info = unsafe { info.assume_init() };
                 format!(
                     "{}{}{}",
-                    info.dwVolumeSerialNumber,
-                    info.nFileIndexHigh,
-                    info.nFileIndexLow
+                    info.dwVolumeSerialNumber, info.nFileIndexHigh, info.nFileIndexLow
                 )
             } else {
-                format!("{}", blk_metadata.len())
+                return Err(Error::GetFileMetadata(io::Error::last_os_error()));
             }
         };
         Ok(device_id)

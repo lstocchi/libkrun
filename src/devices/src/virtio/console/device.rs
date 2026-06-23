@@ -4,8 +4,6 @@ use std::iter::zip;
 use std::mem::{size_of, size_of_val};
 #[cfg(unix)]
 use std::os::unix::io::{AsRawFd, RawFd};
-#[cfg(target_os = "windows")]
-use utils::windows::{AsRawFd, RawFd};
 use std::sync::Arc;
 #[cfg(target_os = "windows")]
 use utils::windows::{AsRawFd, RawFd};

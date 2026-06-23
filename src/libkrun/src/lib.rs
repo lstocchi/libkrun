@@ -37,8 +37,6 @@ use utils::windows::AsRawFd;
 use std::os::windows::io::{BorrowedHandle};
 #[cfg(unix)]
 use std::os::fd::{BorrowedFd, FromRawFd, RawFd};
-#[cfg(windows)]
-use std::os::windows::io::BorrowedHandle;
 #[cfg(target_os = "windows")]
 use utils::windows::SendHandle;
 use std::path::PathBuf;
@@ -47,7 +45,7 @@ use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicI32, Ordering};
 use utils::eventfd::EventFd;
-#[cfg(target_os = "unix")]
+#[cfg(unix)]
 use vmm::resources::{TsiFlags, VsockConfig};
 use vmm::resources::{
     DefaultVirtioConsoleConfig, PortConfig, SerialConsoleConfig, VirtioConsoleConfigMode,
@@ -183,7 +181,7 @@ struct ContextConfig {
     rlimits: Option<String>,
     net_index: u8,
     tsi_port_map: Option<HashMap<u16, u16>>,
-    #[cfg(target_os = "unix")]
+    #[cfg(unix)]
     vsock_config: VsockConfig,
     #[cfg(feature = "blk")]
     block_cfgs: Vec<BlockDeviceConfig>,
@@ -1089,7 +1087,7 @@ pub unsafe extern "C" fn krun_set_port_map(ctx_id: u32, c_port_map: *const *cons
             }
         }
 
-        #[cfg(target_os = "unix")]
+        #[cfg(unix)]
         match CTX_MAP.lock().unwrap().entry(ctx_id) {
             Entry::Occupied(mut ctx_cfg) => {
                 let cfg = ctx_cfg.get_mut();
@@ -1331,7 +1329,7 @@ pub unsafe extern "C" fn krun_add_vsock_port2(
             }
         }
 
-        #[cfg(target_os = "unix")]
+        #[cfg(unix)]
         match CTX_MAP.lock().unwrap().entry(ctx_id) {
             Entry::Occupied(mut ctx_cfg) => {
                 let cfg = ctx_cfg.get_mut();
@@ -2043,7 +2041,7 @@ pub unsafe extern "C" fn krun_set_kernel(
         let format = match kernel_format {
             // For raw kernels in x86_64, we map the kernel into the
             // process and treat it as a bundled kernel.
-            #[cfg(all(target_arch = "x86_64", not(feature = "tee")))]
+            #[cfg(all(target_arch = "x86_64", not(feature = "tee"), not(target_os = "windows")))]
             0 => return map_kernel(ctx_id, &path),
             #[cfg(target_arch = "aarch64")]
             0 => KernelFormat::Raw,
@@ -2184,6 +2182,7 @@ unsafe fn load_krunfw_payload(
     Ok(())
 }
 
+#[cfg(not(target_os = "windows"))]
 #[unsafe(no_mangle)]
 pub extern "C" fn krun_setuid(ctx_id: u32, uid: libc::uid_t) -> i32 {
     match CTX_MAP.lock().unwrap().entry(ctx_id) {
@@ -2197,6 +2196,7 @@ pub extern "C" fn krun_setuid(ctx_id: u32, uid: libc::uid_t) -> i32 {
     KRUN_SUCCESS
 }
 
+#[cfg(not(target_os = "windows"))]
 #[unsafe(no_mangle)]
 pub extern "C" fn krun_setgid(ctx_id: u32, gid: libc::gid_t) -> i32 {
     match CTX_MAP.lock().unwrap().entry(ctx_id) {
@@ -2506,6 +2506,7 @@ pub unsafe extern "C" fn krun_get_default_init(
     -libc::ENOTSUP
 }
 
+#[cfg(not(target_os = "windows"))]
 #[unsafe(no_mangle)]
 pub extern "C" fn krun_add_vsock(ctx_id: u32, tsi_features: u32) -> i32 {
     let tsi_flags = match TsiFlags::from_bits(tsi_features) {
@@ -2941,7 +2942,7 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         return -libc::EINVAL;
     }
 
-    #[cfg(feature = "net")]
+    /* #[cfg(feature = "net")]
     {
         if let Some(legacy_net_cfg) = ctx_cfg.legacy_net_cfg.clone() {
             let backend = match legacy_net_cfg {
@@ -2962,7 +2963,7 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
                 .unwrap_or([0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xee]);
             create_virtio_net(&mut ctx_cfg, backend, mac, NET_COMPAT_FEATURES);
         }
-    }
+    } */
 
     #[cfg(unix)]
     match &ctx_cfg.vsock_config {

@@ -143,7 +143,7 @@ impl<F: FileSystem + Sync> Server<F> {
             x if x == Opcode::Rename2 as u32 => self.rename2(in_header, r, w),
             x if x == Opcode::Lseek as u32 => self.lseek(in_header, r, w),
             x if x == Opcode::CopyFileRange as u32 => self.copyfilerange(in_header, r, w),
-            x if (x == Opcode::SetupMapping as u32) && shm_region.is_some() => {                
+            x if (x == Opcode::SetupMapping as u32) && shm_region.is_some() => {
                 let shm = shm_region.as_ref().unwrap();
                 #[cfg(any(target_os = "linux", target_os = "windows"))]
                 let shm_base_addr = shm.host_addr;
@@ -907,7 +907,9 @@ impl<F: FileSystem + Sync> Server<F> {
 
         let page_size: u32 = {
             #[cfg(unix)]
-            unsafe { libc::sysconf(libc::_SC_PAGESIZE).try_into().unwrap() }
+            unsafe {
+                libc::sysconf(libc::_SC_PAGESIZE).try_into().unwrap()
+            }
             #[cfg(windows)]
             unsafe {
                 use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};

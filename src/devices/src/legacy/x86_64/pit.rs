@@ -29,11 +29,8 @@ use std::time::{Duration, Instant};
 use crate::bus::BusDevice;
 use crate::legacy::irqchip::IrqChip;
 use crate::legacy::pic::Pic;
-use windows_sys::Win32::Foundation::HANDLE;
-use windows_sys::Win32::System::Threading::{
-    WaitForSingleObject, INFINITE,
-};
 use utils::windows::wake_event::WakeEvent;
+use windows_sys::Win32::System::Threading::{INFINITE, WaitForSingleObject};
 
 // ── i8254 constants ─────────────────────────────────────────────────
 
@@ -400,7 +397,7 @@ impl Pit {
 
     fn arm_timer(&self, count: u32, mode: u8) {
         let period = Duration::from_nanos(count as u64 * NANOS_PER_SEC / FREQUENCY_HZ);
-        // Anti-starvation clamp: Force a minimum 1ms period. 
+        // Anti-starvation clamp: Force a minimum 1ms period.
         // Prevents the guest from accidentally DOS-ing the VMM with microsecond IRQ storms.
         let period = period.max(Duration::from_millis(1));
 
@@ -422,19 +419,25 @@ impl Pit {
 
         if sc == SC_READBACK {
             if control_word & RB_CTR0 != 0 {
-                self.counters[0].lock().unwrap().read_back_command(control_word);
+                self.counters[0]
+                    .lock()
+                    .unwrap()
+                    .read_back_command(control_word);
             }
             if control_word & RB_CTR1 != 0 {
-                self.counters[1].lock().unwrap().read_back_command(control_word);
+                self.counters[1]
+                    .lock()
+                    .unwrap()
+                    .read_back_command(control_word);
             }
             if control_word & RB_CTR2 != 0 {
-                self.counters[2].lock().unwrap().read_back_command(control_word);
+                self.counters[2]
+                    .lock()
+                    .unwrap()
+                    .read_back_command(control_word);
             }
         } else if control_word & CMD_RW == RW_LATCH {
-            self.counters[counter_index]
-                .lock()
-                .unwrap()
-                .latch_counter();
+            self.counters[counter_index].lock().unwrap().latch_counter();
         } else {
             self.counters[counter_index]
                 .lock()

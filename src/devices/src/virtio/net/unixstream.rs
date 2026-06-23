@@ -9,8 +9,8 @@ use std::{
 
 use crate::virtio::net::backend::ConnectError;
 
-use super::backend::{NetBackend, ReadError, WriteError};
 use super::PlatformSocket;
+use super::backend::{NetBackend, ReadError, WriteError};
 use super::write_virtio_net_hdr;
 
 /// Each frame the network proxy is prepended by a 4 byte "header".

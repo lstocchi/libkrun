@@ -303,7 +303,12 @@ mod tests {
     use super::*;
     use std::io;
     use std::io::Write;
+
+    #[cfg(not(target_os = "windows"))]
     use std::os::unix::io::{AsRawFd, RawFd};
+    #[cfg(target_os = "windows")]
+    use utils::windows::{AsRawFd, RawFd};
+
     use std::sync::{Arc, Mutex};
 
     use polly::event_manager::EventManager;

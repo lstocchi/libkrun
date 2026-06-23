@@ -568,16 +568,13 @@ impl From<bindings::stat64> for Attr {
 impl Attr {
     pub fn with_flags(st: bindings::stat64, flags: u32) -> Attr {
         Attr {
-            #[cfg(unix)]
             ino: st.st_ino,
-            #[cfg(windows)]
-            ino: st.st_ino as u64,
             size: st.st_size as u64,
             #[cfg(unix)]
-            blocks: st.st_blocks as u64,            
-            #[cfg(windows)]
+            blocks: st.st_blocks as u64,
             // Windows doesn't provide st_blocks. 
-            // A common fallback is calculating it based on 512-byte units.
+            // A common fallback is calculating it based on 512-byte units.          
+            #[cfg(windows)]
             blocks: ((st.st_size + 511) / 512) as u64,
             atime: st.st_atime as u64,
             mtime: st.st_mtime as u64,
@@ -598,14 +595,8 @@ impl Attr {
             nlink: st.st_nlink,
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             nlink: st.st_nlink as u32,
-            #[cfg(unix)]
             uid: st.st_uid,
-            #[cfg(windows)]
-            uid: st.st_uid as u32,
-            #[cfg(unix)]
             gid: st.st_gid,
-            #[cfg(windows)]
-            gid: st.st_gid as u32,
             rdev: st.st_rdev as u32,
             #[cfg(unix)]
             blksize: st.st_blksize as u32,
@@ -649,23 +640,7 @@ impl From<bindings::statvfs64> for Kstatfs {
         }
     }
 }
-#[cfg(target_os = "macos")]
-impl From<bindings::statvfs64> for Kstatfs {
-    fn from(st: bindings::statvfs64) -> Self {
-        Kstatfs {
-            blocks: st.f_blocks as u64,
-            bfree: st.f_bfree as u64,
-            bavail: st.f_bavail as u64,
-            files: st.f_files as u64,
-            ffree: st.f_ffree as u64,
-            bsize: st.f_bsize as u32,
-            namelen: st.f_namemax as u32,
-            frsize: st.f_frsize as u32,
-            ..Default::default()
-        }
-    }
-}
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 impl From<bindings::statvfs64> for Kstatfs {
     fn from(st: bindings::statvfs64) -> Self {
         Kstatfs {
@@ -874,7 +849,6 @@ pub struct SetattrIn {
 }
 unsafe impl ByteValued for SetattrIn {}
 
-#[cfg(unix)]
 impl From<SetattrIn> for bindings::stat64 {
     #[allow(clippy::useless_conversion)]
     fn from(sai: SetattrIn) -> bindings::stat64 {
@@ -890,23 +864,6 @@ impl From<SetattrIn> for bindings::stat64 {
         out.st_atime_nsec = sai.atimensec.into();
         out.st_mtime_nsec = sai.mtimensec.into();
         out.st_ctime_nsec = sai.ctimensec.into();
-
-        out
-    }
-}
-
-#[cfg(windows)]
-impl From<SetattrIn> for bindings::stat64 {
-    #[allow(clippy::useless_conversion)]
-    fn from(sai: SetattrIn) -> bindings::stat64 {
-        let mut out: bindings::stat64 = unsafe { mem::zeroed() };
-        out.st_mode = sai.mode.try_into().unwrap();
-        out.st_uid = sai.uid;
-        out.st_gid = sai.gid;
-        out.st_size = sai.size as i64;
-        out.st_atime = sai.atime as i64;
-        out.st_mtime = sai.mtime as i64;
-        out.st_ctime = sai.ctime as i64;
 
         out
     }

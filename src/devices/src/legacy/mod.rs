@@ -34,8 +34,6 @@ mod kvmioapic;
 pub mod pic;
 #[cfg(target_arch = "aarch64")]
 mod rtc_pl031;
-#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-mod ioapic_whp;
 #[cfg(target_os = "macos")]
 mod vcpu;
 #[cfg(target_arch = "x86_64")]
@@ -57,8 +55,6 @@ use riscv64::serial;
 
 #[cfg(target_arch = "x86_64")]
 pub use self::cmos::Cmos;
-#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
-pub use self::x86_64::pit::{Pit, PitCounter};
 #[cfg(target_os = "macos")]
 pub use self::gicv3::GicV3;
 #[cfg(target_arch = "aarch64")]
@@ -84,13 +80,13 @@ pub use self::kvmgicv3::KvmGicV3;
 pub use self::kvmioapic::KvmIoapic;
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 pub use self::pic::{Pic, PicPort, PicSelect};
-#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-pub use self::ioapic_whp::WhpIoapic;
 #[cfg(target_arch = "aarch64")]
 pub use self::rtc_pl031::RTC;
 pub use self::serial::Serial;
 #[cfg(target_os = "macos")]
 pub use self::vcpu::VcpuList;
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+pub use self::x86_64::pit::{Pit, PitCounter};
 
 // Cannot use multiple types as bounds for a trait object, so we define our own trait
 // which is a composition of the desired bounds. In this case, io::Read and AsRawFd.
