@@ -87,7 +87,57 @@ const LINUX_ENOTRECOVERABLE: i32 = 131;
 // Errors to be directly used.
 pub const LINUX_ERANGE: i32 = 34;
 
+/// Translate WSA error codes to Linux errno values.
+///
+/// On Windows, WinSock errors live in the 10000+ range (WSA* constants).
+/// We map them to their Linux equivalents so the guest sees the right errno.
+/// Translate WSA error codes to Linux errno values.
+///
+/// On Windows, WinSock errors live in the 10000+ range (WSA* constants).
+/// We map them to their Linux equivalents so the guest sees the right errno.
+#[cfg(target_os = "windows")]
+pub fn wsa_errno_to_linux(wsa_err: i32) -> i32 {
+    match wsa_err {
+        10035 => LINUX_EAGAIN,         // WSAEWOULDBLOCK
+        10036 => LINUX_EINPROGRESS,    // WSAEINPROGRESS
+        10037 => LINUX_EALREADY,       // WSAEALREADY
+        10038 => LINUX_ENOTSOCK,       // WSAENOTSOCK
+        10039 => LINUX_EDESTADDRREQ,   // WSAEDESTADDRREQ
+        10040 => LINUX_EMSGSIZE,       // WSAEMSGSIZE
+        10041 => LINUX_EPROTOTYPE,     // WSAEPROTOTYPE
+        10042 => LINUX_ENOPROTOOPT,    // WSAENOPROTOOPT
+        10043 => LINUX_EPROTONOSUPPORT,// WSAEPROTONOSUPPORT
+        10044 => LINUX_ESOCKTNOSUPPORT,// WSAESOCKTNOSUPPORT
+        10045 => LINUX_EOPNOTSUPP,     // WSAEOPNOTSUPP
+        10046 => LINUX_EPFNOSUPPORT,   // WSAEPFNOSUPPORT
+        10047 => LINUX_EAFNOSUPPORT,   // WSAEAFNOSUPPORT
+        10048 => LINUX_EADDRINUSE,     // WSAEADDRINUSE
+        10049 => LINUX_EADDRNOTAVAIL,  // WSAEADDRNOTAVAIL
+        10050 => LINUX_ENETDOWN,       // WSAENETDOWN
+        10051 => LINUX_ENETUNREACH,    // WSAENETUNREACH
+        10052 => LINUX_ENETRESET,      // WSAENETRESET
+        10053 => LINUX_ECONNABORTED,   // WSAECONNABORTED
+        10054 => LINUX_ECONNRESET,     // WSAECONNRESET
+        10055 => LINUX_ENOBUFS,        // WSAENOBUFS
+        10056 => LINUX_EISCONN,        // WSAEISCONN
+        10057 => LINUX_ENOTCONN,       // WSAENOTCONN
+        10058 => LINUX_ESHUTDOWN,      // WSAESHUTDOWN
+        10060 => LINUX_ETIMEDOUT,      // WSAETIMEDOUT
+        10061 => LINUX_ECONNREFUSED,   // WSAECONNREFUSED
+        10064 => LINUX_EHOSTDOWN,      // WSAEHOSTDOWN
+        10065 => LINUX_EHOSTUNREACH,   // WSAEHOSTUNREACH
+        _ => LINUX_EIO,
+    }
+}
+
 pub fn linux_error(error: std::io::Error) -> std::io::Error {
+    /* #[cfg(windows)]
+    {
+        let raw = error.raw_os_error().unwrap_or(5 /* EIO */);
+        return std::io::Error::from_raw_os_error(wsa_errno_to_linux(raw));
+        //error
+    } */
+    
     std::io::Error::from_raw_os_error(linux_errno_raw(error.raw_os_error().unwrap_or(libc::EIO)))
 }
 

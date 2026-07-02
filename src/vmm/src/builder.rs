@@ -39,7 +39,6 @@ use super::{Error, Vmm};
 use crate::device_manager::legacy::PortIODeviceManager;
 use crate::device_manager::mmio::MMIODeviceManager;
 use crate::resources::{DefaultVirtioConsoleConfig, PortConfig, VirtioConsoleConfigMode};
-#[cfg(unix)]
 use crate::resources::TsiFlags;
 use crate::resources::VmResources;
 use crate::vmm_config::external_kernel::{ExternalKernel, KernelFormat};
@@ -64,7 +63,6 @@ use devices::legacy::{IrqChip, IrqChipDevice};
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 use devices::legacy::{KvmGicV2, KvmGicV3};
 use devices::virtio::{port_io, MmioTransport, PortDescription, VirtioDevice};
-#[cfg(unix)]
 use devices::virtio::Vsock;
 
 #[cfg(feature = "tee")]
@@ -1188,9 +1186,8 @@ pub fn build_microvm(
     )?;
     #[cfg(feature = "blk")]
     attach_block_devices(&mut vmm, &vm_resources.block, intc.clone())?;
-    #[cfg(unix)]
     if let Some(vsock) = vm_resources.vsock.get() {
-        attach_unixsock_vsock_device(&mut vmm, vsock, event_manager, intc.clone())?;
+        attach_vsock_device(&mut vmm, vsock, event_manager, intc.clone())?;
         let tsi_flags = vm_resources.vsock.tsi_flags();
         if tsi_flags.contains(TsiFlags::HIJACK_INET) {
             vmm.kernel_cmdline.insert_str("tsi_hijack")?;
@@ -3032,8 +3029,7 @@ fn attach_net_devices(
     Ok(())
 }
 
-#[cfg(unix)]
-fn attach_unixsock_vsock_device(
+fn attach_vsock_device(
     vmm: &mut Vmm,
     unix_vsock: &Arc<Mutex<Vsock>>,
     event_manager: &mut EventManager,

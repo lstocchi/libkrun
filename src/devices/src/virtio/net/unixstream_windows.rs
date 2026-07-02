@@ -46,7 +46,6 @@ impl Unixstream {
 
     /// Connect to the gvproxy AF_UNIX stream socket at `path`.
     pub fn open(path: PathBuf) -> Result<Self, ConnectError> {
-        utils::windows::ensure_wsa_init();
 
         unsafe {
             let sock = socket(AF_UNIX as i32, SOCK_STREAM, 0);

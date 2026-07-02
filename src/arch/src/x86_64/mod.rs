@@ -131,6 +131,12 @@ pub fn arch_memory_regions(
                 };
 
                 let firmware_addr = if let Some(firmware_size) = firmware_size {
+                    // KVM/HVF/WHP all require guest_phys_addr and memory_size to be
+                    // page-aligned when mapping a memory region, but firmware_size is
+                    // just the raw byte length of the firmware file on disk. Round it
+                    // up so both the region size and firmware_start (derived from it)
+                    // stay page-aligned; the extra bytes are zero-filled guest memory.
+                    let firmware_size = align_upwards!(firmware_size, page_size);
                     let firmware_start = layout::FIRST_ADDR_PAST_32BITS - firmware_size as u64;
                     regions.push((GuestAddress(firmware_start), firmware_size));
                     firmware_start
@@ -170,6 +176,9 @@ pub fn arch_memory_regions(
                 };
 
                 let firmware_addr = if let Some(firmware_size) = firmware_size {
+                    // See the comment in the branch above: pad to a page boundary so
+                    // the mapped region stays aligned for KVM/HVF/WHP.
+                    let firmware_size = align_upwards!(firmware_size, page_size);
                     let firmware_start = layout::FIRST_ADDR_PAST_32BITS - firmware_size as u64;
                     regions.insert(
                         regions.len() - 1,

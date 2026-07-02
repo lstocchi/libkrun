@@ -98,12 +98,14 @@ impl Vsock {
             .expect("queue_rx should exist when activated");
         let mut queue_rx = queue_rx.lock().unwrap();
         while let Some(head) = queue_rx.pop(mem) {
-            debug!("process_rx inside while");
+            eprintln!("process_rx inside while");
             let used_len = match VsockPacket::from_rx_virtq_head(&head) {
-                Ok(mut pkt) => {
+                Ok(mut pkt) => {    
                     if self.muxer.recv_pkt(&mut pkt).is_ok() {
+                        eprintln!("process_rx: muxer.recv_pkt ok");
                         pkt.hdr().len() as u32 + pkt.len()
                     } else {
+                        eprintln!("process_rx: muxer.recv_pkt failed");
                         // We are using a consuming iterator over the virtio buffers, so, if we can't
                         // fill in this buffer, we'll need to undo the last iterator step.
                         queue_rx.undo_pop();
@@ -117,6 +119,7 @@ impl Vsock {
             };
 
             debug!("process_rx: something to queue");
+            eprintln!("process_rx: have_used = true");
             have_used = true;
             if let Err(e) = queue_rx.add_used(mem, head.index, used_len) {
                 error!("failed to add used elements to the queue: {e:?}");

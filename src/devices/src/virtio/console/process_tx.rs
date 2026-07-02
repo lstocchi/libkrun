@@ -78,7 +78,7 @@ fn pop_head_blocking<'mem>(
                     }
                     Err(_) => {
                         if let Some(descriptor) = queue.pop(mem) {
-                            break Some(descriptor); // Pass it back to be processed!
+                            break Some(descriptor);
                         }
                         break None;
                     }

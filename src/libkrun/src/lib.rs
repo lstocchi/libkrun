@@ -21,6 +21,8 @@ use devices::virtio::fs::virtual_entry::{VirtualDirEntry, VirtualEntry, VirtualE
 use libc::{c_char, c_int, size_t};
 use once_cell::sync::Lazy;
 use polly::event_manager::EventManager;
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::convert::TryInto;
@@ -32,9 +34,9 @@ use std::io::IsTerminal;
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 #[cfg(target_os = "windows")]
-use utils::windows::AsRawFd;
+use utils::windows::{AsRawFd, RawFd};
 #[cfg(windows)]
-use std::os::windows::io::{BorrowedHandle};
+use std::os::windows::io::{BorrowedHandle, FromRawHandle, RawHandle};
 #[cfg(unix)]
 use std::os::fd::{BorrowedFd, FromRawFd, RawFd};
 #[cfg(target_os = "windows")]
@@ -45,11 +47,20 @@ use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicI32, Ordering};
 use utils::eventfd::EventFd;
-#[cfg(unix)]
 use vmm::resources::{TsiFlags, VsockConfig};
 use vmm::resources::{
     DefaultVirtioConsoleConfig, PortConfig, SerialConsoleConfig, VirtioConsoleConfigMode,
     VmResources
+};
+#[cfg(windows)]
+use windows_sys::Win32::System::Console::{
+    GetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
+};
+#[cfg(windows)]
+use windows_sys::Win32::Networking::WinSock::{
+    AF_UNIX, FIONBIO, INVALID_SOCKET, SO_SNDBUF, SOCK_STREAM, SOCKADDR_UN, SOCKET_ERROR,
+    SOL_SOCKET, WSAECONNABORTED, WSAECONNRESET, WSAESHUTDOWN, WSAEWOULDBLOCK, WSAGetLastError,
+    connect, ioctlsocket, recv, send, setsockopt, socket,
 };
 #[cfg(feature = "blk")]
 use vmm::vmm_config::block::{BlockDeviceConfig, BlockRootConfig};
@@ -66,7 +77,6 @@ use vmm::vmm_config::kernel_cmdline::{DEFAULT_KERNEL_CMDLINE, KernelCmdlineConfi
 use vmm::vmm_config::machine_config::VmConfig;
 #[cfg(feature = "net")]
 use vmm::vmm_config::net::NetworkInterfaceConfig;
-#[cfg(not(target_os = "windows"))]
 use vmm::vmm_config::vsock::VsockDeviceConfig;
 
 #[cfg(feature = "aws-nitro")]
@@ -181,7 +191,6 @@ struct ContextConfig {
     rlimits: Option<String>,
     net_index: u8,
     tsi_port_map: Option<HashMap<u16, u16>>,
-    #[cfg(unix)]
     vsock_config: VsockConfig,
     #[cfg(feature = "blk")]
     block_cfgs: Vec<BlockDeviceConfig>,
@@ -196,7 +205,6 @@ struct ContextConfig {
     /// Console output path, only used by the aws-nitro TryFrom path.
     #[cfg(feature = "aws-nitro")]
     nitro_console_output: Option<PathBuf>,
-    console_output: Option<PathBuf>,
     #[cfg(unix)]
     vmm_uid: Option<libc::uid_t>,
     #[cfg(unix)]
@@ -465,58 +473,76 @@ mod log_defs {
     pub const KRUN_LOG_OPTION_NO_ENV: u32 = 1;
 }
 
-#[allow(clippy::missing_safety_doc)]
-#[no_mangle]
-#[cfg(unix)]
-pub unsafe extern "C" fn krun_init_log(target: RawFd, level: u32, style: u32, options: u32) -> i32 {
-    unsafe {
-        let target = match target {
-        ..-1 => return -libc::EINVAL,
-        -1 => Target::default(),
-        0 /* stdin */ => return -libc::EINVAL,
-        1 /* stdout */ => Target::Stdout,
-        2 /* stderr */ => Target::Stderr,
-        fd => Target::Pipe(Box::new(File::from_raw_fd(fd))),
+fn init_log_inner(target: Target, level: u32, style: u32, options: u32) -> i32 {
+    let filter = log_level_to_filter_str(level);
+
+    let write_style = match style {
+        log_defs::KRUN_LOG_STYLE_AUTO => "auto",
+        log_defs::KRUN_LOG_STYLE_ALWAYS => "always",
+        log_defs::KRUN_LOG_STYLE_NEVER => "never",
+        _ => return -libc::EINVAL,
     };
 
-        let filter = log_level_to_filter_str(level);
+    let use_env = match options {
+        0 => true,
+        log_defs::KRUN_LOG_OPTION_NO_ENV => false,
+        _ => return -libc::EINVAL,
+    };
 
-        let write_style = match style {
-            log_defs::KRUN_LOG_STYLE_AUTO => "auto",
-            log_defs::KRUN_LOG_STYLE_ALWAYS => "always",
-            log_defs::KRUN_LOG_STYLE_NEVER => "never",
-            _ => return -libc::EINVAL,
-        };
+    let mut builder = if use_env {
+        env_logger::Builder::from_env(
+            Env::new()
+                .default_filter_or(filter)
+                .default_write_style_or(write_style),
+        )
+    } else {
+        let mut builder = env_logger::Builder::new();
+        builder.parse_filters(filter).parse_write_style(write_style);
+        builder
+    };
+    builder.format_timestamp_micros().target(target).init();
 
-        let use_env = match options {
-            0 => true,
-            log_defs::KRUN_LOG_OPTION_NO_ENV => false,
-            _ => return -libc::EINVAL,
-        };
-
-        let mut builder = if use_env {
-            env_logger::Builder::from_env(
-                Env::new()
-                    .default_filter_or(filter)
-                    .default_write_style_or(write_style),
-            )
-        } else {
-            let mut builder = env_logger::Builder::new();
-            builder.parse_filters(filter).parse_write_style(write_style);
-            builder
-        };
-        builder.format_timestamp_micros().target(target).init();
-
-        #[cfg(feature = "aws-nitro")]
-        {
-            // Notify krun-awsnitro to enable debug for log level.
-            if level >= 4 {
-                *KRUN_NITRO_DEBUG.lock().unwrap() = true;
-            }
+    #[cfg(feature = "aws-nitro")]
+    {
+        // Notify krun-awsnitro to enable debug for log level.
+        if level >= 4 {
+            *KRUN_NITRO_DEBUG.lock().unwrap() = true;
         }
-
-        KRUN_SUCCESS
     }
+
+    KRUN_SUCCESS
+}
+
+#[allow(clippy::missing_safety_doc)]
+#[unsafe(no_mangle)]
+#[cfg(unix)]
+pub unsafe extern "C" fn krun_init_log(target: RawFd, level: u32, style: u32, options: u32) -> i32 {
+    let target = unsafe {
+        match target {
+            ..-1 => return -libc::EINVAL,
+            -1 => Target::default(),
+            0 => return -libc::EINVAL,
+            1 => Target::Stdout,
+            2 => Target::Stderr,
+            fd => Target::Pipe(Box::new(File::from_raw_fd(fd))),
+        }
+    };
+    init_log_inner(target, level, style, options)
+}
+
+#[allow(clippy::missing_safety_doc)]
+#[unsafe(no_mangle)]
+#[cfg(windows)]
+pub unsafe extern "C" fn krun_init_log(target: HANDLE, level: u32, style: u32, options: u32) -> i32 {
+    let target = unsafe {
+        match target {
+            INVALID_HANDLE_VALUE => Target::default(),
+            h if h == GetStdHandle(STD_OUTPUT_HANDLE) => Target::Stdout,
+            h if h == GetStdHandle(STD_ERROR_HANDLE) => Target::Stderr,
+            h => Target::Pipe(Box::new(File::from_raw_handle(h as RawHandle))),
+        }
+    };
+    init_log_inner(target, level, style, options)
 }
 
 #[unsafe(no_mangle)]
@@ -855,9 +881,46 @@ const NET_ALL_FEATURES: u32 = NET_FEATURE_CSUM
     | NET_FEATURE_HOST_TSO6
     | NET_FEATURE_HOST_UFO;
 
+#[cfg(feature = "net")]
+unsafe fn krun_add_net_unixstream_common(
+    ctx_id: u32,
+    backend: VirtioNetBackend,
+    c_mac: *const u8,
+    features: u32,
+    flags: u32,
+) -> i32 {
+    unsafe {
+        let mac: [u8; 6] = match slice::from_raw_parts(c_mac, 6).try_into() {
+            Ok(m) => m,
+            Err(_) => return -libc::EINVAL,
+        };
+
+        if (flags & !NET_FLAG_DHCP_CLIENT) != 0 {
+            return -libc::EINVAL;
+        }
+        let enable_dhcp_client: bool = flags & NET_FLAG_DHCP_CLIENT != 0;
+
+        if (features & !NET_ALL_FEATURES) != 0 {
+            return -libc::EINVAL;
+        }
+
+        match CTX_MAP.lock().unwrap().entry(ctx_id) {
+            Entry::Occupied(mut ctx_cfg) => {
+                let cfg = ctx_cfg.get_mut();
+                create_virtio_net(cfg, backend, mac, features);
+                if enable_dhcp_client {
+                    cfg.vmr.dhcp_client = true;
+                }
+            }
+            Entry::Vacant(_) => return -libc::ENOENT,
+        }
+        KRUN_SUCCESS
+    }
+}
+
 #[allow(clippy::missing_safety_doc)]
 #[unsafe(no_mangle)]
-#[cfg(feature = "net")]
+#[cfg(all(not(target_os = "windows"),feature = "net"))]
 pub unsafe extern "C" fn krun_add_net_unixstream(
     ctx_id: u32,
     c_path: *const c_char,
@@ -888,31 +951,44 @@ pub unsafe extern "C" fn krun_add_net_unixstream(
             VirtioNetBackend::UnixstreamFd(fd as PlatformSocket)
         };
 
-        let mac: [u8; 6] = match slice::from_raw_parts(c_mac, 6).try_into() {
-            Ok(m) => m,
-            Err(_) => return -libc::EINVAL,
+        krun_add_net_unixstream_common(ctx_id, backend, c_mac, features, flags)
+    }
+}
+
+#[allow(clippy::missing_safety_doc)]
+#[unsafe(no_mangle)]
+#[cfg(all(target_os = "windows",feature = "net"))]
+pub unsafe extern "C" fn krun_add_net_unixstream(
+    ctx_id: u32,
+    c_path: *const c_char,
+    fd: u64,
+    c_mac: *const u8,
+    features: u32,
+    flags: u32,
+) -> i32 {
+    unsafe {
+        let path = if !c_path.is_null() {
+            match CStr::from_ptr(c_path).to_str() {
+                Ok(path) => Some(PathBuf::from(path)),
+                Err(_) => None,
+            }
+        } else {
+            None
         };
 
-        if (flags & !NET_FLAG_DHCP_CLIENT) != 0 {
+        if fd != INVALID_SOCKET as u64 && path.is_some() {
             return -libc::EINVAL;
         }
-        let enable_dhcp_client: bool = flags & NET_FLAG_DHCP_CLIENT != 0;
-
-        if (features & !NET_ALL_FEATURES) != 0 {
+        if fd == INVALID_SOCKET as u64 && path.is_none() {
             return -libc::EINVAL;
         }
+        let backend = if let Some(path) = path {
+            VirtioNetBackend::UnixstreamPath(path)
+        } else {
+            VirtioNetBackend::UnixstreamFd(fd as PlatformSocket)
+        };
 
-        match CTX_MAP.lock().unwrap().entry(ctx_id) {
-            Entry::Occupied(mut ctx_cfg) => {
-                let cfg = ctx_cfg.get_mut();
-                create_virtio_net(cfg, backend, mac, features);
-                if enable_dhcp_client {
-                    cfg.vmr.dhcp_client = true;
-                }
-            }
-            Entry::Vacant(_) => return -libc::ENOENT,
-        }
-        KRUN_SUCCESS
+        krun_add_net_unixstream_common(ctx_id, backend, c_mac, features, flags)
     }
 }
 
@@ -1087,7 +1163,6 @@ pub unsafe extern "C" fn krun_set_port_map(ctx_id: u32, c_port_map: *const *cons
             }
         }
 
-        #[cfg(unix)]
         match CTX_MAP.lock().unwrap().entry(ctx_id) {
             Entry::Occupied(mut ctx_cfg) => {
                 let cfg = ctx_cfg.get_mut();
@@ -1329,7 +1404,6 @@ pub unsafe extern "C" fn krun_add_vsock_port2(
             }
         }
 
-        #[cfg(unix)]
         match CTX_MAP.lock().unwrap().entry(ctx_id) {
             Entry::Occupied(mut ctx_cfg) => {
                 let cfg = ctx_cfg.get_mut();
@@ -1766,6 +1840,7 @@ pub unsafe extern "C" fn krun_set_console_output(ctx_id: u32, c_filepath: *const
     }
 }
 
+#[cfg(unix)]
 #[allow(unused_assignments)]
 #[unsafe(no_mangle)]
 pub extern "C" fn krun_get_shutdown_eventfd(ctx_id: u32) -> i32 {
@@ -1777,13 +1852,28 @@ pub extern "C" fn krun_get_shutdown_eventfd(ctx_id: u32) -> i32 {
                 return efd.get_write_fd();
                 #[cfg(target_os = "linux")]
                 return efd.as_raw_fd();
-                #[cfg(target_os = "windows")]
-                return efd.as_raw_fd() as i32;
             } else {
                 -libc::EINVAL
             }
         }
         Entry::Vacant(_) => -libc::ENOENT,
+    }
+}
+
+#[cfg(windows)]
+#[allow(unused_assignments)]
+#[unsafe(no_mangle)]
+pub extern "C" fn krun_get_shutdown_eventfd(ctx_id: u32) -> HANDLE {
+    match CTX_MAP.lock().unwrap().entry(ctx_id) {
+        Entry::Occupied(mut ctx_cfg) => {
+            let cfg = ctx_cfg.get_mut();
+            if let Some(efd) = cfg.shutdown_efd.as_ref() {
+                return efd.as_raw_fd();
+            } else {
+                INVALID_HANDLE_VALUE
+            }
+        }
+        Entry::Vacant(_) => INVALID_HANDLE_VALUE,
     }
 }
 
@@ -2506,7 +2596,6 @@ pub unsafe extern "C" fn krun_get_default_init(
     -libc::ENOTSUP
 }
 
-#[cfg(not(target_os = "windows"))]
 #[unsafe(no_mangle)]
 pub extern "C" fn krun_add_vsock(ctx_id: u32, tsi_features: u32) -> i32 {
     let tsi_flags = match TsiFlags::from_bits(tsi_features) {
@@ -2514,8 +2603,8 @@ pub extern "C" fn krun_add_vsock(ctx_id: u32, tsi_features: u32) -> i32 {
         None => return -libc::EINVAL,
     };
 
-    if cfg!(target_os = "macos") && tsi_flags.contains(TsiFlags::HIJACK_UNIX) {
-        error!("TSI hijacking of UNIX sockets is not yet supported on macOS");
+    if (cfg!(target_os = "macos") || cfg!(target_os = "windows")) && tsi_flags.contains(TsiFlags::HIJACK_UNIX) {
+        error!("TSI hijacking of UNIX sockets is not yet supported");
         return -libc::EINVAL;
     }
 
@@ -2942,30 +3031,6 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
         return -libc::EINVAL;
     }
 
-    /* #[cfg(feature = "net")]
-    {
-        if let Some(legacy_net_cfg) = ctx_cfg.legacy_net_cfg.clone() {
-            let backend = match legacy_net_cfg {
-                LegacyNetworkConfig::VirtioNetGvproxy(path) => {
-                    #[cfg(unix)]
-                    let backend = VirtioNetBackend::UnixgramPath(path, true);
-                    
-                    #[cfg(windows)]
-                    let backend = VirtioNetBackend::UnixstreamPath(path);
-                    
-                    backend
-                }
-                #[cfg(unix)]
-                LegacyNetworkConfig::VirtioNetPasst(fd) => VirtioNetBackend::UnixstreamFd(fd),
-            };
-            let mac = ctx_cfg
-                .legacy_mac
-                .unwrap_or([0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xee]);
-            create_virtio_net(&mut ctx_cfg, backend, mac, NET_COMPAT_FEATURES);
-        }
-    } */
-
-    #[cfg(unix)]
     match &ctx_cfg.vsock_config {
         VsockConfig::Disabled => (),
         VsockConfig::Explicit { tsi_flags } => {
@@ -2986,11 +3051,6 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
     if let Some(shm_size) = ctx_cfg.gpu_shm_size {
         ctx_cfg.vmr.set_gpu_shm_size(shm_size);
     }
-
-    /* eprintln!("console_output:");
-    if let Some(console_output) = ctx_cfg.console_output {
-        ctx_cfg.vmr.set_console_output(console_output);
-    } */
 
     #[cfg(unix)]
     if let Some(gid) = ctx_cfg.vmm_gid {

@@ -27,6 +27,7 @@
 use log::debug;
 use std::collections::HashMap;
 use std::io;
+use std::mem::MaybeUninit;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -40,15 +41,13 @@ use super::{AsRawFd, RawFd};
 use windows_sys::Win32::Foundation::{
     CloseHandle, HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT as WAIT_TIMEOUT_CODE,
 };
-use windows_sys::Win32::System::Threading::INFINITE;
 use windows_sys::Win32::Networking::WinSock::{
-    WSACloseEvent, WSACreateEvent, WSAEnumNetworkEvents, WSAEventSelect, INVALID_SOCKET,
-    SOCKET_ERROR, WSANETWORKEVENTS, WSAStartup, WSADATA, WSACleanup,
+    INVALID_SOCKET, SOCKET, SOCKET_ERROR, WSACleanup, WSACloseEvent, WSACreateEvent, WSADATA, WSAEnumNetworkEvents, WSAEventSelect, WSANETWORKEVENTS, WSAStartup,
 };
-pub use windows_sys::Win32::Networking::WinSock::SOCKET;
 use windows_sys::Win32::System::IO::{
     CreateIoCompletionPort, GetQueuedCompletionStatusEx, OVERLAPPED_ENTRY,
 };
+use windows_sys::Win32::System::Threading::INFINITE;
 
 // Generic access mask requesting all permissions the caller is allowed.
 // https://learn.microsoft.com/en-us/windows/win32/secauthz/access-mask
@@ -156,16 +155,19 @@ struct Watch {
     /// packets already queued by the kernel are silently ignored.
     is_active: AtomicBool,
     /// For socket watches created via [`Epoll::ctl_socket`]: the Winsock
-    /// `SOCKET` handle. Immutable after creation.
+    /// `SOCKET` handle.  Set to [`INVALID_SOCKET`] for regular event-handle
+    /// watches.  Immutable after creation.
     socket: Option<SOCKET>,
 }
 
 // Ensure internal handles are cleaned up only when the Watch is truly destroyed
 impl Drop for Watch {
     fn drop(&mut self) {
-        if self.socket.is_some() {
-            unsafe {
-                WSACloseEvent(self.fd as isize);
+        unsafe {
+            if let Some(socket) = self.socket {
+                if socket != INVALID_SOCKET {
+                    WSAEventSelect(socket, 0, 0);
+                }
             }
         }
     }
@@ -201,7 +203,9 @@ impl Drop for CompletionPort {
                 let _ = NtCancelWaitCompletionPacket(w.wcp, 1);
                 CloseHandle(w.wcp);
                 if let Some(socket) = w.socket {
-                    WSAEventSelect(socket, 0, 0);
+                    if socket != INVALID_SOCKET {
+                        WSAEventSelect(socket, 0, 0);
+                    }
                 }
             }
         }
@@ -212,7 +216,6 @@ impl Drop for CompletionPort {
         }
         unsafe {
             CloseHandle(self.handle);
-            WSACleanup();
         }
     }
 }
@@ -261,44 +264,15 @@ fn calculate_net_events(events: EventSet) -> i32 {
     net_events
 }
 
-fn parse_net_events(net_ev: &WSANETWORKEVENTS) -> EventSet {
-    let mut actual = EventSet::empty();
-    if net_ev.lNetworkEvents & (NET_FD_READ | NET_FD_ACCEPT) != 0 {
-        actual |= EventSet::IN;
-    }
-    if net_ev.lNetworkEvents & (NET_FD_WRITE | NET_FD_CONNECT) != 0 {
-        actual |= EventSet::OUT;
-    }
-    if net_ev.lNetworkEvents & NET_FD_CLOSE != 0 {
-        actual |= EventSet::HANG_UP | EventSet::READ_HANG_UP;
-    }
-    
-    actual
-}
-
 /// Epoll-compatible polling abstraction backed by an I/O Completion Port.
+#[derive(Clone)]
 pub struct Epoll {
     iocp: Arc<CompletionPort>,
-    entries: Vec<OVERLAPPED_ENTRY>,
 }
-
-impl Clone for Epoll {
-    fn clone(&self) -> Self {
-        Epoll {
-            iocp: self.iocp.clone(),
-            entries: Vec::new(),
-        }
-    }
-}
-
-// SAFETY: `Epoll` is safe to send across threads. The `Vec<OVERLAPPED_ENTRY>` entries
-// buffer is only accessed from the thread that owns the `Epoll`, and the underlying
-// `CompletionPort` (Arc) already implements `Send + Sync`.
-unsafe impl Send for Epoll {}
 
 impl Epoll {
     /// Create a new polling instance backed by a fresh I/O Completion Port.
-    pub fn new() -> io::Result<Self> {        
+    pub fn new() -> io::Result<Self> {
         let mut data: WSADATA = unsafe { std::mem::zeroed() };
         let ret = unsafe { WSAStartup(0x0202, &mut data) };
         if ret != 0 {
@@ -307,7 +281,7 @@ impl Epoll {
 
         let handle =
             unsafe { CreateIoCompletionPort(INVALID_HANDLE_VALUE, std::ptr::null_mut(), 0, 0) };
-        if handle.is_null() {
+        if handle == std::ptr::null_mut() {
             let err = io::Error::last_os_error();
             debug!("CreateIoCompletionPort failed: {:?}", err);
             unsafe { WSACleanup(); }
@@ -319,10 +293,15 @@ impl Epoll {
                 watches: Mutex::new(HashMap::new()),
                 zombies: Mutex::new(Vec::new()),
             }),
-            entries: Vec::with_capacity(32),
         })
     }
 
+    /// Add, modify, or remove a handle in the interest set.
+    ///
+    /// * `fd` – the waitable handle (as [`RawFd`] / `HANDLE`).
+    /// * `event` – carries the desired [`EventSet`] mask and a `u64` data
+    ///   payload that will be returned by [`wait`](Self::wait) when this
+    ///   handle becomes ready.
     pub fn ctl(
         &self,
         operation: ControlOperation,
@@ -352,6 +331,8 @@ impl Epoll {
     ) -> io::Result<()> {
         self.ctl_inner(operation, PollHandle::Socket(socket), event)
     }
+
+    
 
     /// Add, modify, or remove a handle in the interest set.
     ///
@@ -494,23 +475,21 @@ impl Epoll {
     /// is the raw `Watch` pointer set during [`ctl`](Self::ctl), so we can
     /// read event metadata through atomics without any table lookup.
     pub fn wait(
-        &mut self,
+        &self,
         max_events: usize,
         timeout: i32,
         events: &mut [EpollEvent],
     ) -> io::Result<usize> {
         let iocp_handle = self.iocp.handle;
 
-        let capacity = events.len().min(max_events).min(i32::MAX as usize);
+        let capacity = max_events.min(events.len());
         if capacity == 0 {
             return Ok(0);
         }
 
-        self.entries.clear();
-        if self.entries.capacity() < capacity {
-            self.entries.reserve_exact(capacity);
-        }
-
+        const BATCH_SIZE: usize = 256;
+        let batch_limit = capacity.min(BATCH_SIZE);
+        let mut entries = [MaybeUninit::<OVERLAPPED_ENTRY>::uninit(); BATCH_SIZE];
         let mut count: u32 = 0;
         let win_timeout: u32 = if timeout < 0 {
             INFINITE
@@ -521,8 +500,8 @@ impl Epoll {
         let ok = unsafe {
             GetQueuedCompletionStatusEx(
                 iocp_handle,
-                self.entries.spare_capacity_mut().as_mut_ptr() as *mut _,
-                capacity as u32,
+                entries[..batch_limit].as_mut_ptr() as *mut _,
+                batch_limit as u32,
                 &mut count,
                 win_timeout,
                 0,
@@ -537,11 +516,12 @@ impl Epoll {
             return Err(err);
         }
 
-        // Update vector length based on how many packets the kernel actually wrote.
-        unsafe { self.entries.set_len(count as usize) }
+        let entries_slice = unsafe {
+            std::slice::from_raw_parts(entries.as_ptr().cast::<OVERLAPPED_ENTRY>(), count as usize)
+        };
         let mut result_count = 0;
 
-        for entry in &self.entries {
+        for entry in entries_slice {
             let watch_ptr = entry.lpCompletionKey as *const Watch;
             if watch_ptr.is_null() {
                 continue;
@@ -556,7 +536,12 @@ impl Epoll {
             let current_events = watch.events.load(Ordering::Acquire);
             let event_set = EventSet::from_bits_truncate(current_events);
             
-            let (bits, should_report) = if let Some(socket) = watch.socket {
+
+            if let Some(socket) = watch.socket {
+                if socket == INVALID_SOCKET {
+                    continue;
+                }
+                // ── Socket watch ──
                 // WSAEnumNetworkEvents atomically retrieves the pending
                 // network events AND resets the WSAEvent object so the
                 // next WSAEventSelect notification can re-signal it.
@@ -565,66 +550,49 @@ impl Epoll {
                     WSAEnumNetworkEvents(socket, watch.fd as isize, &mut net_ev)
                 };
 
-                if ret != 0 {
-                    debug!("WSAEnumNetworkEvents failed: {}", io::Error::last_os_error());
-                    (0, false)
-                } else {
-                    let actual = parse_net_events(&net_ev);
-                    let reported = actual & event_set;
-                    if reported.is_empty() {
-                        (0, false)
-                    } else {
-                        (reported.bits(), true)
+                let mut actual = EventSet::empty();
+                if ret == 0 {
+                    if net_ev.lNetworkEvents & (NET_FD_READ | NET_FD_ACCEPT) != 0 {
+                        actual |= EventSet::IN;
                     }
-                }                
-            } else {
-                ((event_set & (EventSet::IN | EventSet::OUT)).bits(), true)
-            };
-
-            if should_report {
-                events[result_count] = EpollEvent {
-                    events: bits,
-                    u64: watch.data.load(Ordering::Acquire),
-                };
-                result_count += 1;
-            }
-
-            if !event_set.contains(EventSet::EDGE_TRIGGERED) {
-                // Level-triggered: re-associate the WCP so the next signal
-                // on this handle produces another completion packet.
-                //
-                // KNOWN RACE: there is a race between this call and
-                // `CloseHandle(watch.wcp)` in `Epoll::ctl(Delete)`.  Another
-                // thread may delete the watch (marking it inactive and closing
-                // the WCP handle) between our `is_active` check above and the
-                // `associate_wcp` call here.  In that case:
-                //
-                //  1. The WCP handle is already closed and
-                //     `NtAssociateWaitCompletionPacket` returns
-                //     `STATUS_INVALID_HANDLE` -- harmless, we ignore the error.
-                //  2. Windows recycles the handle value for a non-WCP object --
-                //     `NtAssociateWaitCompletionPacket` returns
-                //     `STATUS_OBJECT_TYPE_MISMATCH` -- also harmless.
-                //  3. Windows recycles the handle value for a *new* WCP created
-                //     by a third thread.  The associate succeeds on the wrong
-                //     WCP.  When that third thread later tries to associate its
-                //     own WCP it will fail and delete its handle, leaving the
-                //     kernel to drop the WCP once its refcount reaches zero
-                //     (the original delete already closed the userspace handle
-                //     and the event was never queued to the IOCP).  The only
-                //     consequence is a lost event for the third thread, which
-                //     should be re-queued on the next iteration.
-                //
-                // We should try to remove the GC mechanism but for now
-                // this is acceptable.
-                
+                    if net_ev.lNetworkEvents & (NET_FD_WRITE | NET_FD_CONNECT) != 0 {
+                        actual |= EventSet::OUT;
+                    }
+                    if net_ev.lNetworkEvents & NET_FD_CLOSE != 0 {
+                        actual |= EventSet::HANG_UP | EventSet::READ_HANG_UP;
+                    }
+                } else {
+                    debug!("WSAEnumNetworkEvents failed: {}", io::Error::last_os_error());
+                }
 
                 // Always re-arm the WCP — WSAEnumNetworkEvents already
                 // reset the event, so the WCP will wait for the next signal.
                 let _ = associate_wcp(watch.wcp, iocp_handle, watch.fd, watch_ptr as *mut _);
+
+                let reported = actual & event_set;
+                if reported.is_empty() {
+                    continue;
+                }
+
+                events[result_count] = EpollEvent {
+                    events: reported.bits(),
+                    u64: watch.data.load(Ordering::Acquire),
+                };
+                result_count += 1;
+            } else {
+                // ── Regular event-handle watch ──
+                events[result_count] = EpollEvent {
+                    events: (event_set & (EventSet::IN | EventSet::OUT)).bits(),
+                    u64: watch.data.load(Ordering::Acquire),
+                };
+                result_count += 1;
+
+                if !event_set.contains(EventSet::EDGE_TRIGGERED) {
+                    let _ = associate_wcp(watch.wcp, iocp_handle, watch.fd, watch_ptr as *mut _);
+                }
             }
         }
-            
+
         Ok(result_count)
     }
 }
@@ -733,7 +701,7 @@ mod tests {
 
     #[test]
     fn test_wait_returns_signaled_event() {
-        let mut epoll = Epoll::new().unwrap();
+        let epoll = Epoll::new().unwrap();
         let ev = create_event();
         let event = EpollEvent::new(EventSet::IN, ev as u64);
         epoll.ctl(ControlOperation::Add, ev, &event).unwrap();
@@ -754,7 +722,7 @@ mod tests {
 
     #[test]
     fn test_wait_timeout_no_signal() {
-        let mut epoll = Epoll::new().unwrap();
+        let epoll = Epoll::new().unwrap();
         let ev = create_event();
         let event = EpollEvent::new(EventSet::IN, ev as u64);
         epoll.ctl(ControlOperation::Add, ev, &event).unwrap();
@@ -771,7 +739,7 @@ mod tests {
 
     #[test]
     fn test_wait_multiple_handles() {
-        let mut epoll = Epoll::new().unwrap();
+        let epoll = Epoll::new().unwrap();
         let ev1 = create_event();
         let ev2 = create_event();
 
@@ -813,7 +781,7 @@ mod tests {
 
     #[test]
     fn test_level_triggered_redelivers() {
-        let mut epoll = Epoll::new().unwrap();
+        let epoll = Epoll::new().unwrap();
         let ev = create_event();
         let event = EpollEvent::new(EventSet::IN, ev as u64);
         epoll.ctl(ControlOperation::Add, ev, &event).unwrap();
@@ -840,7 +808,7 @@ mod tests {
 
     #[test]
     fn test_edge_triggered_no_redelivery() {
-        let mut epoll = Epoll::new().unwrap();
+        let epoll = Epoll::new().unwrap();
         let ev = create_event();
         let event = EpollEvent::new(EventSet::IN | EventSet::EDGE_TRIGGERED, ev as u64);
         epoll.ctl(ControlOperation::Add, ev, &event).unwrap();
@@ -865,7 +833,7 @@ mod tests {
 
     #[test]
     fn test_edge_triggered_rearm_via_modify() {
-        let mut epoll = Epoll::new().unwrap();
+        let epoll = Epoll::new().unwrap();
         let ev = create_event();
         let event = EpollEvent::new(EventSet::IN | EventSet::EDGE_TRIGGERED, ev as u64);
         epoll.ctl(ControlOperation::Add, ev, &event).unwrap();

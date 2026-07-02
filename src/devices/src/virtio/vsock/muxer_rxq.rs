@@ -91,6 +91,7 @@ impl MuxerRxQ {
 }
 
 pub fn rx_to_pkt(cid: u64, rx: MuxerRx, pkt: &mut VsockPacket) {
+    eprintln!("rx_to_pkt: rx = {rx:?}");
     match rx {
         MuxerRx::Reset {
             local_port,
@@ -177,7 +178,8 @@ pub fn rx_to_pkt(cid: u64, rx: MuxerRx, pkt: &mut VsockPacket) {
                 .set_dst_port(peer_port)
                 .set_type(uapi::VSOCK_TYPE_STREAM)
                 .set_buf_alloc(defs::CONN_TX_BUF_SIZE as u32)
-                .set_fwd_cnt(fwd_cnt);
+                .set_fwd_cnt(fwd_cnt)
+                .set_len(0);
         }
         MuxerRx::CreditUpdate {
             local_port,
@@ -191,7 +193,8 @@ pub fn rx_to_pkt(cid: u64, rx: MuxerRx, pkt: &mut VsockPacket) {
                 .set_dst_port(peer_port)
                 .set_type(uapi::VSOCK_TYPE_STREAM)
                 .set_buf_alloc(defs::CONN_TX_BUF_SIZE as u32)
-                .set_fwd_cnt(fwd_cnt);
+                .set_fwd_cnt(fwd_cnt)
+                .set_len(0);
         }
         MuxerRx::ListenResponse {
             local_port,

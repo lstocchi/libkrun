@@ -25,7 +25,10 @@ use std::result;
 
 #[cfg(target_os = "linux")]
 use nix::sys::socket::{AddressFamily, sockaddr};
+#[cfg(unix)]
 use nix::sys::socket::{SockaddrLike, SockaddrStorage};
+#[cfg(windows)]
+use super::windows::sockaddr_storage::SockaddrStorage;
 use utils::byte_order;
 use vm_memory::{self, Address, GuestAddress, GuestMemory, GuestMemoryError};
 
@@ -187,6 +190,7 @@ pub struct TsiReleaseReq {
 /// The vsock packet, implemented as a wrapper over a virtq descriptor chain:
 /// - the chain head, holding the packet header; and
 /// - (an optional) data/buffer descriptor, only present for data packets (VSOCK_OP_RW).
+#[derive(Debug)]
 pub struct VsockPacket {
     hdr: *mut u8,
     buf: Option<*mut u8>,
@@ -622,6 +626,11 @@ impl VsockPacket {
             }
             _ => None,
         }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn parse_address(buf: &[u8], addr_len: u32) -> Option<SockaddrStorage> {
+        SockaddrStorage::from_linux_bytes(buf, addr_len)
     }
 
     pub fn read_proxy_create(&self) -> Option<TsiProxyCreate> {

@@ -1,4 +1,4 @@
-use std::os::windows::io::AsRawHandle;
+use std::os::windows::io::{AsRawHandle, AsRawSocket, OwnedSocket};
 use std::sync::Once;
 
 use windows_sys::Win32::Foundation::HANDLE;
@@ -12,19 +12,6 @@ pub mod wake_event;
 /// is just [`HANDLE`] — the two names are interchangeable.
 pub type RawFd = HANDLE;
 
-static WSA_INIT: Once = Once::new();
-
-/// Ensure that `WSAStartup` has been called exactly once for this process.
-/// Safe to call from any thread, any number of times.
-pub fn ensure_wsa_init() {
-    WSA_INIT.call_once(|| {
-        use windows_sys::Win32::Networking::WinSock::{WSAStartup, WSADATA};
-        let mut data: WSADATA = unsafe { std::mem::zeroed() };
-        let ret = unsafe { WSAStartup(0x0202, &mut data) };
-        assert!(ret == 0, "WSAStartup failed: {ret}");
-    });
-}
-
 /// Windows equivalent of [`std::os::unix::io::AsRawFd`].
 pub trait AsRawFd {
     fn as_raw_fd(&self) -> RawFd;
@@ -33,6 +20,12 @@ pub trait AsRawFd {
 impl AsRawFd for std::fs::File {
     fn as_raw_fd(&self) -> RawFd {        
         self.as_raw_handle() as RawFd
+    }
+}
+
+impl AsRawFd for OwnedSocket {
+    fn as_raw_fd(&self) -> RawFd {
+        self.as_raw_socket() as RawFd
     }
 }
 

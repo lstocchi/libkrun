@@ -45,7 +45,12 @@ extern "C" {
  * Returns:
  *  Zero on success or a negative error number on failure.
  */
-int32_t krun_init_log(int target_fd, uint32_t level, uint32_t style, uint32_t options);
+int32_t krun_init_log(#ifdef _WIN32
+    void *target_handle,
+#else
+    int target_fd,
+#endif
+ uint32_t level, uint32_t style, uint32_t options);
 
 /**
  * Creates a configuration context.
@@ -325,7 +330,11 @@ int32_t krun_add_virtiofs3(uint32_t ctx_id,
  */
 int32_t krun_add_net_unixstream(uint32_t ctx_id,
                                 const char *c_path,
+                                #ifdef _WIN32
+                                uint64_t fd,
+                                #else
                                 int fd,
+                                #endif
                                 uint8_t *const c_mac,
                                 uint32_t features,
                                 uint32_t flags);

@@ -56,7 +56,6 @@ pub use self::queue::{Descriptor, DescriptorChain, Queue};
 pub use self::rng::*;
 #[cfg(feature = "vhost-user")]
 pub use self::vhost_user::VhostUserDevice;
-#[cfg(unix)]
 pub use self::vsock::*;
 
 /// When the driver initializes the device, it lets the device know about the

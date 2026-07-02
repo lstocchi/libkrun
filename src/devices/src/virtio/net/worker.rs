@@ -158,11 +158,15 @@ impl NetWorker {
             let backend_socket = self.backend.raw_socket_fd();
             epoll
                 .ctl_socket(
+                    ControlOperation::Add,
                     backend_socket as usize,
-                    EventSet::IN | EventSet::OUT | EventSet::READ_HANG_UP,
-                    BACKEND_TOKEN,
-                )
-                .unwrap();
+                    &EpollEvent::new(
+                        EventSet::IN
+                            | EventSet::OUT
+                            | EventSet::READ_HANG_UP,
+                        BACKEND_TOKEN,
+                    ),
+                );
         }
 
         loop {

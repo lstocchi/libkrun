@@ -5,35 +5,26 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the THIRD-PARTY file.
 
-#[cfg(unix)]
 mod device;
-#[cfg(unix)]
 mod event_handler;
-#[cfg(unix)]
 mod muxer;
-#[cfg(unix)]
 mod muxer_rxq;
-#[cfg(unix)]
 mod muxer_thread;
-#[cfg(unix)]
 #[allow(dead_code)]
 mod packet;
-#[cfg(unix)]
 mod proxy;
-#[cfg(unix)]
 mod reaper;
 #[cfg(target_os = "macos")]
 mod timesync;
-#[cfg(unix)]
 mod tsi_dgram;
-#[cfg(unix)]
 mod tsi_stream;
-#[cfg(unix)]
 mod unix;
+
+#[cfg(target_os = "windows")]
+mod windows;
 
 pub use self::defs::TsiFlags;
 pub use self::defs::uapi::VIRTIO_ID_VSOCK as TYPE_VSOCK;
-#[cfg(unix)]
 pub use self::device::Vsock;
 
 use bitflags::bitflags;
