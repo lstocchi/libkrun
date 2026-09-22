@@ -333,7 +333,8 @@ impl Vmm {
                 initrd,
                 vcpus.len() as u8,
                 _pvh,
-                _acpi_enabled,
+                //_acpi_enabled,
+                true,
                 _virtio_mmio_devices,
             )
             .map_err(Error::ConfigureSystem)?;

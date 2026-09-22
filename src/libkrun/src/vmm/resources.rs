@@ -267,7 +267,7 @@ mod tests {
             smbios_oem_strings: None,
             nested_enabled: false,
             split_irqchip: false,
-            acpi_enabled: false,
+            acpi_enabled: true, // false,
             serial_consoles: Vec::new(),
             kernel_console: None,
         }

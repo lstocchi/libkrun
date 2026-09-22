@@ -1,12 +1,13 @@
 use std::marker::PhantomData;
 #[cfg(not(target_os = "windows"))]
 use std::os::fd::{AsRawFd, BorrowedFd};
+#[cfg(target_os = "windows")]
+use std::os::windows::io::BorrowedHandle;
 use std::sync::{Arc, Mutex};
 
 #[cfg(target_os = "macos")]
 use crate::vmm::VmCtl;
 use crate::vmm::Vmm as InnerVmm;
-#[cfg(unix)]
 use crate::vmm::resources::SerialConsoleConfig;
 use crate::vmm::resources::VmResources;
 use crate::vmm::vmm_config::machine_config::VmConfig;
@@ -16,6 +17,10 @@ use polly::event_manager::EventManager;
 use utils::eventfd::EventFd;
 #[cfg(target_os = "macos")]
 use utils::pollable_channel::PollableChannelSender;
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+#[cfg(target_os = "windows")]
+use std::os::windows::io::AsRawHandle;
 
 use super::device_builders::{DeviceManager, MmioDeviceManager};
 use super::error::VmmError;
@@ -27,7 +32,6 @@ pub struct VmmBuilder<'a> {
     ram_mib: Option<u32>,
     payload: Option<Payload>,
     device_manager: Option<Box<dyn DeviceManager<'a> + 'a>>,
-    #[cfg(unix)]
     serial_consoles: Vec<SerialConsoleConfig>,
     kernel_console: Option<String>,
     nested_virt: bool,
@@ -93,6 +97,23 @@ impl<'a> VmmBuilder<'a> {
         self.serial_consoles.push(SerialConsoleConfig {
             input_fd: in_fd,
             output_fd: out_fd,
+        });
+        Ok(self)
+    }
+
+    #[cfg(target_os = "windows")]
+    pub fn add_serial_console(
+        mut self,
+        input_fd: Option<BorrowedHandle<'a>>,
+        output_fd: Option<BorrowedHandle<'a>>,
+    ) -> Result<Self, VmmError> {
+        
+
+        let in_handle = input_fd.map_or(INVALID_HANDLE_VALUE, |handle| handle.as_raw_handle());
+        let out_handle = output_fd.map_or(INVALID_HANDLE_VALUE, |handle| handle.as_raw_handle());
+        self.serial_consoles.push(SerialConsoleConfig {
+            input_handle: in_handle,
+            output_handle: out_handle,
         });
         Ok(self)
     }
@@ -403,7 +424,7 @@ fn build_vm(builder_cfg: VmmBuilder<'_>) -> Result<Vmm<'_>, VmmError> {
 
     vm_resources.nested_enabled = builder_cfg.nested_virt;
     vm_resources.split_irqchip = builder_cfg.split_irqchip;
-    vm_resources.acpi_enabled = builder_cfg.acpi;
+    vm_resources.acpi_enabled = true; // builder_cfg.acpi;
     if !builder_cfg.smbios_oem_strings.is_empty() {
         vm_resources.smbios_oem_strings = Some(builder_cfg.smbios_oem_strings);
     }

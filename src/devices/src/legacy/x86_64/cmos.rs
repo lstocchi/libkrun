@@ -79,16 +79,9 @@ impl Cmos {
 
         Cmos { index: 0, data }
     }
-}
 
-impl BusDevice for Cmos {
-    fn read(&mut self, _vcpuid: u64, offset: u64, data: &mut [u8]) {
-        if data.len() != 1 {
-            error!("cmos: unsupported read length");
-            return;
-        }
-
-        data[0] = match offset {
+    fn read_byte(&mut self, offset: u64) -> u8 {
+        match offset {
             INDEX_OFFSET => {
                 debug!("cmos: read index offset");
                 self.index
@@ -110,24 +103,33 @@ impl BusDevice for Cmos {
                 }
             }
             _ => {
-                debug!("cmos: unsupported read offset");
-                0
+                debug!("cmos: unsupported read offset 0x{offset:x}");
+                0x00
             }
-        };
+        }
     }
 
-    fn write(&mut self, _vcpuid: u64, offset: u64, data: &[u8]) {
-        if data.len() != 1 {
-            error!("cmos: unsupported write length");
-            return;
-        }
-
+    fn write_byte(&mut self, offset: u64, byte: u8) {
         match offset {
             INDEX_OFFSET => {
                 debug!("cmos: update index");
-                self.index = data[0] & INDEX_MASK;
+                self.index = byte & INDEX_MASK;
             }
-            _ => debug!("cmos: ignoring unsupported write to CMOS"),
+            _ => debug!("cmos: ignoring unsupported write to CMOS at offset 0x{offset:x}"),
+        }
+    }
+}
+
+impl BusDevice for Cmos {
+    fn read(&mut self, _vcpuid: u64, offset: u64, data: &mut [u8]) {
+        for (i, byte) in data.iter_mut().enumerate() {
+            *byte = self.read_byte(offset + i as u64);
+        }
+    }
+
+    fn write(&mut self, _vcpuid: u64, offset: u64, data: &[u8]) {
+        for (i, &byte) in data.iter().enumerate() {
+            self.write_byte(offset + i as u64, byte);
         }
     }
 }
@@ -154,5 +156,13 @@ mod tests {
         assert_eq!(rtc_data(0x08, epoch_secs), Some(0x02));
         assert_eq!(rtc_data(0x09, epoch_secs), Some(0x00));
         assert_eq!(rtc_data(0x32, epoch_secs), Some(0x20));
+    }
+
+    #[test]
+    fn cmos_supports_multibyte_read() {
+        let mut cmos = Cmos::new(1024 * 1024 * 1024, 0);
+        let mut buf = [0u8; 2];
+        cmos.read(0, 0x0, &mut buf);
+        assert_eq!(buf.len(), 2);
     }
 }

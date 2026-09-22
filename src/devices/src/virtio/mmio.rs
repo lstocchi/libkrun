@@ -375,6 +375,7 @@ impl MmioTransport {
 
 impl BusDevice for MmioTransport {
     fn read(&mut self, _vcpuid: u64, offset: u64, data: &mut [u8]) {
+        debug!("virtio-mmio [{}]: READ offset 0x{:03x} (len={})", self.locked_device().device_type(), offset, data.len());
         match offset {
             0x00..=0xff if data.len() == 4 => {
                 let v = match offset {
@@ -439,6 +440,7 @@ impl BusDevice for MmioTransport {
     }
 
     fn write(&mut self, _vcpuid: u64, offset: u64, data: &[u8]) {
+        eprintln!("virtio-mmio [{}]: WRITE offset 0x{:03x} val=0x{:08x}", self.locked_device().device_type(), offset, byte_order::read_le_u32(data));
         fn hi(v: &mut GuestAddress, x: u32) {
             *v = (*v & 0xffff_ffff) | (u64::from(x) << 32)
         }

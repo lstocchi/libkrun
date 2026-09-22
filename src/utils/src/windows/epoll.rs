@@ -587,12 +587,13 @@ impl Epoll {
                 // already consumed and reset the handle. Re-check the actual
                 // current state here so we don't report a stale/phantom
                 // notification for an event that was already drained.
-                let signaled = unsafe { WaitForSingleObject(watch.fd, 0) } == WAIT_OBJECT_0;
+                /* let signaled = unsafe { WaitForSingleObject(watch.fd, 0) } == WAIT_OBJECT_0;
                 if signaled {
                     ((event_set & (EventSet::IN | EventSet::OUT)).bits(), true)
                 } else {
                     (0, false)
-                }
+                } */
+                ((event_set & (EventSet::IN | EventSet::OUT)).bits(), true)
             };
 
             if should_report {

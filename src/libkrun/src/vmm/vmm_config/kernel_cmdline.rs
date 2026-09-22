@@ -7,10 +7,8 @@ pub const DEFAULT_KERNEL_CMDLINE: &str = "reboot=k panic=-1 panic_print=0 nomodu
 #[cfg(target_os = "macos")]
 pub const DEFAULT_KERNEL_CMDLINE: &str = "reboot=k panic=-1 panic_print=0 nomodule console=hvc0 \
                                           rootfstype=virtiofs rw quiet no-kvmapf";
-// WHP (Windows Hypervisor Platform) differs from KVM in that it provides
-// no in-kernel PIT, PIC, or IOAPIC emulation. All three are emulated in
-// userspace. This makes interrupt delivery inherently less precise than KVM,
-// so we add the no_timer_check flag to skip the timer check to avoid panics.
+// WHP provides the LAPIC. libkrun supplies a userspace PIT and IOAPIC, but no
+// legacy PIC, so skip checks which assume a complete PC timer topology.
 #[cfg(target_os = "windows")]
 pub const DEFAULT_KERNEL_CMDLINE: &str = "reboot=k panic=-1 panic_print=0 nomodule console=hvc0 \
                                           rootfstype=virtiofs rw quiet no_timer_check";

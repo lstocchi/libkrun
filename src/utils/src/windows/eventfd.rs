@@ -65,11 +65,12 @@ impl EventFd {
     pub fn write(&self, v: u64) -> result::Result<(), io::Error> {
         let mut counter = self.inner.counter.lock().unwrap();
 
-        let was_zero = *counter == 0;
+        //let was_zero = *counter == 0;
         *counter = counter.saturating_add(v);
 
         // Only signal the event if it was not already signaled.
-        if was_zero && unsafe { SetEvent(self.inner.event) } == 0 {
+        //if was_zero && unsafe { SetEvent(self.inner.event) } == 0 {
+        if unsafe { SetEvent(self.inner.event) } == 0 {
             return Err(io::Error::last_os_error());
         }
         Ok(())

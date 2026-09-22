@@ -11,9 +11,33 @@ use std::sync::Arc;
 use log::{debug, error};
 use windows_sys::Win32::Foundation::S_OK;
 use windows_sys::Win32::System::Hypervisor::{
-    WHV_CAPABILITY, WHV_EMULATOR_CALLBACKS, WHV_EMULATOR_STATUS, WHV_MEMORY_ACCESS_CONTEXT, WHV_PARTITION_HANDLE, WHV_PARTITION_PROPERTY, WHV_PARTITION_PROPERTY_CODE, WHV_PROCESSOR_FEATURES_BANKS, WHV_REGISTER_NAME, WHV_REGISTER_VALUE, WHV_RUN_VP_EXIT_CONTEXT, WHV_SYNTHETIC_PROCESSOR_FEATURES_BANKS, WHV_VP_EXIT_CONTEXT, WHV_X64_CPUID_RESULT, WHV_X64_IO_PORT_ACCESS_CONTEXT, WHvCancelRunVirtualProcessor, WHvCapabilityCodeHypervisorPresent, WHvCapabilityCodeProcessorFeaturesBanks, WHvCapabilityCodeSyntheticProcessorFeaturesBanks, WHvCreatePartition, WHvCreateVirtualProcessor, WHvDeletePartition, WHvDeleteVirtualProcessor, WHvEmulatorCreateEmulator, WHvEmulatorDestroyEmulator, WHvEmulatorTryIoEmulation, WHvEmulatorTryMmioEmulation, WHvGetCapability, WHvGetVirtualProcessorRegisters, WHvMapGpaRange, WHvMapGpaRangeFlagExecute, WHvMapGpaRangeFlagRead, WHvMapGpaRangeFlagWrite, WHvPartitionPropertyCodeCpuidResultList, WHvPartitionPropertyCodeLocalApicEmulationMode, WHvPartitionPropertyCodeProcessorCount, WHvPartitionPropertyCodeProcessorFeaturesBanks, WHvPartitionPropertyCodeSyntheticProcessorFeaturesBanks, WHvRequestInterrupt, WHvRunVirtualProcessor, WHvRunVpExitReasonCanceled, WHvRunVpExitReasonInvalidVpRegisterValue, WHvRunVpExitReasonMemoryAccess, WHvRunVpExitReasonUnrecoverableException, WHvRunVpExitReasonUnsupportedFeature, WHvRunVpExitReasonX64ApicEoi, WHvRunVpExitReasonX64Cpuid, WHvRunVpExitReasonX64Halt, WHvRunVpExitReasonX64InterruptWindow, WHvRunVpExitReasonX64IoPortAccess, WHvRunVpExitReasonX64MsrAccess, WHvSetPartitionProperty, WHvSetVirtualProcessorRegisters, WHvSetupPartition, WHvX64LocalApicEmulationModeXApic, WHvX64RegisterDeliverabilityNotifications, WHvX64RegisterRax, WHvX64RegisterRbx, WHvX64RegisterRcx, WHvX64RegisterRdx, WHvX64RegisterRip,
+    WHV_CAPABILITY, WHV_EMULATOR_CALLBACKS, WHV_EMULATOR_STATUS, WHV_MEMORY_ACCESS_CONTEXT,
+    WHV_PARTITION_HANDLE, WHV_PARTITION_PROPERTY, WHV_PARTITION_PROPERTY_CODE,
+    WHV_PROCESSOR_FEATURES_BANKS, WHV_REGISTER_NAME, WHV_REGISTER_VALUE, WHV_RUN_VP_EXIT_CONTEXT,
+    WHV_SYNTHETIC_PROCESSOR_FEATURES_BANKS, WHV_VP_EXIT_CONTEXT, WHV_X64_CPUID_RESULT,
+    WHV_X64_IO_PORT_ACCESS_CONTEXT, WHvCancelRunVirtualProcessor,
+    WHvCapabilityCodeHypervisorPresent, WHvCapabilityCodeProcessorFeaturesBanks,
+    WHvCapabilityCodeSyntheticProcessorFeaturesBanks, WHvCreatePartition,
+    WHvCreateVirtualProcessor, WHvDeletePartition, WHvDeleteVirtualProcessor,
+    WHvEmulatorCreateEmulator, WHvEmulatorDestroyEmulator, WHvEmulatorTryIoEmulation,
+    WHvEmulatorTryMmioEmulation, WHvGetCapability, WHvGetVirtualProcessorRegisters, WHvMapGpaRange,
+    WHvMapGpaRangeFlagExecute, WHvMapGpaRangeFlagRead, WHvMapGpaRangeFlagWrite,
+    WHvPartitionPropertyCodeCpuidResultList, WHvPartitionPropertyCodeLocalApicEmulationMode,
+    WHvPartitionPropertyCodeProcessorCount, WHvPartitionPropertyCodeProcessorFeaturesBanks,
+    WHvPartitionPropertyCodeSyntheticProcessorFeaturesBanks, WHvRequestInterrupt,
+    WHvRunVirtualProcessor, WHvRunVpExitReasonCanceled, WHvRunVpExitReasonInvalidVpRegisterValue,
+    WHvRunVpExitReasonMemoryAccess, WHvRunVpExitReasonUnrecoverableException,
+    WHvRunVpExitReasonUnsupportedFeature, WHvRunVpExitReasonX64Cpuid, WHvRunVpExitReasonX64Halt,
+    WHvRunVpExitReasonX64InterruptWindow, WHvRunVpExitReasonX64IoPortAccess,
+    WHvRunVpExitReasonX64MsrAccess, WHvSetPartitionProperty, WHvSetVirtualProcessorRegisters,
+    WHvSetupPartition, WHvX64LocalApicEmulationModeXApic,
+    WHvX64RegisterDeliverabilityNotifications, WHvX64RegisterRax, WHvX64RegisterRbx,
+    WHvX64RegisterRcx, WHvX64RegisterRdx, WHvX64RegisterRip,
 };
 use windows_sys::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
+
+#[repr(C, align(16))]
+struct AlignedRegisterValues<const N: usize>(pub [WHV_REGISTER_VALUE; N]);
 
 #[derive(Debug)]
 pub enum Error {
@@ -223,6 +247,7 @@ pub struct MsrExitInfo {
 
 pub struct WhpVm {
     handle: WHV_PARTITION_HANDLE,
+    vcpu_count: u32,
 }
 
 #[repr(C)]
@@ -291,7 +316,7 @@ impl WhpVm {
         }
 
         debug!("WHP partition created with {vcpu_count} vCPU(s)");
-        Ok(WhpVm { handle })
+        Ok(WhpVm { handle, vcpu_count })
     }
 
     fn configure_partition(
@@ -573,6 +598,19 @@ impl WhpVm {
         if hr != S_OK {
             Err(Error::RequestInterrupt(hr))
         } else {
+            // WHP does not wake a processor blocked in HLT merely because an
+            // interrupt was queued. Canceling the run makes it re-enter WHP,
+            // where the pending LAPIC interrupt can be delivered.
+            if matches!(req.destination_mode, InterruptDestinationMode::Physical)
+                && !matches!(req.interrupt_type, InterruptType::LowestPriority)
+                && req.destination < self.vcpu_count
+            {
+                self.cancel_vcpu(req.destination);
+            } else {
+                for vp_index in 0..self.vcpu_count {
+                    self.cancel_vcpu(vp_index);
+                }
+            }
             Ok(())
         }
     }
@@ -682,23 +720,11 @@ impl WhpEmulator {
         vp_context: *const WHV_VP_EXIT_CONTEXT,
         io_context: *const WHV_X64_IO_PORT_ACCESS_CONTEXT,
     ) -> Result<(), Error> {
-        let io_ctx = unsafe { &*io_context };
-        let is_write = unsafe { io_ctx.AccessInfo.Anonymous._bitfield } & 1;
-        eprintln!(
-            "I/O Port access: Port=0x{:04x}, Write={}",
-            io_ctx.PortNumber,
-            is_write // 1 = Write, 0 = Read
-        );
         let mut status: WHV_EMULATOR_STATUS = unsafe { mem::zeroed() };
         let hr = unsafe {
             WHvEmulatorTryIoEmulation(self.handle, context, vp_context, io_context, &mut status)
         };
-        let res = Self::check_emulation_result(hr, status, Error::IoEmulation);
-        if let Err(Error::EmulationFailed(bits)) = res {
-            debug!("IO Emulation unhandled for port access (status 0x{bits:08x})");
-            return Err(Error::EmulationFailed(bits));
-        }
-        res
+        Self::check_emulation_result(hr, status, Error::IoEmulation)
     }
 
     /// Attempts to emulate an x86 Memory-Mapped I/O (MMIO) instruction (e.g., `MOV eax, [mem]`).
@@ -746,7 +772,6 @@ pub enum VcpuExitReason {
     UnrecoverableException,
     InvalidVpRegisterValue,
     UnsupportedFeature,
-    ApicEoi,
     Unknown(u32),
 }
 
@@ -755,21 +780,6 @@ pub struct WhpVcpu {
     index: u32,
     exit_context: WHV_RUN_VP_EXIT_CONTEXT,
 }
-
-/*
-WHP API requires virtual processor register structures to be 16-byte aligned in memory.
-
-However, Rust's `windows-sys` metadata generator drops the DECLSPEC_ALIGN(16) attribute,
-causing `WHV_REGISTER_VALUE` to default to an 8-byte alignment.
-As a result, stack-allocated arrays `[WHV_REGISTER_VALUE; N]` can land on
-8-byte boundaries, triggering alignment faults or access violations in
-`winhvplatform.dll`.
-
-To fix this, we use a wrapper struct `AlignedRegisterValues<T>` to
-guarantee proper 16-byte stack alignment.
-*/
-#[repr(C, align(16))]
-struct AlignedRegisterValues<T>(T);
 
 impl WhpVcpu {
     /// Creates a new virtual processor within the given partition.
@@ -861,12 +871,6 @@ impl WhpVcpu {
         self.set_registers64([(WHvX64RegisterRip, new_rip)])
     }
 
-    /// Completes a port I/O read and advances RIP atomically.
-    pub fn complete_io_read(&self, rax: u64) -> Result<(), Error> {
-        let new_rip = self.exit_context.VpContext.Rip + self.instruction_length() as u64;
-        self.set_registers64([(WHvX64RegisterRax, rax), (WHvX64RegisterRip, new_rip)])
-    }
-
     /// Sets RAX, RBX, RCX, RDX and advances RIP in a single register write.
     /// Used by CPUID exit handling.
     pub fn complete_cpuid(&self, eax: u64, ebx: u64, ecx: u64, edx: u64) -> Result<(), Error> {
@@ -899,7 +903,7 @@ impl WhpVcpu {
         names: [WHV_REGISTER_NAME; N],
     ) -> Result<[WHV_REGISTER_VALUE; N], Error> {
         // Create a 16-byte aligned zeroed array on the stack
-        let mut values = AlignedRegisterValues(unsafe { mem::zeroed::<[WHV_REGISTER_VALUE; N]>() });
+        let mut aligned_values = AlignedRegisterValues(unsafe { mem::zeroed::<[WHV_REGISTER_VALUE; N]>() });
 
         let hr = unsafe {
             WHvGetVirtualProcessorRegisters(
@@ -907,7 +911,7 @@ impl WhpVcpu {
                 self.index,
                 names.as_ptr(),
                 N as u32,
-                values.0.as_mut_ptr(),
+                aligned_values.0.as_mut_ptr(),
             )
         };
 
@@ -915,7 +919,7 @@ impl WhpVcpu {
             Err(Error::GetRegisters(hr))
         } else {
             // Return the array directly!
-            Ok(values.0)
+            Ok(aligned_values.0)
         }
     }
 
@@ -956,14 +960,14 @@ impl WhpVcpu {
         pairs: [(WHV_REGISTER_NAME, WHV_REGISTER_VALUE); N],
     ) -> Result<(), Error> {
         let mut names: [WHV_REGISTER_NAME; N] = unsafe { mem::zeroed() };
-        let mut values = AlignedRegisterValues(unsafe { mem::zeroed::<[WHV_REGISTER_VALUE; N]>() });
+        let mut aligned_values = AlignedRegisterValues(unsafe { mem::zeroed::<[WHV_REGISTER_VALUE; N]>() });
 
         for i in 0..N {
             names[i] = pairs[i].0;
-            values.0[i] = pairs[i].1;
+            aligned_values.0[i] = pairs[i].1;
         }
 
-        self.set_whp_registers(&names, &values.0)
+        self.set_whp_registers(&names, &aligned_values.0)
     }
 
     pub fn set_registers64<const N: usize>(
@@ -971,14 +975,14 @@ impl WhpVcpu {
         pairs: [(WHV_REGISTER_NAME, u64); N],
     ) -> Result<(), Error> {
         let mut names: [WHV_REGISTER_NAME; N] = unsafe { mem::zeroed() };
-        let mut values = AlignedRegisterValues(unsafe { mem::zeroed::<[WHV_REGISTER_VALUE; N]>() });
+        let mut aligned_values = AlignedRegisterValues(unsafe { mem::zeroed::<[WHV_REGISTER_VALUE; N]>() });
 
         for i in 0..N {
             names[i] = pairs[i].0;
-            values.0[i].Reg64 = pairs[i].1;
+            aligned_values.0[i].Reg64 = pairs[i].1;
         }
 
-        self.set_whp_registers(&names, &values.0)
+        self.set_whp_registers(&names, &aligned_values.0)
     }
 
     pub fn vm(&self) -> &Arc<WhpVm> {
@@ -1021,7 +1025,6 @@ impl WhpVcpu {
             WHvRunVpExitReasonUnrecoverableException => VcpuExitReason::UnrecoverableException,
             WHvRunVpExitReasonInvalidVpRegisterValue => VcpuExitReason::InvalidVpRegisterValue,
             WHvRunVpExitReasonUnsupportedFeature => VcpuExitReason::UnsupportedFeature,
-            WHvRunVpExitReasonX64ApicEoi => VcpuExitReason::ApicEoi,
             _ => VcpuExitReason::Unknown(ctx.ExitReason as u32),
         }
     }

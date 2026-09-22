@@ -132,6 +132,61 @@ impl Vm {
     pub fn whp_vm(&self) -> &Arc<WhpVm> {
         &self.whp_vm
     }
+
+    pub fn add_mapping(
+        &self,
+        reply_sender: crossbeam_channel::Sender<bool>,
+        host_addr: u64,
+        guest_addr: u64,
+        len: u64,
+    ) {
+        eprintln!("add_mapping: host_addr={host_addr:x}, guest_addr={guest_addr:x}, len={len}");
+
+        // Align host_addr and guest_addr down to 4KB boundary
+        let aligned_host = host_addr & !0xFFF;
+        let aligned_guest = guest_addr & !0xFFF;
+
+        // Calculate how many bytes were shaved off by rounding down the start address
+        let offset = host_addr - aligned_host;
+
+        // Align length up to cover the full page range
+        let aligned_len = (len + offset + 0xFFF) & !0xFFF;
+
+        // Best-effort unmap on the page-aligned range
+        let _ = self.whp_vm.unmap_memory(aligned_guest, aligned_len);
+
+        let map_result = unsafe {
+            self.whp_vm
+                .map_memory(aligned_host as *mut c_void, aligned_guest, aligned_len)
+        };
+
+        if let Err(e) = map_result {
+            eprintln!("Error adding memory map: {e}");
+            reply_sender.send(false).unwrap();
+        } else {
+            reply_sender.send(true).unwrap();
+        }
+    }
+
+    pub fn remove_mapping(
+        &self,
+        reply_sender: crossbeam_channel::Sender<bool>,
+        guest_addr: u64,
+        len: u64,
+    ) {
+        eprintln!("remove_mapping: guest_addr={guest_addr:x}, len={len}");
+
+        let aligned_guest = guest_addr & !0xFFF;
+        let offset = guest_addr - aligned_guest;
+        let aligned_len = (len + offset + 0xFFF) & !0xFFF;
+
+        if let Err(e) = self.whp_vm.unmap_memory(aligned_guest, aligned_len) {
+            eprintln!("Error removing memory map: {e}");
+            reply_sender.send(false).unwrap();
+        } else {
+            reply_sender.send(true).unwrap();
+        }
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -360,12 +415,6 @@ impl Vcpu {
             arch::x86_64::regs::setup_sregs(guest_mem, &self.whp_vcpu)
                 .map_err(Error::SREGSConfiguration)?;
             arch::x86_64::msr::setup_msrs(&self.whp_vcpu).map_err(Error::MSRSConfiguration)?;
-        } else {
-            arch::x86_64::regs::setup_firmware_regs(
-                &self.whp_vcpu,
-                kernel_start_addr.raw_value(),
-            )
-            .map_err(Error::REGSConfiguration)?;
         }
 
         Ok(())
@@ -466,79 +515,16 @@ impl Vcpu {
 
         let result = match reason {
             VcpuExitReason::IoPortAccess => {
-                use windows_sys::Win32::System::Hypervisor::WHvX64RegisterRax;
-                let io_ctx = unsafe { &*self.whp_vcpu.io_port_access_context() };
-                let access_info = unsafe { io_ctx.AccessInfo.Anonymous._bitfield };
-                let is_write = access_info & 1 != 0;
-                let access_size = ((access_info >> 1) & 7) as usize;
-                let is_string = access_info & (1 << 4) != 0;
-
-                if !is_string {
-                    let mut data = io_ctx.Rax.to_le_bytes();
-                    if is_write {
-                        
-                            let val = data[0];
-                            
-                                eprint!("{}", val as char);
-                            
-                        
-
-                        self.io_bus.write(
-                            self.cpu_index() as u64,
-                            io_ctx.PortNumber as u64,
-                            &data[..access_size],
-                        );
-                        self.whp_vcpu.advance_rip().map_err(Error::Emulation)?;
-                    } else {
-                        data.fill(0);
-                        self.io_bus.read(
-                            self.cpu_index() as u64,
-                            io_ctx.PortNumber as u64,
-                            &mut data[..access_size],
-                        );
-                        let value = u64::from_le_bytes(data);
-                        let rax = match access_size {
-                            1 => (io_ctx.Rax & !0xff) | value,
-                            2 => (io_ctx.Rax & !0xffff) | value,
-                            4 => value,
-                            _ => return Err(Error::VcpuUnhandledExit),
-                        };
-                        self.whp_vcpu
-                            .complete_io_read(rax)
-                            .map_err(Error::Emulation)?;
-                    }
-                    return Ok(VcpuEmulation::Handled);
-                }
-
                 let ctx = self.callback_context(&self.io_bus as *const devices::Bus);
-                let emulation_res = unsafe {
+                unsafe {
                     self.emulator
                         .try_io_emulation(
                             &ctx as *const _ as *const c_void,
                             self.whp_vcpu.vp_exit_context(),
                             self.whp_vcpu.io_port_access_context(),
                         )
-                };
-
-                if let Err(_e) = emulation_res {
-                    debug!(
-                        "Unhandled I/O Port 0x{:04x} (Write={}); advancing RIP",
-                        io_ctx.PortNumber, is_write
-                    );
-
-                    if !is_write {
-                        // For reads (IN), return 0xFFFFFFFF to the guest so it doesn't hang waiting on a bit flag
-                        if let Err(set_err) = self.whp_vcpu.set_registers64([(WHvX64RegisterRax, 0xFFFF_FFFF)]) {
-                            error!("Failed to set RAX for unhandled I/O read: {:?}", set_err);
-                        }
-                    }
-
-                    if let Err(adv_err) = self.whp_vcpu.advance_rip() {
-                        error!("Failed to advance RIP after unhandled I/O exit: {:?}", adv_err);
-                        return Err(Error::VcpuUnhandledExit);
-                    }
+                        .map_err(Error::Emulation)?;
                 }
-
                 Ok(VcpuEmulation::Handled)
             }
             VcpuExitReason::MemoryAccess => {
@@ -547,28 +533,15 @@ impl Vcpu {
                     .as_ref()
                     .map_or(std::ptr::null(), |b| b as *const devices::Bus);
                 let ctx = self.callback_context(bus);
-                let emulation_res = unsafe {
+                unsafe {
                     self.emulator
                         .try_mmio_emulation(
                             &ctx as *const _ as *const c_void,
                             self.whp_vcpu.vp_exit_context(),
                             self.whp_vcpu.memory_access_context(),
                         )
-                    };
-
-                if let Err(_e) = emulation_res {
-                    let mmio_ctx = unsafe { &*self.whp_vcpu.memory_access_context() };
-                    debug!(
-                        "Unhandled MMIO at GPA 0x{:08x}; advancing RIP",
-                        mmio_ctx.Gpa
-                    );
-
-                    if let Err(adv_err) = self.whp_vcpu.advance_rip() {
-                        error!("Failed to advance RIP after unhandled MMIO exit: {:?}", adv_err);
-                        return Err(Error::VcpuUnhandledExit);
-                    }
+                        .map_err(Error::Emulation)?;
                 }
-
                 Ok(VcpuEmulation::Handled)
             }
             VcpuExitReason::Halt => {
@@ -603,9 +576,6 @@ impl Vcpu {
                 if rflags[0] & 0x200 != 0 {
                     let _ = self.whp_vcpu.clear_interrupt_window();
                 }
-                Ok(VcpuEmulation::Handled)
-            }
-            VcpuExitReason::ApicEoi => {
                 Ok(VcpuEmulation::Handled)
             }
             _ => {

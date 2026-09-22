@@ -80,29 +80,6 @@ impl BusDevice for PcControlPorts {
     }
 }
 
-#[cfg(windows)]
-struct DebugPort(Vec<u8>);
-
-#[cfg(windows)]
-impl BusDevice for DebugPort {
-    fn read(&mut self, _vcpuid: u64, _offset: u64, data: &mut [u8]) {
-        if data.len() == 1 {
-            // Advertise the Bochs-compatible debug console expected by OVMF.
-            data[0] = 0xe9;
-        }
-    }
-
-    fn write(&mut self, _vcpuid: u64, _offset: u64, data: &[u8]) {
-        self.0.extend_from_slice(data);
-        while let Some(newline) = self.0.iter().position(|byte| *byte == b'\n') {
-            let line = self.0.drain(..=newline).collect::<Vec<_>>();
-            if let Ok(text) = std::str::from_utf8(&line) {
-                debug!("firmware: {}", text.trim_end());
-            }
-        }
-    }
-}
-
 impl PortIODeviceManager {
     /// Create a new DeviceManager handling legacy devices (uart, i8042).
     pub fn new(
@@ -155,26 +132,9 @@ impl PortIODeviceManager {
             .insert(self.cmos.clone(), 0x70, 0x8)
             .map_err(Error::BusError)?;
 
-        #[cfg(windows)]
-        self.io_bus
-            .insert(Arc::new(Mutex::new(DebugPort(Vec::new()))), 0x402, 0x1)
-            .map_err(Error::BusError)?;
-
         if let Some(serial) = self.stdio_serial.first() {
             self.io_bus
                 .insert(serial.clone(), 0x3f8, 0x8)
-                .map_err(Error::BusError)?;
-        }
-        #[cfg(windows)]
-        if self.stdio_serial.is_empty() {
-            self.io_bus
-                .insert(
-                    Arc::new(Mutex::new(devices::legacy::Serial::new_sink(
-                        self.com_evt_1.try_clone().map_err(Error::EventFd)?,
-                    ))),
-                    0x3f8,
-                    0x8,
-                )
                 .map_err(Error::BusError)?;
         }
         self.io_bus

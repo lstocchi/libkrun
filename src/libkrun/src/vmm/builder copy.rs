@@ -73,7 +73,6 @@ use flate2::read::GzDecoder;
 #[cfg(feature = "amd-sev")]
 use kvm_bindings::KVM_MAX_CPUID_ENTRIES;
 #[cfg(target_arch = "x86_64")]
-#[cfg(not(target_os = "windows"))]
 use linux_loader::loader::{self, KernelLoader};
 #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
 use polly::event_manager::Subscriber;
@@ -123,7 +122,6 @@ pub enum StartMicrovmError {
     /// Cannot open the file containing the kernel code.
     ElfOpenKernel(io::Error),
     /// Cannot load the kernel into the VM.
-    #[cfg(not(target_os = "windows"))]
     ElfLoadKernel(linux_loader::loader::Error),
     /// The firmware can't be loaded into the provided memory address.
     FirmwareInvalidAddress(vm_memory::GuestMemoryError),
@@ -136,7 +134,6 @@ pub enum StartMicrovmError {
     /// Cannot find compressed kernel in file.
     ImageBz2Invalid,
     /// Cannot load the kernel from the uncompressed ELF data.
-    #[cfg(not(target_os = "windows"))]
     ImageBz2LoadKernel(linux_loader::loader::Error),
     /// Cannot open the file containing the kernel code.
     ImageBz2OpenKernel(io::Error),
@@ -145,7 +142,6 @@ pub enum StartMicrovmError {
     /// Cannot find compressed kernel in file.
     ImageGzInvalid,
     /// Cannot load the kernel from the uncompressed ELF data.
-    #[cfg(not(target_os = "windows"))]
     ImageGzLoadKernel(linux_loader::loader::Error),
     /// Cannot open the file containing the kernel code.
     ImageGzOpenKernel(io::Error),
@@ -154,7 +150,6 @@ pub enum StartMicrovmError {
     /// Cannot find compressed kernel in file.
     ImageZstdInvalid,
     /// Cannot load the kernel from the uncompressed ELF data.
-    #[cfg(not(target_os = "windows"))]
     ImageZstdLoadKernel(linux_loader::loader::Error),
     /// Cannot open the file containing the kernel code.
     ImageZstdOpenKernel(io::Error),
@@ -271,7 +266,6 @@ impl Display for StartMicrovmError {
             ElfOpenKernel(ref err) => {
                 write!(f, "Cannot open the file containing the kernel code: {err}")
             }
-            #[cfg(not(target_os = "windows"))]
             ElfLoadKernel(ref err) => {
                 write!(f, "Cannot load the kernel into the VM: {err}")
             }
@@ -296,7 +290,6 @@ impl Display for StartMicrovmError {
             ImageBz2Invalid => {
                 write!(f, "Cannot find compressed kernel in file.")
             }
-            #[cfg(not(target_os = "windows"))]
             ImageBz2LoadKernel(ref err) => {
                 write!(
                     f,
@@ -312,7 +305,6 @@ impl Display for StartMicrovmError {
             ImageGzInvalid => {
                 write!(f, "Cannot find compressed kernel in file.")
             }
-            #[cfg(not(target_os = "windows"))]
             ImageGzLoadKernel(ref err) => {
                 write!(
                     f,
@@ -328,7 +320,6 @@ impl Display for StartMicrovmError {
             ImageZstdInvalid => {
                 write!(f, "Cannot find compressed kernel in file.")
             }
-            #[cfg(not(target_os = "windows"))]
             ImageZstdLoadKernel(ref err) => {
                 write!(
                     f,
@@ -557,7 +548,6 @@ pub enum Payload {
         target_os = "windows"
     ))]
     KernelCopy,
-    #[cfg(not(target_os = "windows"))]
     ExternalKernel(ExternalKernel),
     #[cfg(test)]
     Empty,
@@ -594,11 +584,8 @@ pub fn choose_payload(vm_resources: &VmResources) -> Result<Payload, StartMicrov
             target_os = "windows"
         ))]
         return Ok(Payload::KernelCopy);
-    } else if let Some(_external_kernel) = vm_resources.external_kernel() {
-        #[cfg(not(target_os = "windows"))]
-        return Ok(Payload::ExternalKernel(_external_kernel.clone()));
-        #[cfg(target_os = "windows")]
-        unreachable!()
+    } else if let Some(external_kernel) = vm_resources.external_kernel() {
+        Ok(Payload::ExternalKernel(external_kernel.clone()))
     } else if vm_resources.firmware_config.is_some() {
         Ok(Payload::Firmware)
     } else {
@@ -1388,7 +1375,6 @@ pub fn build_microvm(
     Ok(vmm)
 }
 
-#[cfg(not(target_os = "windows"))]
 fn load_external_kernel(
     guest_mem: &GuestMemoryMmap,
     arch_mem_info: &ArchMemoryInfo,
@@ -1721,7 +1707,6 @@ pub fn load_payload(
                 pvh: false,
             })
         }
-        #[cfg(not(target_os = "windows"))]
         Payload::ExternalKernel(external_kernel) => {
             let (entry_addr, initrd_config, cmdline, pvh) =
                 load_external_kernel(&guest_mem, _arch_mem_info, external_kernel)?;
@@ -1841,7 +1826,7 @@ pub fn create_guest_memory(
 
     #[cfg(target_arch = "x86_64")]
     let (mut arch_mem_info, mut arch_mem_regions) = match payload {
-        #[cfg(not(any(feature = "tee", target_os = "windows")))]
+        #[cfg(not(any(feature = "tee", target_os = "windows")))]        
         Payload::KernelMmap => {
             let (kernel_guest_addr, kernel_size) = if let Some(kernel_bundle) = kernel_bundle {
                 (kernel_bundle.guest_addr, kernel_bundle.size)
@@ -1850,7 +1835,6 @@ pub fn create_guest_memory(
             };
             arch::arch_memory_regions(mem_size, Some(kernel_guest_addr), kernel_size, 0, None)
         }
-        #[cfg(not(target_os = "windows"))]
         Payload::ExternalKernel(external_kernel) => {
             #[cfg(not(feature = "tee"))]
             let fw = _firmware_size;
@@ -1992,7 +1976,9 @@ pub fn create_guest_memory(
         payload,
     )?;
 
-    if matches!(payload, Payload::Firmware)
+    // Only write firmware if data exists AND this isn't an ExternalKernel payload
+    // (ExternalKernel does direct kernel boot and doesn't use EFI firmware)
+    if !matches!(payload, Payload::ExternalKernel(_))
         && let Some(firmware_data) = firmware_data.as_ref()
     {
         guest_mem
