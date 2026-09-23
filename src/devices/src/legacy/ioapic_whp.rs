@@ -17,8 +17,8 @@ use utils::eventfd::EventFd;
 
 use super::ioapic::{
     IOAPIC_DM_EXTINT, IOAPIC_DM_MASK, IOAPIC_LVT_DELIV_MODE_SHIFT, IOAPIC_LVT_DEST_MODE_SHIFT,
-    IOAPIC_LVT_MASKED_SHIFT, IOAPIC_LVT_REMOTE_IRR, IOAPIC_LVT_TRIGGER_MODE_SHIFT, IOAPIC_NUM_PINS,
-    IOAPIC_TRIGGER_EDGE, IOAPIC_VECTOR_MASK, IoApicBackend, IoApicRegs, Ioapic,
+    IOAPIC_LVT_MASKED_SHIFT, IOAPIC_NUM_PINS, IOAPIC_VECTOR_MASK, IoApicBackend, IoApicRegs,
+    Ioapic,
 };
 
 const IOAPIC_LVT_DEST_IDX_SHIFT: u64 = 56;
@@ -43,7 +43,6 @@ impl WhpIoapicBackend {
             let vector = (entry & IOAPIC_VECTOR_MASK) as u32;
             let dest = ((entry >> IOAPIC_LVT_DEST_IDX_SHIFT) & 0xff) as u32;
             let dest_mode = ((entry >> IOAPIC_LVT_DEST_MODE_SHIFT) & 1) as u8;
-            let trigger = (entry >> IOAPIC_LVT_TRIGGER_MODE_SHIFT) & 1;
             let deliv_mode = ((entry >> IOAPIC_LVT_DELIV_MODE_SHIFT) & IOAPIC_DM_MASK) as u8;
 
             if deliv_mode as u64 == IOAPIC_DM_EXTINT {
@@ -51,17 +50,7 @@ impl WhpIoapicBackend {
                 continue;
             }
 
-            if trigger == IOAPIC_TRIGGER_EDGE {
-                regs.irr &= !mask;
-            } else {
-                if entry & IOAPIC_LVT_REMOTE_IRR != 0 {
-                    continue;
-                }
-                regs.ioredtbl[i] |= IOAPIC_LVT_REMOTE_IRR;
-                // Clear IRR to prevent infinite interrupt storms since we don't
-                // have a mechanism to track line de-assertion for level-triggered IRQs.
-                regs.irr &= !mask;
-            }
+            regs.irr &= !mask;
 
             let req = InterruptRequest {
                 interrupt_type: match deliv_mode {
@@ -76,15 +65,17 @@ impl WhpIoapicBackend {
                 } else {
                     InterruptDestinationMode::Logical
                 },
-                trigger_mode: if trigger == IOAPIC_TRIGGER_EDGE {
-                    InterruptTriggerMode::Edge
-                } else {
-                    InterruptTriggerMode::Level
-                },
+                // WHvRequestInterrupt injects directly into the LAPIC and
+                // provides no deassert operation, so each delivery is a
+                // pulse even when ACPI describes the source as level-triggered.
+                trigger_mode: InterruptTriggerMode::Edge,
                 destination: dest,
                 vector,
             };
 
+            log::trace!(
+                "ioapic: inject IRQ {i}, vector {vector:#x}, destination {dest}, mode {dest_mode}"
+            );
             if let Err(e) = vm.request_interrupt(&req) {
                 error!("ioapic: WHvRequestInterrupt failed for pin {i}: {e}");
             }
@@ -123,7 +114,18 @@ impl IoApicBackend for WhpIoapicBackend {
 
         regs.irr |= 1 << irq;
         Self::service(regs, &self.vm);
-        self.vm.cancel_vcpu(0);
+        Ok(())
+    }
+
+    fn clear_irq(&mut self, irq: u32, regs: &mut IoApicRegs) -> Result<(), DeviceError> {
+        if irq as usize >= IOAPIC_NUM_PINS {
+            return Err(DeviceError::FailedSignalingUsedQueue(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("IRQ {irq} out of IOAPIC pin range"),
+            )));
+        }
+
+        regs.irr &= !(1 << irq);
         Ok(())
     }
 }
@@ -131,7 +133,7 @@ impl IoApicBackend for WhpIoapicBackend {
 pub type WhpIoapic = Ioapic<WhpIoapicBackend>;
 
 impl Ioapic<WhpIoapicBackend> {
-    pub fn new(vm: Arc<WhpVm>) -> Self {
-        Ioapic::from_backend(WhpIoapicBackend { vm })
+    pub fn new(vm: Arc<WhpVm>, id: u8) -> Self {
+        Ioapic::from_backend_with_id(WhpIoapicBackend { vm }, id)
     }
 }

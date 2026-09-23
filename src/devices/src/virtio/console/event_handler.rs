@@ -22,7 +22,9 @@ impl Console {
         }
 
         if let Err(e) = self.queue_events[queue_index].read() {
-            error!("Failed to read event from queue index {queue_index}: {e:?}");
+            if e.kind() != ErrorKind::WouldBlock {
+                error!("Failed to read event from queue index {queue_index}: {e:?}");
+            }
             return false;
         }
 
@@ -170,3 +172,4 @@ impl Subscriber for Console {
         ]
     }
 }
+use std::io::ErrorKind;

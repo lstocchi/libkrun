@@ -90,6 +90,10 @@ pub trait IoApicBackend: Send + 'static {
         interrupt_evt: Option<&EventFd>,
         regs: &mut IoApicRegs,
     ) -> Result<(), DeviceError>;
+
+    fn clear_irq(&mut self, _irq_line: u32, _regs: &mut IoApicRegs) -> Result<(), DeviceError> {
+        Ok(())
+    }
 }
 
 struct IoapicInner<B: IoApicBackend> {
@@ -102,13 +106,87 @@ pub struct Ioapic<B: IoApicBackend> {
 }
 
 impl<B: IoApicBackend> Ioapic<B> {
-    pub(super) fn from_backend(backend: B) -> Self {
+    pub(super) fn from_backend_with_id(backend: B, id: u8) -> Self {
         Self {
             inner: Mutex::new(IoapicInner {
-                regs: IoApicRegs::new(),
+                regs: IoApicRegs {
+                    id,
+                    ..IoApicRegs::new()
+                },
                 backend,
             }),
         }
+    }
+
+    fn handle_eoi(&self, vector: u8) {
+        let mut inner = self.inner.lock().unwrap();
+        let IoapicInner { regs, backend } = &mut *inner;
+        let mut cleared = false;
+
+        for entry in &mut regs.ioredtbl {
+            if (*entry & IOAPIC_VECTOR_MASK) as u8 == vector
+                && *entry & IOAPIC_LVT_REMOTE_IRR != 0
+            {
+                *entry &= !IOAPIC_LVT_REMOTE_IRR;
+                cleared = true;
+            }
+        }
+
+        if cleared {
+            backend.on_eoi(regs);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use super::*;
+
+    struct TestBackend {
+        eoi_count: Arc<AtomicUsize>,
+    }
+
+    impl IoApicBackend for TestBackend {
+        fn on_entry_changed(&mut self, _regs: &mut IoApicRegs, _index: usize) {}
+
+        fn on_eoi(&mut self, _regs: &mut IoApicRegs) {
+            self.eoi_count.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn set_irq(
+            &mut self,
+            _irq_line: Option<u32>,
+            _interrupt_evt: Option<&EventFd>,
+            _regs: &mut IoApicRegs,
+        ) -> Result<(), DeviceError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn eoi_clears_remote_irr_for_matching_vector() {
+        let eoi_count = Arc::new(AtomicUsize::new(0));
+        let ioapic = Ioapic::from_backend_with_id(
+            TestBackend {
+                eoi_count: eoi_count.clone(),
+            },
+            1,
+        );
+        let vector = 0x25;
+
+        {
+            let mut inner = ioapic.inner.lock().unwrap();
+            inner.regs.ioredtbl[5] = u64::from(vector) | IOAPIC_LVT_REMOTE_IRR;
+        }
+
+        IrqChipT::eoi(&ioapic, vector);
+
+        let inner = ioapic.inner.lock().unwrap();
+        assert_eq!(inner.regs.ioredtbl[5] & IOAPIC_LVT_REMOTE_IRR, 0);
+        assert_eq!(eoi_count.load(Ordering::Relaxed), 1);
     }
 }
 
@@ -129,6 +207,16 @@ impl<B: IoApicBackend> IrqChipT for Ioapic<B> {
         let mut inner = self.inner.lock().unwrap();
         let IoapicInner { regs, backend } = &mut *inner;
         backend.set_irq(irq_line, interrupt_evt, regs)
+    }
+
+    fn clear_irq(&self, irq_line: u32) -> Result<(), DeviceError> {
+        let mut inner = self.inner.lock().unwrap();
+        let IoapicInner { regs, backend } = &mut *inner;
+        backend.clear_irq(irq_line, regs)
+    }
+
+    fn eoi(&self, vector: u8) {
+        self.handle_eoi(vector)
     }
 }
 

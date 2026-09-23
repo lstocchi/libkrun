@@ -223,6 +223,7 @@ pub struct MsrExitInfo {
 
 pub struct WhpVm {
     handle: WHV_PARTITION_HANDLE,
+    vcpu_count: u32,
 }
 
 #[repr(C)]
@@ -291,7 +292,7 @@ impl WhpVm {
         }
 
         debug!("WHP partition created with {vcpu_count} vCPU(s)");
-        Ok(WhpVm { handle })
+        Ok(WhpVm { handle, vcpu_count })
     }
 
     fn configure_partition(
@@ -573,6 +574,25 @@ impl WhpVm {
         if hr != S_OK {
             Err(Error::RequestInterrupt(hr))
         } else {
+            debug!(
+                "WHP: queued interrupt vector {:#x} for destination {}",
+                req.vector,
+                req.destination
+            );
+            // WHP queues the LAPIC interrupt but does not wake a vCPU blocked
+            // in WHvRunVirtualProcessor. Cancel the target run so it re-enters
+            // WHP and accepts the pending interrupt.
+            if matches!(req.destination_mode, InterruptDestinationMode::Physical)
+                && !matches!(req.interrupt_type, InterruptType::LowestPriority)
+                && req.destination < self.vcpu_count
+            {
+                self.cancel_vcpu(req.destination);
+            } else {
+                // Logical and lowest-priority delivery can select any vCPU.
+                for vp_index in 0..self.vcpu_count {
+                    self.cancel_vcpu(vp_index);
+                }
+            }
             Ok(())
         }
     }
@@ -684,11 +704,11 @@ impl WhpEmulator {
     ) -> Result<(), Error> {
         let io_ctx = unsafe { &*io_context };
         let is_write = unsafe { io_ctx.AccessInfo.Anonymous._bitfield } & 1;
-        eprintln!(
+/*         eprintln!(
             "I/O Port access: Port=0x{:04x}, Write={}",
             io_ctx.PortNumber,
             is_write // 1 = Write, 0 = Read
-        );
+        ); */
         let mut status: WHV_EMULATOR_STATUS = unsafe { mem::zeroed() };
         let hr = unsafe {
             WHvEmulatorTryIoEmulation(self.handle, context, vp_context, io_context, &mut status)
@@ -818,6 +838,10 @@ impl WhpVcpu {
 
     pub fn memory_access_context(&self) -> *const WHV_MEMORY_ACCESS_CONTEXT {
         unsafe { &self.exit_context.Anonymous.MemoryAccess }
+    }
+
+    pub fn apic_eoi_vector(&self) -> u8 {
+        unsafe { self.exit_context.Anonymous.ApicEoi.InterruptVector as u8 }
     }
 
     /// Returns parsed CPUID exit info. Only valid after a `CpuidAccess` exit.

@@ -861,6 +861,19 @@ impl<'a> ConsoleBuilder<'a> {
         })
     }
 
+    /// Set up the default console: port 0 (hvc0) plus named redirect ports.
+    ///
+    /// Replicates the v1 `krun_add_virtio_console_default` behaviour:
+    ///
+    /// - If any fd is a terminal, port 0 becomes a full TTY console
+    ///   (raw mode enabled), and that fd is NOT added as a redirect port.
+    /// - Otherwise, port 0 gets log output and named redirect ports
+    ///   (`krun-stdin`, `krun-stdout`, `krun-stderr`) are added.
+    ///
+    /// The stream descriptors are borrowed and must remain open and valid until
+    /// the VMM exits.
+    ///
+    /// Pass `None` to skip a stream.
     pub fn add_default_console(
         &mut self,
         stdin: Option<BorrowedHandle<'a>>,
@@ -871,9 +884,9 @@ impl<'a> ConsoleBuilder<'a> {
         let stdout_is_tty = stdout.as_ref().is_some_and(|fd| fd.is_terminal());
         let stderr_is_tty = stderr.as_ref().is_some_and(|fd| fd.is_terminal());
 
-        let term_handle = if stdin_is_tty {
-            stdin
-        } else if stdout_is_tty {
+        // GetConsoleScreenBufferInfo requires a console screen-buffer handle;
+        // the stdin console handle refers to the input buffer and is invalid here.
+        let term_handle = if stdout_is_tty {
             stdout
         } else if stderr_is_tty {
             stderr
@@ -881,46 +894,32 @@ impl<'a> ConsoleBuilder<'a> {
             None
         };
 
-        let console_input = if stdin_is_tty {
-            if let Some(ref fd) = stdin {
-                Some(
-                    port_io::input_to_handle_dup(fd.as_raw_handle()).map_err(|e| {
-                        log::error!("dup input fd: {e}");
-                        VmmError::BadFd()
-                    })?,
-                )
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+        // ConPTY exposes standard streams as pipes, so IsTerminal is false even
+        // though those streams are the interactive console. The guest's login
+        // console is hvc0, not the named redirect ports used on Unix.
+        let console_input = stdin
+            .as_ref()
+            .map(|fd| {
+                port_io::input_to_handle_dup(fd.as_raw_handle()).map_err(|e| {
+                    log::error!("dup input handle: {e}");
+                    VmmError::BadFd()
+                })
+            })
+            .transpose()?;
 
-        let console_output = if stdout_is_tty {
-            if let Some(ref fd) = stdout {
-                Some(
-                    port_io::output_to_handle_dup(fd.as_raw_handle()).map_err(|e| {
-                        log::error!("dup output fd: {e}");
-                        VmmError::BadFd()
-                    })?,
-                )
-            } else {
-                Some(port_io::output_to_log_as_err())
-            }
-        } else {
-            Some(port_io::output_to_log_as_err())
-        };
+        let console_output = stdout
+            .as_ref()
+            .map(|fd| {
+                port_io::output_to_handle_dup(fd.as_raw_handle()).map_err(|e| {
+                    log::error!("dup output handle: {e}");
+                    VmmError::BadFd()
+                })
+            })
+            .transpose()?
+            .or_else(|| Some(port_io::output_to_log_as_err()));
 
         let terminal: Option<Box<dyn devices::virtio::port_io::PortTerminalProperties>> =
             if let Some(tfd) = term_handle {
-                // SAFETY: The caller guarantees via `'a` that the borrowed file descriptor outlasts
-                // the console device and VMM. Currently, the VMM runs until process termination via `_exit()`,
-                // so the host file descriptor is valid for the remainder of the process.
-                // TODO: remove this transmute once we get proper support for stopping the VMM instead of _exit().
-                let static_fd = unsafe {
-                    std::mem::transmute::<BorrowedHandle<'a>, BorrowedHandle<'static>>(tfd)
-                };
-                self.tty_fds.push(static_fd);
                 Some(port_io::term_handle(tfd.as_raw_handle()).map_err(|e| {
                     log::error!("term fd: {e}");
                     VmmError::BadFd()
@@ -929,6 +928,21 @@ impl<'a> ConsoleBuilder<'a> {
                 Some(port_io::term_fixed_size(0, 0))
             };
 
+        if stdin_is_tty {
+            if let Some(tfd) = stdin {
+                // Raw input mode applies to the console input buffer, not the
+                // screen-buffer handle used above to determine window size.
+                // SAFETY: The caller guarantees via `'a` that the borrowed handle outlasts
+                // the console device and VMM. Currently, the VMM runs until process termination via `_exit()`,
+                // so the host handle is valid for the remainder of the process.
+                // TODO: remove this transmute once we get proper support for stopping the VMM instead of _exit().
+                let static_fd = unsafe {
+                    std::mem::transmute::<BorrowedHandle<'a>, BorrowedHandle<'static>>(tfd)
+                };
+                self.tty_fds.push(static_fd);
+            }
+        }
+
         // Port 0: default console (hvc0)
         self.ports.push(PortDescription {
             name: "".into(),
@@ -936,17 +950,6 @@ impl<'a> ConsoleBuilder<'a> {
             output: console_output,
             terminal,
         });
-
-        // Named redirect ports for non-terminal fds
-        if stdin.is_some() && !stdin_is_tty {
-            self.add_inout_port("krun-stdin", stdin, None)?;
-        }
-        if stdout.is_some() && !stdout_is_tty {
-            self.add_inout_port("krun-stdout", None, stdout)?;
-        }
-        if stderr.is_some() && !stderr_is_tty {
-            self.add_inout_port("krun-stderr", None, stderr)?;
-        }
 
         Ok(())
     }

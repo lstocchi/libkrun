@@ -25,6 +25,8 @@
 //!    `Watch` memory have been drained.
 
 use log::debug;
+use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+use windows_sys::Win32::System::Threading::WaitForSingleObject;
 use std::collections::HashMap;
 use std::io;
 use std::ptr;
@@ -43,7 +45,7 @@ use super::bindings::*;
 use super::{AsRawFd, RawFd};
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT as WAIT_TIMEOUT_CODE,
+    CloseHandle, HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT as WAIT_TIMEOUT_CODE,
 };
 use windows_sys::Win32::System::IO::{
     CreateIoCompletionPort, GetQueuedCompletionStatusEx, OVERLAPPED_ENTRY,
@@ -54,7 +56,7 @@ use windows_sys::Win32::Networking::WinSock::{
     SOCKET_ERROR, WSACleanup, WSACloseEvent, WSACreateEvent, WSADATA, WSAEnumNetworkEvents,
     WSAEventSelect, WSANETWORKEVENTS, WSAStartup,
 };
-use windows_sys::Win32::System::Threading::{INFINITE, WaitForSingleObject};
+use windows_sys::Win32::System::Threading::INFINITE;
 
 // Generic access mask requesting all permissions the caller is allowed.
 // https://learn.microsoft.com/en-us/windows/win32/secauthz/access-mask
@@ -579,21 +581,15 @@ impl Epoll {
                     }
                 }
             } else {
-                // The WCP is one-shot: once it fires, re-arming it while the
-                // handle is still signaled (because the caller hasn't drained
-                // it yet) makes the kernel queue another completion packet
-                // immediately (see the re-associate call below). By the time
-                // that duplicate packet is delivered, the caller may have
-                // already consumed and reset the handle. Re-check the actual
-                // current state here so we don't report a stale/phantom
-                // notification for an event that was already drained.
-                /* let signaled = unsafe { WaitForSingleObject(watch.fd, 0) } == WAIT_OBJECT_0;
+                // Preserve every WCP completion. A manual-reset EventFd can
+                // produce a stale completion after it is drained; consumers
+                // explicitly ignore the resulting WouldBlock read.
+                let signaled = unsafe { WaitForSingleObject(watch.fd, 0) } == WAIT_OBJECT_0;
                 if signaled {
                     ((event_set & (EventSet::IN | EventSet::OUT)).bits(), true)
                 } else {
                     (0, false)
-                } */
-                ((event_set & (EventSet::IN | EventSet::OUT)).bits(), true)
+                }
             };
 
             if should_report {
@@ -874,16 +870,10 @@ mod tests {
         close(ev);
     }
 
-    /// Regression test for the phantom-wakeup race: `wait()` re-arms a
-    /// level-triggered WCP immediately after delivering an event, while the
-    /// handle is *still signaled* (because the caller hasn't drained/reset
-    /// it yet). That eager re-arm causes the kernel to immediately queue a
-    /// second, stale completion packet. If the caller resets the handle
-    /// before that second packet is consumed, `wait()` must NOT report it as
-    /// ready again -- otherwise callers reading an `EFD_NONBLOCK` eventfd
-    /// off the back of it get a spurious `WouldBlock`.
+    /// Re-arming a WCP for a manual-reset event can queue a stale completion.
+    /// EventFd consumers must ignore the resulting `WouldBlock` read.
     #[test]
-    fn test_level_triggered_no_phantom_wakeup_after_reset() {
+    fn test_level_triggered_redelivers_after_reset() {
         let mut epoll = Epoll::new().unwrap();
         let ev = create_event();
         let event = EpollEvent::new(EventSet::IN, ev as u64);
@@ -896,14 +886,11 @@ mod tests {
         assert_eq!(n, 1, "first wait should deliver the real event");
 
         // Simulate the caller draining the corresponding EventFd (which
-        // calls ResetEvent) *before* any stale re-armed packet is consumed.
+        // calls ResetEvent) before the re-armed completion is consumed.
         reset(ev);
 
         let n = epoll.wait(8, 100, &mut ready).unwrap();
-        assert_eq!(
-            n, 0,
-            "must not report a phantom event for a handle that was already reset"
-        );
+        assert_eq!(n, 1, "the re-armed WCP completion is delivered");
 
         epoll
             .ctl(ControlOperation::Delete, ev, &EpollEvent::default())

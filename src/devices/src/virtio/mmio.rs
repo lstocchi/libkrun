@@ -140,12 +140,12 @@ impl InterruptTransport {
     }
 
     pub fn try_signal_used_queue(&self) -> Result<(), crate::Error> {
-        debug!(target: &self.0.log_target, "interrupt: signal_used_queue");
+        // debug!(target: &self.0.log_target, "interrupt: signal_used_queue");
         self.try_signal(VIRTIO_MMIO_INT_VRING)
     }
 
     pub fn try_signal_config_change(&self) -> Result<(), crate::Error> {
-        debug!(target: &self.0.log_target, "interrupt: signal_config_change");
+        // debug!(target: &self.0.log_target, "interrupt: signal_config_change");
         self.try_signal(VIRTIO_MMIO_INT_CONFIG)
     }
 
@@ -158,6 +158,14 @@ impl InterruptTransport {
     pub fn signal_config_change(&self) {
         if let Err(e) = self.try_signal_config_change() {
             warn!(target: &self.0.log_target, "Failed to signal config change: {e:?}");
+        }
+    }
+
+    fn clear_irq(&self) {
+        if let Some(irq_line) = self.irq_line() {
+            if let Err(e) = self.intc().lock().unwrap().clear_irq(irq_line) {
+                warn!(target: &self.0.log_target, "Failed to clear virtio IRQ: {e:?}");
+            }
         }
     }
 }
@@ -289,6 +297,7 @@ impl MmioTransport {
         self.acked_features_select = 0;
         self.queue_select = 0;
         self.interrupt.0.status.store(0, Ordering::SeqCst);
+        self.interrupt.clear_irq();
         self.device_status = device_status::INIT;
         // Do not reset config_generation and keep it monotonically increasing.
         // Recreate queues from queue_config for the next negotiation cycle.
@@ -330,6 +339,11 @@ impl MmioTransport {
     #[allow(unused_assignments)]
     fn set_device_status(&mut self, status: u32) {
         use device_status::*;
+        trace!(
+            target: &self.interrupt.0.log_target,
+            "virtio-mmio status transition 0x{:02x} -> 0x{status:02x}",
+            self.device_status
+        );
         // match changed bits
         match !self.device_status & status {
             ACKNOWLEDGE if self.device_status == INIT => {
@@ -375,7 +389,7 @@ impl MmioTransport {
 
 impl BusDevice for MmioTransport {
     fn read(&mut self, _vcpuid: u64, offset: u64, data: &mut [u8]) {
-        debug!("virtio-mmio [{}]: READ offset 0x{:03x} (len={})", self.locked_device().device_type(), offset, data.len());
+        // debug!("virtio-mmio [{}]: READ offset 0x{:03x} (len={})", self.locked_device().device_type(), offset, data.len());
         match offset {
             0x00..=0xff if data.len() == 4 => {
                 let v = match offset {
@@ -440,7 +454,7 @@ impl BusDevice for MmioTransport {
     }
 
     fn write(&mut self, _vcpuid: u64, offset: u64, data: &[u8]) {
-        eprintln!("virtio-mmio [{}]: WRITE offset 0x{:03x} val=0x{:08x}", self.locked_device().device_type(), offset, byte_order::read_le_u32(data));
+        // eprintln!("virtio-mmio [{}]: WRITE offset 0x{:03x} val=0x{:08x}", self.locked_device().device_type(), offset, byte_order::read_le_u32(data));
         fn hi(v: &mut GuestAddress, x: u32) {
             *v = (*v & 0xffff_ffff) | (u64::from(x) << 32)
         }
@@ -452,6 +466,11 @@ impl BusDevice for MmioTransport {
         match offset {
             0x00..=0xff if data.len() == 4 => {
                 let v = byte_order::read_le_u32(data);
+                trace!(
+                    target: &self.interrupt.0.log_target,
+                    "virtio-mmio write offset=0x{offset:02x} value=0x{v:08x} status=0x{:02x}",
+                    self.device_status
+                );
                 match offset {
                     0x14 => self.features_select = v,
                     0x20 => {
@@ -482,9 +501,14 @@ impl BusDevice for MmioTransport {
                     }
                     0x64 => {
                         if self.check_device_status(device_status::DRIVER_OK, 0) {
-                            self.interrupt
+                            let status = self
+                                .interrupt
                                 .status()
-                                .fetch_and(!(v as usize), Ordering::SeqCst);
+                                .fetch_and(!(v as usize), Ordering::SeqCst)
+                                & !(v as usize);
+                            if status == 0 {
+                                self.interrupt.clear_irq();
+                            }
                         }
                     }
                     0x70 => self.set_device_status(v),

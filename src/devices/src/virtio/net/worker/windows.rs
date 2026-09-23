@@ -1,4 +1,4 @@
-use std::io;
+use std::io::{self, ErrorKind};
 use std::os::windows::io::{FromRawSocket, OwnedSocket, RawSocket};
 use std::sync::mpsc;
 use std::thread;
@@ -18,6 +18,7 @@ const RX_TOKEN: u64 = 1;
 const TX_TOKEN: u64 = 2;
 const BACKEND_TOKEN: u64 = 3;
 const MAX_PROXY_PAYLOAD_SIZE: usize = MAX_BUFFER_SIZE - VNET_HDR_LEN;
+const TX_POLL_TIMEOUT_MS: i32 = 10;
 
 pub struct NetWorker {
     rx_q: DeviceQueue,
@@ -136,7 +137,11 @@ impl NetRxWorker {
             for event in &events[..event_count] {
                 match event.data() {
                     RX_TOKEN => {
-                        self.rx_q.event.read()?;
+                        if let Err(error) = self.rx_q.event.read()
+                            && error.kind() != ErrorKind::WouldBlock
+                        {
+                            return Err(error);
+                        }
                         self.set_socket_events(&epoll, backend_socket, true)?;
                         if self.drain_rx(&epoll, backend_socket, &mut needs_interrupt)? {
                             self.signal_if_needed(needs_interrupt)?;
@@ -209,13 +214,7 @@ impl NetRxWorker {
     }
 
     fn signal_if_needed(&mut self, used: bool) -> io::Result<()> {
-        if used
-            && self
-                .rx_q
-                .queue
-                .needs_notification(&self.mem)
-                .map_err(queue_io_error)?
-        {
+        if used {
             self.interrupt
                 .try_signal_used_queue()
                 .map_err(|error| io::Error::other(format!("interrupt error: {error:?}")))?;
@@ -266,7 +265,6 @@ impl NetTxWorker {
 
     fn run(&mut self) -> Result<(), TxError> {
         let queue_event = self.tx_q.event.as_raw_fd();
-        let backend_socket = self.backend.raw_socket_fd();
         let mut epoll = Epoll::new().map_err(io_tx_error)?;
         epoll
             .ctl(
@@ -275,34 +273,32 @@ impl NetTxWorker {
                 &EpollEvent::new(EventSet::IN, TX_TOKEN),
             )
             .map_err(io_tx_error)?;
-        epoll
-            .ctl_socket(
-                ControlOperation::Add,
-                backend_socket as usize,
-                &EpollEvent::new(EventSet::READ_HANG_UP, BACKEND_TOKEN),
-            )
-            .map_err(io_tx_error)?;
 
         let mut events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
         loop {
             let count = epoll
-                .wait(events.len(), -1, &mut events)
+                .wait(events.len(), TX_POLL_TIMEOUT_MS, &mut events)
                 .map_err(io_tx_error)?;
+            if count == 0 {
+                if self.pending_indices.is_empty() {
+                    // WCP can lose an EventFd notification after a stale completion.
+                    // Periodically drain the queue so a guest packet is never stranded.
+                    self.process_tx_loop()?;
+                } else {
+                    self.resume_tx()?;
+                }
+                continue;
+            }
             for event in &events[..count] {
                 match event.data() {
                     TX_TOKEN => {
-                        self.tx_q.event.read().map_err(io_tx_error)?;
+                        if let Err(error) = self.tx_q.event.read()
+                            && error.kind() != ErrorKind::WouldBlock
+                        {
+                            return Err(io_tx_error(error));
+                        }
                         if self.pending_indices.is_empty() {
-                            self.process_tx_loop(&epoll, backend_socket)?;
-                        }
-                    }
-                    BACKEND_TOKEN => {
-                        let event_set = event.event_set();
-                        if event_set.contains(EventSet::OUT) && !self.pending_indices.is_empty() {
-                            self.resume_tx(&epoll, backend_socket)?;
-                        }
-                        if event_set.contains(EventSet::READ_HANG_UP) {
-                            return Err(TxError::Backend(WriteError::ProcessNotRunning));
+                            self.process_tx_loop()?;
                         }
                     }
                     token => log::warn!("unexpected virtio-net TX event token: {token}"),
@@ -311,13 +307,13 @@ impl NetTxWorker {
         }
     }
 
-    fn process_tx_loop(&mut self, epoll: &Epoll, backend_socket: RawSocket) -> Result<(), TxError> {
+    fn process_tx_loop(&mut self) -> Result<(), TxError> {
         loop {
             self.tx_q
                 .queue
                 .disable_notification(&self.mem)
                 .map_err(TxError::QueueError)?;
-            let pending = self.process_tx(epoll, backend_socket)?;
+            let pending = self.process_tx()?;
             let has_new_entries = self
                 .tx_q
                 .queue
@@ -329,7 +325,7 @@ impl NetTxWorker {
         }
     }
 
-    fn process_tx(&mut self, epoll: &Epoll, backend_socket: RawSocket) -> Result<bool, TxError> {
+    fn process_tx(&mut self) -> Result<bool, TxError> {
         let tx_queue = &mut self.tx_q.queue;
         let tx_buffer = self.backend.prepare_tx_buffer();
         let mut write_offset = 0;
@@ -423,24 +419,28 @@ impl NetTxWorker {
             .map_err(TxError::Backend)?
         {
             WriteStatus::Complete => {
+                log::trace!("virtio-net TX completed {} descriptor(s)", self.pending_indices.len());
                 self.complete_pending()?;
                 Ok(false)
             }
             WriteStatus::Pending => {
-                self.set_writable_events(epoll, backend_socket, true)?;
+                log::trace!("virtio-net TX pending {} descriptor(s)", self.pending_indices.len());
                 Ok(true)
             }
         }
     }
 
-    fn resume_tx(&mut self, epoll: &Epoll, backend_socket: RawSocket) -> Result<(), TxError> {
+    fn resume_tx(&mut self) -> Result<(), TxError> {
         match self.backend.resume_tx().map_err(TxError::Backend)? {
             WriteStatus::Complete => {
+                log::trace!("virtio-net TX resumed {} descriptor(s)", self.pending_indices.len());
                 self.complete_pending()?;
-                self.set_writable_events(epoll, backend_socket, false)?;
-                self.process_tx_loop(epoll, backend_socket)
+                self.process_tx_loop()
             }
-            WriteStatus::Pending => Ok(()),
+            WriteStatus::Pending => {
+                log::trace!("virtio-net TX remains pending {} descriptor(s)", self.pending_indices.len());
+                Ok(())
+            }
         }
     }
 
@@ -455,38 +455,12 @@ impl NetTxWorker {
     }
 
     fn signal_tx(&mut self) -> Result<(), TxError> {
-        if self
-            .tx_q
-            .queue
-            .needs_notification(&self.mem)
-            .map_err(TxError::QueueError)?
-        {
-            self.interrupt
-                .try_signal_used_queue()
-                .map_err(TxError::DeviceError)?;
-        }
+        self.interrupt
+            .try_signal_used_queue()
+            .map_err(TxError::DeviceError)?;
         Ok(())
     }
 
-    fn set_writable_events(
-        &self,
-        epoll: &Epoll,
-        backend_socket: RawSocket,
-        writable: bool,
-    ) -> Result<(), TxError> {
-        let events = if writable {
-            EventSet::OUT | EventSet::READ_HANG_UP
-        } else {
-            EventSet::READ_HANG_UP
-        };
-        epoll
-            .ctl_socket(
-                ControlOperation::Modify,
-                backend_socket as usize,
-                &EpollEvent::new(events, BACKEND_TOKEN),
-            )
-            .map_err(io_tx_error)
-    }
 }
 
 fn queue_io_error(error: crate::virtio::queue::Error) -> io::Error {

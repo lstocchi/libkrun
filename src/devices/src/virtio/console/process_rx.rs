@@ -1,8 +1,12 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::{io, thread};
+#[cfg(not(windows))]
+use std::io;
+use std::thread;
 
 use vm_memory::{GuestMemoryBackend, GuestMemoryError, GuestMemoryMmap, GuestMemoryRegion};
+#[cfg(windows)]
+use vm_memory::bitmap::Bitmap;
 
 use crate::virtio::console::console_control::ConsoleControl;
 use crate::virtio::console::port_io::PortInput;
@@ -31,11 +35,18 @@ pub(crate) fn process_rx(
         let head_index = head.index;
         let mut bytes_read = 0;
         for chain in head.into_iter().writable() {
+            log::debug!(
+                "console port {port_id}: reading descriptor {} ({} bytes)",
+                chain.index,
+                chain.len
+            );
             match read_to_desc(chain, input.as_mut(), &mut eof) {
                 Ok(0) => {
+                    log::debug!("console port {port_id}: descriptor read returned zero bytes");
                     break;
                 }
                 Ok(len) => {
+                    log::debug!("console port {port_id}: descriptor read returned {len} bytes");
                     bytes_read += len;
                 }
                 Err(e) => {
@@ -45,9 +56,20 @@ pub(crate) fn process_rx(
         }
 
         if bytes_read != 0 {
-            log::trace!("Rx {bytes_read} bytes queue len{}", queue.len(mem));
+            log::debug!(
+                "console port {port_id}: completing descriptor {head_index} with {bytes_read} bytes"
+            );
             if let Err(e) = queue.add_used(mem, head_index, bytes_read as u32) {
                 error!("failed to add used elements to the queue: {e:?}");
+            } else {
+                log::debug!("console port {port_id}: RX descriptor completed");
+            }
+            #[cfg(target_os = "windows")]
+            // Windows ReadFile blocks instead of returning WouldBlock, so the
+            // guest has not received the wakeup sent by the polling path below.
+            match interrupt.try_signal_used_queue() {
+                Ok(()) => log::trace!("console port {port_id}: notified guest of {bytes_read} input bytes"),
+                Err(e) => log::error!("console port {port_id}: failed to notify guest of input: {e:?}"),
             }
         }
 
@@ -90,6 +112,7 @@ fn pop_head_blocking<'mem>(
     }
 }
 
+#[cfg(not(windows))]
 fn read_to_desc(
     desc: DescriptorChain,
     input: &mut (dyn PortInput + Send),
@@ -112,5 +135,35 @@ fn read_to_desc(
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(0),
                 Err(e) => Err(GuestMemoryError::IOError(e)),
             }
+        })
+}
+
+#[cfg(windows)]
+fn read_to_desc(
+    desc: DescriptorChain,
+    input: &mut (dyn PortInput + Send),
+    eof: &mut bool,
+) -> Result<usize, GuestMemoryError> {
+    // Do not block in ReadFile while holding a guest-memory slice. WHP vCPUs
+    // can need that same memory access to progress the console queue.
+    let mut host_buf = vec![0; desc.len as usize];
+    let bytes_read = input.read_bytes(&mut host_buf).map_err(GuestMemoryError::IOError)?;
+    if bytes_read == 0 {
+        *eof = true;
+        return Ok(0);
+    }
+
+    let mut copied = 0;
+    desc.mem
+        .try_access(desc.len as usize, desc.addr, |_, len, addr, region| {
+            let mut target = region.get_slice(addr, len).unwrap();
+            let count = (bytes_read - copied).min(len);
+            let guard = target.ptr_guard_mut();
+            unsafe {
+                std::ptr::copy_nonoverlapping(host_buf[copied..].as_ptr(), guard.as_ptr(), count);
+            }
+            target.bitmap().mark_dirty(0, count);
+            copied += count;
+            Ok(count)
         })
 }

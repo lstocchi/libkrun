@@ -20,7 +20,9 @@ impl Rng {
         }
 
         if let Err(e) = self.queue_event(REQ_INDEX).read() {
-            error!("Failed to read request queue event: {e:?}");
+            if e.kind() != ErrorKind::WouldBlock {
+                error!("Failed to read request queue event: {e:?}");
+            }
         } else if self.process_req() {
             self.device_state.signal_used_queue();
         }
@@ -81,3 +83,4 @@ impl Subscriber for Rng {
         )]
     }
 }
+use std::io::ErrorKind;

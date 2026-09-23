@@ -1102,6 +1102,7 @@ pub fn build_microvm(
         // in userspace.
         intc = Arc::new(Mutex::new(IrqChipDevice::new(Box::new(WhpIoapic::new(
             vm.whp_vm().clone(),
+            vm_resources.vm_config().vcpu_count.unwrap() + 1,
         )))));
 
         attach_legacy_devices_whp(
@@ -1121,6 +1122,7 @@ pub fn build_microvm(
             &pio_device_manager.io_bus,
             &exit_evt,
             kernel_boot,
+            intc.clone(),
         )
         .map_err(StartMicrovmError::Internal)?;
     }
@@ -2257,6 +2259,7 @@ fn create_vcpus_x86_64_whp(
     io_bus: &devices::Bus,
     exit_evt: &EventFd,
     kernel_boot: bool,
+    intc: IrqChip,
 ) -> super::Result<Vec<Vcpu>> {
     let mut vcpus = Vec::with_capacity(vcpu_config.vcpu_count as usize);
     for cpu_index in 0..vcpu_config.vcpu_count {
@@ -2266,6 +2269,7 @@ fn create_vcpus_x86_64_whp(
             guest_mem.clone(),
             io_bus.clone(),
             exit_evt.try_clone().map_err(Error::EventFd)?,
+            intc.clone(),
         )
         .map_err(Error::Vcpu)?;
         vcpu.configure_x86_64(guest_mem, entry_addr, kernel_boot)

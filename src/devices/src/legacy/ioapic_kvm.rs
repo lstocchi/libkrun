@@ -305,6 +305,6 @@ impl Ioapic<IoApicKvmBackend> {
         routing_entries.copy_from_slice(backend.irq_routes.as_slice());
         vm.set_gsi_routing(&routing)?;
 
-        Ok(Ioapic::from_backend(backend))
+        Ok(Ioapic::from_backend_with_id(backend, 0))
     }
 }

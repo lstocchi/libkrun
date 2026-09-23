@@ -4,7 +4,7 @@ use super::super::DeviceQueue;
 use super::device::{CacheType, DiskProperties};
 
 use crate::virtio::InterruptTransport;
-use std::io::{self, Write};
+use std::io::{self, ErrorKind, Write};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::result;
@@ -141,7 +141,9 @@ impl BlockWorker {
 
     fn process_queue_event(&mut self) {
         if let Err(e) = self.device_queue.event.read() {
-            error!("Failed to get queue event: {e:?}");
+            if e.kind() != ErrorKind::WouldBlock {
+                error!("Failed to get queue event: {e:?}");
+            }
         } else {
             self.process_virtio_queues();
         }

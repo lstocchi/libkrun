@@ -19,6 +19,7 @@ use std::thread;
 use super::super::{FC_EXIT_CODE_GENERIC_ERROR, FC_EXIT_CODE_OK};
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError, unbounded};
+use devices::legacy::IrqChip;
 use utils::eventfd::EventFd;
 use vm_memory::{
     Address, Bytes, GuestAddress, GuestMemory, GuestMemoryBackend, GuestMemoryError,
@@ -304,6 +305,7 @@ pub struct Vcpu {
     io_bus: devices::Bus,
     mmio_bus: Option<devices::Bus>,
     exit_evt: EventFd,
+    intc: IrqChip,
 
     event_receiver: Receiver<VcpuEvent>,
     event_sender: Option<Sender<VcpuEvent>>,
@@ -321,6 +323,7 @@ impl Vcpu {
         guest_mem: GuestMemoryMmap,
         io_bus: devices::Bus,
         exit_evt: EventFd,
+        intc: IrqChip,
     ) -> Result<Self> {
         let whp_vcpu = WhpVcpu::new(vm, id as u32).map_err(Error::VcpuRun)?;
         let emulator =
@@ -336,6 +339,7 @@ impl Vcpu {
             io_bus,
             mmio_bus: None,
             exit_evt,
+            intc,
             event_receiver,
             event_sender: Some(event_sender),
             response_receiver: Some(response_receiver),
@@ -477,9 +481,9 @@ impl Vcpu {
                     let mut data = io_ctx.Rax.to_le_bytes();
                     if is_write {
                         
-                            let val = data[0];
+                           /*  let val = data[0];
                             
-                                eprint!("{}", val as char);
+                                eprint!("{}", val as char); */
                             
                         
 
@@ -606,6 +610,10 @@ impl Vcpu {
                 Ok(VcpuEmulation::Handled)
             }
             VcpuExitReason::ApicEoi => {
+                self.intc
+                    .lock()
+                    .unwrap()
+                    .eoi(self.whp_vcpu.apic_eoi_vector());
                 Ok(VcpuEmulation::Handled)
             }
             _ => {

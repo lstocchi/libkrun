@@ -87,8 +87,36 @@ impl PortInput for PortInputHandle {
         } else {
             let n = bytes_read as usize;
             buf.bitmap().mark_dirty(0, n);
+            log::trace!("console input: ReadFile returned {n} bytes");
             Ok(n)
         }
+    }
+
+    fn read_bytes(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let len = u32::try_from(buf.len()).map_err(|_| {
+            io::Error::new(ErrorKind::InvalidInput, "buffer length exceeds u32::MAX")
+        })?;
+        let mut bytes_read: u32 = 0;
+        let ret = unsafe {
+            ReadFile(
+                self.as_raw_handle(),
+                buf.as_mut_ptr().cast(),
+                len,
+                &mut bytes_read,
+                std::ptr::null_mut(),
+            )
+        };
+        if ret == 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == ErrorKind::BrokenPipe {
+                return Ok(0);
+            }
+            return Err(err);
+        }
+
+        let n = bytes_read as usize;
+        log::trace!("console input: ReadFile returned {n} bytes");
+        Ok(n)
     }
 
     fn wait_until_readable(&self, stopfd: Option<&EventFd>) {
@@ -102,6 +130,10 @@ impl PortInput for PortInputHandle {
 
 impl PortInput for PortInputEmpty {
     fn read_volatile(&mut self, _buf: &mut VolatileSlice) -> Result<usize, io::Error> {
+        Ok(0)
+    }
+
+    fn read_bytes(&mut self, _buf: &mut [u8]) -> Result<usize, io::Error> {
         Ok(0)
     }
 
