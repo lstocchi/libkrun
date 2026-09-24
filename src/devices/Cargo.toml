@@ -1,9 +1,12 @@
 [package]
-name = "devices"
-version = "0.1.0"
-authors = ["The Chromium OS Authors"]
-edition = "2021"
-build = "build.rs"
+name = "krun-devices"
+version = "0.1.0-2.0.0-dev"
+authors = ["The libkrun Authors"]
+edition = "2024"
+
+description = "Virtual device emulation for libkrun"
+license = "Apache-2.0"
+repository = "https://github.com/containers/libkrun"
 
 [features]
 tee = []
@@ -11,45 +14,66 @@ amd-sev = ["blk", "tee"]
 tdx = ["blk", "tee"]
 net = []
 blk = []
-efi = ["blk", "net"]
 gpu = ["rutabaga_gfx", "thiserror", "zerocopy", "krun_display"]
-snd = ["pw", "thiserror"]
 input = ["zerocopy", "krun_input"]
 virgl_resource_map2 = []
 aws-nitro = []
 test_utils = []
+timesync = []
+vhost-user = ["vhost", "vmm-sys-util", "krun_display"]
+ffi = ["dep:ffier"]
 
 [dependencies]
 bitflags = "1.2.0"
 crossbeam-channel = ">=0.5.15"
+ffier = { git = "https://github.com/mtjhrc/ffier.git", tag = "0.2.0rc1", optional = true }
 libc = ">=0.2.39"
 libloading = "0.8"
 log = "0.4.0"
-nix = { version = "0.30.1", features = ["ioctl", "net", "poll", "socket", "fs"] }
-pw = { package = "pipewire", version = "0.8.0", optional = true }
-rand = "0.9.2"
+rand = "0.10.2"
 thiserror = { version = "2.0", optional = true }
+vhost = { version = "0.17", optional = true, features = ["vhost-user-frontend"] }
+vmm-sys-util = { version = "0.15", optional = true }
 virtio-bindings = "0.2.0"
-vm-memory = { version = ">=0.13", features = ["backend-mmap"] }
 zerocopy = { version = "0.8.26", optional = true, features = ["derive"] }
-krun_display = { path = "../krun_display", optional = true, features = ["bindgen_clang_runtime"] }
-krun_input = { path = "../krun_input", features = ["bindgen_clang_runtime"], optional = true }
+krun_display = { package = "krun-display", version = "0.1.0", path = "../display", optional = true, features = ["bindgen_clang_runtime"] }
+krun_input = { package = "krun-input", version = "0.1.0", path = "../input", features = ["bindgen_clang_runtime"], optional = true }
 
-arch = { path = "../arch" }
-utils = { path = "../utils" }
-polly = { path = "../polly" }
-rutabaga_gfx = { path = "../rutabaga_gfx", features = ["virgl_renderer", "virgl_renderer_next"], optional = true }
-imago = { version = "0.2.1", features = ["sync-wrappers", "vm-memory"] }
+arch = { package = "krun-arch", version = "=0.1.0-2.0.0-dev", path = "../arch" }
+utils = { package = "krun-utils", version = "=0.1.0-2.0.0-dev", path = "../utils" }
+polly = { package = "krun-polly", version = "=0.1.0-2.0.0-dev", path = "../polly" }
+rutabaga_gfx = { version = "0.1.85", features = ["virgl_renderer"], optional = true }
+imago = { version = "0.2.4", default-features = false, features = ["sync", "vm-memory"] }
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.30.1", features = ["ioctl", "net", "poll", "socket", "fs"] }
+vm-memory = { version = "0.18", default-features = false, features = ["backend-mmap", "rawfd"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-hvf = { path = "../hvf" }
+hvf = { package = "krun-hvf", version = "=0.1.0-2.0.0-dev", path = "../hvf" }
 lru = ">=0.9"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-rutabaga_gfx = { path = "../rutabaga_gfx", features = ["x"], optional = true }
+rutabaga_gfx = { version = "0.1.85", features = ["virgl_renderer"], optional = true }
 caps = "0.5.5"
-kvm-bindings = { version = ">=0.11", features = ["fam-wrappers"] }
-kvm-ioctls = ">=0.21"
+kvm-bindings = { version = "0.14.1", features = ["fam-wrappers"] }
+kvm-ioctls = "0.25"
 
 [target.'cfg(any(target_arch = "aarch64", target_arch = "riscv64"))'.dependencies]
 vm-fdt = ">= 0.2.0"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+whp = { package = "krun-whp", version = "=0.1.0-2.0.0-dev", path = "../whp" }
+vm-memory = { version = "0.18", default-features = false, features = ["backend-mmap"] }
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinSock",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_IO",
+    "Win32_System_Memory",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+    "Wdk_Foundation",
+    "Wdk_Storage_FileSystem",
+] }

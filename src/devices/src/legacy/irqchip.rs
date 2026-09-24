@@ -1,11 +1,11 @@
 use std::sync::{Arc, Mutex};
 
+use crate::Error as DeviceError;
 use crate::bus::BusDevice;
 #[cfg(target_arch = "riscv64")]
 use crate::legacy::aia::AIADevice;
 #[cfg(target_arch = "aarch64")]
 use crate::legacy::gic::GICDevice;
-use crate::Error as DeviceError;
 
 use utils::eventfd::EventFd;
 
@@ -34,6 +34,14 @@ impl IrqChipDevice {
         interrupt_evt: Option<&EventFd>,
     ) -> Result<(), DeviceError> {
         self.inner.set_irq(irq_line, interrupt_evt)
+    }
+
+    pub fn clear_irq(&self, irq_line: u32) -> Result<(), DeviceError> {
+        self.inner.clear_irq(irq_line)
+    }
+
+    pub fn eoi(&self, vector: u8) {
+        self.inner.eoi(vector)
     }
 }
 
@@ -121,6 +129,12 @@ pub trait IrqChipT: BusDevice {
         irq_line: Option<u32>,
         interrupt_evt: Option<&EventFd>,
     ) -> Result<(), DeviceError>;
+
+    fn clear_irq(&self, _irq_line: u32) -> Result<(), DeviceError> {
+        Ok(())
+    }
+
+    fn eoi(&self, _vector: u8) {}
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -132,6 +146,12 @@ pub trait IrqChipT: BusDevice + GICDevice {
         irq_line: Option<u32>,
         interrupt_evt: Option<&EventFd>,
     ) -> Result<(), DeviceError>;
+
+    fn clear_irq(&self, _irq_line: u32) -> Result<(), DeviceError> {
+        Ok(())
+    }
+
+    fn eoi(&self, _vector: u8) {}
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -143,6 +163,12 @@ pub trait IrqChipT: BusDevice + AIADevice {
         irq_line: Option<u32>,
         interrupt_evt: Option<&EventFd>,
     ) -> Result<(), DeviceError>;
+
+    fn clear_irq(&self, _irq_line: u32) -> Result<(), DeviceError> {
+        Ok(())
+    }
+
+    fn eoi(&self, _vector: u8) {}
 }
 
 #[cfg(any(test, feature = "test_utils"))]
@@ -158,8 +184,8 @@ pub mod test_utils {
         }
     }
 
-    impl Into<IrqChip> for DummyIrqChip {
-        fn into(self) -> IrqChip {
+    impl From<DummyIrqChip> for IrqChip {
+        fn from(_val: DummyIrqChip) -> Self {
             Arc::new(Mutex::new(IrqChipDevice::new(
                 Box::new(DummyIrqChip::new()),
             )))

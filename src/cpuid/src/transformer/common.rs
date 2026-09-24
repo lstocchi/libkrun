@@ -6,7 +6,7 @@ use crate::bit_helper::BitHelper;
 use crate::common::get_cpuid;
 
 use crate::transformer::Error::FamError;
-use kvm_bindings::{kvm_cpuid_entry2, CpuId};
+use kvm_bindings::{CpuId, kvm_cpuid_entry2};
 
 // constants for setting the fields of kvm_cpuid2 structures
 // CPUID bits in ebx, ecx, and edx.
@@ -37,6 +37,8 @@ pub fn update_feature_info_entry(
 
     // X86 hypervisor feature
     entry.ecx.write_bit(ecx::HYPERVISOR_BITINDEX, true);
+
+    entry.ecx.write_bit(ecx::TSC_DEADLINE_TIMER_BITINDEX, true);
 
     entry
         .ebx
@@ -145,13 +147,13 @@ mod tests {
         assert_eq!(get_max_cpus_per_package(4).unwrap(), 4);
         assert_eq!(get_max_cpus_per_package(6).unwrap(), 8);
 
-        assert!(get_max_cpus_per_package(u8::max_value()).is_err());
+        assert!(get_max_cpus_per_package(u8::MAX).is_err());
     }
 
     fn check_update_feature_info_entry(cpu_count: u8, expected_htt: bool) {
         use crate::cpu_leaf::leaf_0x1::*;
 
-        let vm_spec = VmSpec::new(0, cpu_count, false).expect("Error creating vm_spec");
+        let vm_spec = VmSpec::new(0, cpu_count, false, false).expect("Error creating vm_spec");
         let mut entry = kvm_cpuid_entry2 {
             function: 0x0,
             index: 0,
@@ -165,7 +167,8 @@ mod tests {
 
         assert!(update_feature_info_entry(&mut entry, &vm_spec).is_ok());
 
-        assert!(entry.edx.read_bit(edx::HTT_BITINDEX) == expected_htt)
+        assert!(entry.edx.read_bit(edx::HTT_BITINDEX) == expected_htt);
+        assert!(entry.ecx.read_bit(ecx::TSC_DEADLINE_TIMER_BITINDEX));
     }
 
     fn check_update_cache_parameters_entry(
@@ -176,7 +179,7 @@ mod tests {
     ) {
         use crate::cpu_leaf::leaf_cache_parameters::*;
 
-        let vm_spec = VmSpec::new(0, cpu_count, ht_enabled).expect("Error creating vm_spec");
+        let vm_spec = VmSpec::new(0, cpu_count, ht_enabled, false).expect("Error creating vm_spec");
         let mut entry = kvm_cpuid_entry2 {
             function: 0x0,
             index: 0,

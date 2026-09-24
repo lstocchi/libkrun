@@ -4,12 +4,15 @@ use super::super::DeviceQueue;
 use super::device::{CacheType, DiskProperties};
 
 use crate::virtio::InterruptTransport;
-use std::io::{self, Write};
+use std::io::{self, ErrorKind, Write};
+#[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::result;
 use std::thread;
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use utils::eventfd::EventFd;
+#[cfg(target_os = "windows")]
+use utils::windows::AsRawFd;
 use virtio_bindings::virtio_blk::*;
 use vm_memory::{ByteValued, GuestMemoryMmap};
 
@@ -91,7 +94,7 @@ impl BlockWorker {
         let virtq_ev_fd = self.device_queue.event.as_raw_fd();
         let stop_ev_fd = self.stop_fd.as_raw_fd();
 
-        let epoll = Epoll::new().unwrap();
+        let mut epoll = Epoll::new().unwrap();
 
         let _ = epoll.ctl(
             ControlOperation::Add,
@@ -105,8 +108,8 @@ impl BlockWorker {
             &EpollEvent::new(EventSet::IN, stop_ev_fd as u64),
         );
 
+        let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
         loop {
-            let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
             match epoll.wait(epoll_events.len(), -1, epoll_events.as_mut_slice()) {
                 Ok(ev_cnt) => {
                     for event in &epoll_events[0..ev_cnt] {
@@ -138,7 +141,9 @@ impl BlockWorker {
 
     fn process_queue_event(&mut self) {
         if let Err(e) = self.device_queue.event.read() {
-            error!("Failed to get queue event: {e:?}");
+            if e.kind() != ErrorKind::WouldBlock {
+                error!("Failed to get queue event: {e:?}");
+            }
         } else {
             self.process_virtio_queues();
         }
@@ -203,10 +208,10 @@ impl BlockWorker {
                 error!("failed to add used elements to the queue: {e:?}");
             }
 
-            if self.device_queue.queue.needs_notification(mem).unwrap() {
-                if let Err(e) = self.interrupt.try_signal_used_queue() {
-                    error!("error signalling queue: {e:?}");
-                }
+            if self.device_queue.queue.needs_notification(mem).unwrap()
+                && let Err(e) = self.interrupt.try_signal_used_queue()
+            {
+                error!("error signalling queue: {e:?}");
             }
         }
     }

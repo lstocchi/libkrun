@@ -1,11 +1,14 @@
+#[cfg(unix)]
 use std::os::unix::io::AsRawFd;
+#[cfg(target_os = "windows")]
+use utils::windows::AsRawFd;
 
 use polly::event_manager::{EventManager, Subscriber};
 use utils::epoll::{EpollEvent, EventSet};
 
 use super::device::Console;
 use crate::virtio::console::device::{CONTROL_RXQ_INDEX, CONTROL_TXQ_INDEX};
-use crate::virtio::console::port_queue_mapping::{queue_idx_to_port_id, QueueDirection};
+use crate::virtio::console::port_queue_mapping::{QueueDirection, queue_idx_to_port_id};
 use crate::virtio::device::VirtioDevice;
 
 impl Console {
@@ -19,7 +22,9 @@ impl Console {
         }
 
         if let Err(e) = self.queue_events[queue_index].read() {
-            error!("Failed to read event from queue index {queue_index}: {e:?}");
+            if e.kind() != ErrorKind::WouldBlock {
+                error!("Failed to read event from queue index {queue_index}: {e:?}");
+            }
             return false;
         }
 
@@ -112,14 +117,19 @@ impl Subscriber for Console {
     fn process(&mut self, event: &EpollEvent, event_manager: &mut EventManager) {
         let source = event.fd();
 
-        let control_rxq = self.queue_events[CONTROL_RXQ_INDEX].as_raw_fd();
-        let control_txq = self.queue_events[CONTROL_TXQ_INDEX].as_raw_fd();
-        let control_rxq_control = self.control.queue_evt().as_raw_fd();
-
         let activate_evt = self.activate_evt.as_raw_fd();
         let sigwinch_evt = self.sigwinch_evt.as_raw_fd();
 
         if self.is_activated() {
+            // interest_list() registers sigwinch_evt and control.queue_evt() with
+            // epoll at creation time, but queue_events is only populated later in
+            // activate(). If a spurious event arrives before activation, indexing
+            // into the empty queue_events would panic — so these must stay inside
+            // the is_activated() guard.
+            let control_rxq = self.queue_events[CONTROL_RXQ_INDEX].as_raw_fd();
+            let control_txq = self.queue_events[CONTROL_TXQ_INDEX].as_raw_fd();
+            let control_rxq_control = self.control.queue_evt().as_raw_fd();
+
             let mut raise_irq = false;
 
             if source == control_txq {
@@ -162,3 +172,4 @@ impl Subscriber for Console {
         ]
     }
 }
+use std::io::ErrorKind;

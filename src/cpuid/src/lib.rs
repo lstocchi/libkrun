@@ -8,7 +8,7 @@
 #![deny(missing_docs)]
 //! Utility for configuring the CPUID (CPU identification) for the guest microVM.
 
-#![cfg(target_arch = "x86_64")]
+#![cfg(all(target_arch = "x86_64", target_os = "linux"))]
 
 use kvm_bindings::CpuId;
 
@@ -39,14 +39,14 @@ mod brand_string;
 ///
 /// # Example
 /// ```
-/// use cpuid::{filter_cpuid, VmSpec};
+/// use krun_cpuid::{filter_cpuid, VmSpec};
 /// use kvm_bindings::{CpuId, KVM_MAX_CPUID_ENTRIES};
 /// use kvm_ioctls::Kvm;
 ///
 /// let kvm = Kvm::new().unwrap();
 /// let mut kvm_cpuid: CpuId = kvm.get_supported_cpuid(KVM_MAX_CPUID_ENTRIES).unwrap();
 ///
-/// let vm_spec = VmSpec::new(0, 1, true).unwrap();
+/// let vm_spec = VmSpec::new(0, 1, true, false).unwrap();
 ///
 /// filter_cpuid(&mut kvm_cpuid, &vm_spec).unwrap();
 ///

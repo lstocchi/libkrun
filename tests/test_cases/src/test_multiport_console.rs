@@ -6,15 +6,19 @@ pub struct TestMultiportConsole;
 mod host {
     use super::*;
 
-    use crate::common::setup_fs_and_enter;
-    use crate::{krun_call, krun_call_u32};
-    use crate::{Test, TestSetup};
-    use krun_sys::*;
-    use std::ffi::CString;
     use std::io::{BufRead, BufReader, Write};
-    use std::os::fd::AsRawFd;
+    use std::os::fd::AsFd;
     use std::os::unix::net::UnixStream;
-    use std::{mem, thread};
+    use std::thread;
+
+    use crate::common::{build_init_config, init_krun, setup_rootfs};
+    use crate::{ShouldRun, Test, TestSetup};
+
+    #[cfg(feature = "dynamic-linking")]
+    fn require_symbols() -> Result<(), libloading::Error> {
+        crate::common::require_vm_symbols()?;
+        krun::require(None, &[krun::Symbol::KrunConsoleBuilderAddInoutPort])
+    }
 
     fn spawn_ping_pong_responder(stream: UnixStream) {
         thread::spawn(move || {
@@ -30,49 +34,95 @@ mod host {
         });
     }
 
-    fn test_port(ctx: u32, console_id: u32, name: &str) -> anyhow::Result<()> {
-        let (guest, host) = UnixStream::pair()?;
-        let name_cstring = CString::new(name)?;
-        unsafe {
-            krun_call!(krun_add_console_port_inout(
-                ctx,
-                console_id,
-                name_cstring.as_ptr(),
-                guest.as_raw_fd(),
-                guest.as_raw_fd()
-            ))?;
-        }
-        mem::forget(guest);
+    fn add_ping_pong_port<'a>(
+        builder: &mut krun::ConsoleBuilder<'a>,
+        guest: &'a UnixStream,
+        host: UnixStream,
+        name: &str,
+    ) -> anyhow::Result<()> {
+        builder
+            .add_inout_port(name, Some(guest.as_fd()), Some(guest.as_fd()))
+            .map_err(|e| anyhow::anyhow!("add_inout_port: {e:?}"))?;
         spawn_ping_pong_responder(host);
         Ok(())
     }
 
     impl Test for TestMultiportConsole {
-        fn start_vm(self: Box<Self>, test_setup: TestSetup) -> anyhow::Result<()> {
-            unsafe {
-                krun_call!(krun_set_log_level(KRUN_LOG_LEVEL_TRACE))?;
-                let ctx = krun_call_u32!(krun_create_ctx())?;
-
-                krun_call!(krun_disable_implicit_console(ctx))?;
-
-                // Add a default console (as with other tests this uses stdout for writing "OK")
-                krun_call!(krun_add_virtio_console_default(
-                    ctx,
-                    -1,
-                    std::io::stdout().as_raw_fd(),
-                    -1,
-                ))?;
-
-                let console_id = krun_call_u32!(krun_add_virtio_console_multiport(ctx))?;
-
-                test_port(ctx, console_id, "test-port-alpha")?;
-                test_port(ctx, console_id, "test-port-beta")?;
-                test_port(ctx, console_id, "test-port-gamma")?;
-
-                krun_call!(krun_set_vm_config(ctx, 1, 1024))?;
-                setup_fs_and_enter(ctx, test_setup)?;
+        fn should_run(&self) -> ShouldRun {
+            #[cfg(feature = "dynamic-linking")]
+            if require_symbols().is_err() {
+                return ShouldRun::No("feature not enabled in this libkrun build");
             }
-            Ok(())
+            ShouldRun::Yes
+        }
+
+        fn start_vm(self: Box<Self>, test_setup: TestSetup) -> anyhow::Result<()> {
+            init_krun()?;
+            #[cfg(feature = "dynamic-linking")]
+            require_symbols().unwrap();
+
+            let root_dir = setup_rootfs(&test_setup)?;
+            let init_config = build_init_config(&test_setup.test_case, &[]);
+
+            let mut rootfs = krun::FsDevice::new("/dev/root", root_dir.to_str().unwrap())
+                .map_err(|e| anyhow::anyhow!("FsDevice::new: {e:?}"))?;
+            let mut payload =
+                krun::Payload::load_krunfw().map_err(|e| anyhow::anyhow!("load_krunfw: {e:?}"))?;
+            let mut overlay = krun::FsOverlay::new();
+            init_config
+                .apply(&mut overlay, &mut payload)
+                .map_err(|e| anyhow::anyhow!("Config::apply: {e}"))?;
+            rootfs.set_overlay(overlay);
+
+            // Default console with stdout only (for "OK" output)
+            let stdout = std::io::stdout();
+            let mut default_console = krun::ConsoleDevice::builder();
+            default_console
+                .add_default_console(None, Some(stdout.as_fd()), None)
+                .map_err(|e| anyhow::anyhow!("add_default_console: {e:?}"))?;
+            let default_console = default_console
+                .build()
+                .map_err(|e| anyhow::anyhow!("build default console: {e:?}"))?;
+
+            // Second console with test ports
+            let (guest_alpha, host_alpha) = UnixStream::pair()?;
+            let (guest_beta, host_beta) = UnixStream::pair()?;
+            let (guest_gamma, host_gamma) = UnixStream::pair()?;
+            let mut test_console = krun::ConsoleDevice::builder();
+            add_ping_pong_port(
+                &mut test_console,
+                &guest_alpha,
+                host_alpha,
+                "test-port-alpha",
+            )?;
+            add_ping_pong_port(&mut test_console, &guest_beta, host_beta, "test-port-beta")?;
+            add_ping_pong_port(
+                &mut test_console,
+                &guest_gamma,
+                host_gamma,
+                "test-port-gamma",
+            )?;
+            let test_console = test_console
+                .build()
+                .map_err(|e| anyhow::anyhow!("build test console: {e:?}"))?;
+
+            let mut devices = krun::MmioDeviceManager::new();
+            devices.add(rootfs);
+            devices.add(default_console);
+            devices.add(test_console);
+
+            let vmm = krun::VmmBuilder::new()
+                .vcpus(1)
+                .map_err(|e| anyhow::anyhow!("vcpus: {e:?}"))?
+                .ram_mib(1024)
+                .map_err(|e| anyhow::anyhow!("ram_mib: {e:?}"))?
+                .payload(payload)
+                .devices(devices)
+                .build()
+                .map_err(|e| anyhow::anyhow!("build: {e:?}"))?;
+
+            vmm.run();
+            unreachable!()
         }
     }
 }

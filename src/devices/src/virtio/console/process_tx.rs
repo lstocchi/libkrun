@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::{io, thread};
 
-use vm_memory::{GuestMemory, GuestMemoryError, GuestMemoryMmap, GuestMemoryRegion};
+use vm_memory::{GuestMemoryBackend, GuestMemoryError, GuestMemoryMmap, GuestMemoryRegion};
 
 use crate::virtio::console::port_io::PortOutput;
 use crate::virtio::{DescriptorChain, InterruptTransport, Queue};
@@ -83,6 +83,9 @@ fn write_desc_to_output(
     output: &mut (dyn PortOutput + Send),
     interrupt: &InterruptTransport,
 ) -> Result<usize, GuestMemoryError> {
+    // TODO: Switch to using `get_slices()` with the next vm-memory
+    //       bump.
+    #[allow(deprecated)]
     desc.mem
         .try_access(desc.len as usize, desc.addr, |_, len, addr, region| {
             let src = region.get_slice(addr, len).unwrap();

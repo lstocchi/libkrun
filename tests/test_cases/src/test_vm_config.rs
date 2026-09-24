@@ -9,20 +9,20 @@ pub struct TestVmConfig {
 mod host {
     use super::*;
 
-    use crate::common::setup_fs_and_enter;
-    use crate::{krun_call, krun_call_u32};
-    use crate::{Test, TestSetup};
-    use krun_sys::*;
+    use crate::common::setup_and_run;
+    use crate::{ShouldRun, Test, TestSetup};
 
     impl Test for TestVmConfig {
-        fn start_vm(self: Box<Self>, test_setup: TestSetup) -> anyhow::Result<()> {
-            unsafe {
-                krun_call!(krun_set_log_level(KRUN_LOG_LEVEL_TRACE))?;
-                let ctx = krun_call_u32!(krun_create_ctx())?;
-                krun_call!(krun_set_vm_config(ctx, self.num_cpus, self.ram_mib))?;
-                setup_fs_and_enter(ctx, test_setup)?;
+        fn should_run(&self) -> ShouldRun {
+            #[cfg(feature = "dynamic-linking")]
+            if crate::common::require_vm_symbols().is_err() {
+                return ShouldRun::No("core VM symbols not available");
             }
-            Ok(())
+            ShouldRun::Yes
+        }
+
+        fn start_vm(self: Box<Self>, test_setup: TestSetup) -> anyhow::Result<()> {
+            setup_and_run(self.num_cpus, self.ram_mib, test_setup)
         }
     }
 }

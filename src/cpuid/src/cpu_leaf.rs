@@ -34,7 +34,8 @@ pub mod leaf_0x1 {
         pub const MONITOR_BITINDEX: u32 = 3;
         // CPL Qualified Debug Store
         pub const DS_CPL_SHIFT: u32 = 4;
-        // 5 = VMX (Virtual Machine Extensions)
+        // VMX = Virtual Machine Extensions (Intel nested virtualization)
+        pub const VMX_BITINDEX: u32 = 5;
         // 6 = SMX (Safer Mode Extensions)
         // 7 = EIST (Enhanced Intel SpeedStep® technology)
         // TM2 = Thermal Monitor 2
@@ -49,6 +50,8 @@ pub mod leaf_0x1 {
         // PDCM = Perfmon and Debug Capability
         pub const PDCM_BITINDEX: u32 = 15;
         // 18 = DCA Direct Cache Access (prefetch data from a memory mapped device)
+        #[cfg(feature = "tdx")]
+        pub const X2APIC_BITINDEX: u32 = 21;
         pub const MOVBE_BITINDEX: u32 = 22;
         pub const TSC_DEADLINE_TIMER_BITINDEX: u32 = 24;
         pub const OSXSAVE_BITINDEX: u32 = 27;
@@ -268,6 +271,8 @@ pub mod leaf_0x80000001 {
     pub const LEAF_NUM: u32 = 0x8000_0001;
 
     pub mod ecx {
+        // SVM = Secure Virtual Machine (AMD nested virtualization)
+        pub const SVM_BITINDEX: u32 = 2;
         pub const TOPOEXT_INDEX: u32 = 22;
         pub const PREFETCH_BITINDEX: u32 = 8; // 3DNow! PREFETCH/PREFETCHW instructions
         pub const LZCNT_BITINDEX: u32 = 5; // advanced bit manipulation

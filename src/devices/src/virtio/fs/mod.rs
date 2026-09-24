@@ -1,10 +1,15 @@
+mod augment_fs;
 mod device;
 #[allow(dead_code)]
 mod filesystem;
 pub mod fuse;
+mod inode_alloc;
 #[allow(dead_code)]
 mod multikey;
+mod null_fs;
+mod read_only;
 mod server;
+pub mod virtual_entry;
 mod worker;
 
 #[cfg(target_os = "linux")]
@@ -19,6 +24,12 @@ pub mod macos;
 pub use macos::fs_utils;
 #[cfg(target_os = "macos")]
 pub use macos::passthrough;
+#[cfg(target_os = "windows")]
+pub mod windows;
+#[cfg(target_os = "windows")]
+pub use windows::fs_utils;
+#[cfg(target_os = "windows")]
+pub use windows::passthrough;
 
 use super::bindings;
 use super::descriptor_utils;

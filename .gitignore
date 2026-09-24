@@ -7,6 +7,9 @@ __pycache__
 *.pyc
 *~
 /libkrun.pc
+/libkrun_init.pc
+init/init
+init/init-binary/init-*
 init/nitro/init
 examples/chroot_vm
 examples/launch-tee
@@ -17,3 +20,4 @@ examples/consoles
 examples/rootfs_fedora
 test-prefix
 /linux-sysroot
+/freebsd-sysroot

@@ -11,9 +11,14 @@ pub mod gic;
 mod gicv3;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod hvfgicv3;
+#[cfg(target_arch = "x86_64")]
 mod i8042;
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 mod ioapic;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+mod ioapic_kvm;
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+mod ioapic_whp;
 mod irqchip;
 #[cfg(all(target_os = "linux", target_arch = "riscv64"))]
 mod kvmaia;
@@ -52,10 +57,12 @@ pub use self::gicv3::GicV3;
 pub use self::gpio::Gpio;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub use self::hvfgicv3::HvfGicV3;
-pub use self::i8042::Error as I8042DeviceError;
-pub use self::i8042::I8042Device;
+#[cfg(target_arch = "x86_64")]
+pub use self::i8042::{Error as I8042DeviceError, I8042Device};
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-pub use self::ioapic::IoApic;
+pub use self::ioapic_kvm::IoApic;
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+pub use self::ioapic_whp::WhpIoapic;
 #[cfg(any(test, feature = "test_utils"))]
 pub use self::irqchip::test_utils::DummyIrqChip;
 pub use self::irqchip::{IrqChip, IrqChipDevice, IrqChipT};
@@ -72,13 +79,21 @@ pub use self::rtc_pl031::RTC;
 pub use self::serial::Serial;
 #[cfg(target_os = "macos")]
 pub use self::vcpu::VcpuList;
+#[cfg(target_arch = "x86_64")]
+pub use self::x86_64::pit::Pit;
 
 // Cannot use multiple types as bounds for a trait object, so we define our own trait
 // which is a composition of the desired bounds. In this case, io::Read and AsRawFd.
 // Run `rustc --explain E0225` for more details.
 /// Trait that composes the `std::io::Read` and `std::os::unix::io::AsRawFd` traits.
+#[cfg(unix)]
 pub trait ReadableFd: std::io::Read + std::os::fd::AsRawFd {}
+#[cfg(unix)]
+impl ReadableFd for std::fs::File {}
 
+#[cfg(windows)]
+pub trait ReadableFd: std::io::Read + utils::windows::AsRawFd {}
+#[cfg(windows)]
 impl ReadableFd for std::fs::File {}
 
 #[cfg(target_os = "linux")]

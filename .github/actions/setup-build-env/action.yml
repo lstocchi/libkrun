@@ -9,6 +9,19 @@ runs:
         rustup update stable
         rustup default stable
         rustup component add rustfmt clippy
+        rustup target add x86_64-unknown-freebsd
+        rustup toolchain install nightly
+        rustup component add rust-src --toolchain nightly
+
+    - name: Add musl target
+      shell: bash
+      run: |
+        case $(uname -m) in
+          x86_64)  TARGET="x86_64-unknown-linux-musl"  ;;
+          aarch64|arm64) TARGET="aarch64-unknown-linux-musl" ;;
+          *)       echo "unknown arch: $(uname -m)"; exit 1 ;;
+        esac
+        rustup target add "$TARGET"
 
     - name: Cache Cargo dependencies
       uses: actions/cache@v4
@@ -21,12 +34,27 @@ runs:
 
     - name: Set up Homebrew (macOS)
       if: runner.os == 'macOS'
-      uses: Homebrew/actions/setup-homebrew@master
+      uses: Homebrew/actions/setup-homebrew@main
 
     - name: Install packages (macOS)
       if: runner.os == 'macOS'
       shell: bash
-      run: brew tap slp/krun && brew install virglrenderer clang-format llvm
+      run: brew install clang-format llvm meson ninja libepoxy
+
+    - name: Build and install virglrenderer 1.3.0 (macOS)
+      if: runner.os == 'macOS'
+      shell: bash
+      run: |
+        python3 -m venv /tmp/venv
+        source /tmp/venv/bin/activate
+        pip install PyYAML
+        rm -rf /tmp/virglrenderer
+        git clone --depth 1 --branch virglrenderer-1.3.0 \
+          https://gitlab.freedesktop.org/virgl/virglrenderer.git /tmp/virglrenderer
+        cd /tmp/virglrenderer
+        meson setup build
+        ninja -C build
+        sudo ninja -C build install
 
     - name: Install packages (Linux)
       if: runner.os == 'Linux'
@@ -34,9 +62,24 @@ runs:
       run: |
         sudo apt-get update
         sudo apt-get install -y \
-          libvirglrenderer-dev \
+          git \
           libepoxy-dev \
           libdrm-dev \
-          libpipewire-0.3-dev \
           clang-format \
-          libclang-dev
+          libclang-dev \
+          meson \
+          ninja-build \
+          python3-yaml
+
+    - name: Build and install virglrenderer 1.3.0 (Linux)
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        rm -rf /tmp/virglrenderer
+        git clone --depth 1 --branch virglrenderer-1.3.0 \
+          https://gitlab.freedesktop.org/virgl/virglrenderer.git /tmp/virglrenderer
+        cd /tmp/virglrenderer
+        meson setup build
+        ninja -C build
+        sudo ninja -C build install
+        sudo ldconfig

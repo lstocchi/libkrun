@@ -2,21 +2,21 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-use std::collections::btree_map;
 use std::collections::BTreeMap;
+use std::collections::btree_map;
 use std::convert::TryInto;
 use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::io;
-use std::mem::{self, size_of, MaybeUninit};
+use std::mem::{self, MaybeUninit, size_of};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use caps::{has_cap, CapSet, Capability};
-use nix::{request_code_none, request_code_read};
+use caps::{CapSet, Capability, has_cap};
+use nix::request_code_read;
 
 use vm_memory::ByteValued;
 
@@ -25,15 +25,13 @@ use super::super::filesystem::{
     ListxattrReply, OpenOptions, SetattrValid, ZeroCopyReader, ZeroCopyWriter,
 };
 use super::super::fuse;
+use super::super::inode_alloc::InodeAllocator;
 use super::super::multikey::MultikeyBTreeMap;
 
 const CURRENT_DIR_CSTR: &[u8] = b".\0";
 const PARENT_DIR_CSTR: &[u8] = b"..\0";
 const EMPTY_CSTR: &[u8] = b"\0";
 const PROC_CSTR: &[u8] = b"/proc/self/fd\0";
-const INIT_CSTR: &[u8] = b"init.krun\0";
-
-static INIT_BINARY: &[u8] = include_bytes!(env!("KRUN_INIT_BINARY_PATH"));
 
 type Inode = u64;
 type Handle = u64;
@@ -71,13 +69,16 @@ struct LinuxDirent64 {
 unsafe impl ByteValued for LinuxDirent64 {}
 
 macro_rules! scoped_cred {
-    ($name:ident, $ty:ty, $syscall_nr:expr) => {
+    ($name:ident, $ty:ty, $syscall_nr:expr_2021, $get_current:expr_2021) => {
         #[derive(Debug)]
-        struct $name;
+        struct $name {
+            old: $ty,
+        }
 
         impl $name {
             // Changes the effective uid/gid of the current thread to `val`.  Changes
-            // the thread's credentials back to root when the returned struct is dropped.
+            // the thread's credentials back to the previous value when the returned
+            // struct is dropped.
             fn new(val: $ty) -> io::Result<Option<$name>> {
                 // We want credential changes to be per-thread because otherwise
                 // we might interfere with operations being carried out on other
@@ -91,11 +92,22 @@ macro_rules! scoped_cred {
                 // setfsgid systems calls.   However since those calls have no way to
                 // return an error, it's preferable to do this instead.
 
+                // Remember the current effective id so Drop can restore it.
+                // Restoring a hardcoded 0 instead is wrong when the server
+                // runs as an unprivileged user granted CAP_SETUID/CAP_SETGID:
+                // the first Drop parks the thread at euid 0, the next switch
+                // to a non-zero uid then clears the thread's effective
+                // capability set (see capabilities(7), "Effect of user ID
+                // changes on capabilities"), and the restore after that fails
+                // with EPERM -- leaving the worker thread stuck with the guest
+                // uid's credentials for every subsequent request.
+                let old = unsafe { $get_current() } as $ty;
+
                 // This call is safe because it doesn't modify any memory and we
                 // check the return value.
                 let res = unsafe { libc::syscall($syscall_nr, -1, val, -1) };
                 if res == 0 {
-                    Ok(Some($name))
+                    Ok(Some($name { old }))
                 } else {
                     Err(io::Error::last_os_error())
                 }
@@ -104,10 +116,10 @@ macro_rules! scoped_cred {
 
         impl Drop for $name {
             fn drop(&mut self) {
-                let res = unsafe { libc::syscall($syscall_nr, -1, 0, -1) };
+                let res = unsafe { libc::syscall($syscall_nr, -1, self.old, -1) };
                 if res < 0 {
                     error!(
-                        "failed to change credentials back to root: {}",
+                        "failed to restore credentials: {}",
                         io::Error::last_os_error(),
                     );
                 }
@@ -115,8 +127,8 @@ macro_rules! scoped_cred {
         }
     };
 }
-scoped_cred!(ScopedUid, libc::uid_t, libc::SYS_setresuid);
-scoped_cred!(ScopedGid, libc::gid_t, libc::SYS_setresgid);
+scoped_cred!(ScopedUid, libc::uid_t, libc::SYS_setresuid, libc::geteuid);
+scoped_cred!(ScopedGid, libc::gid_t, libc::SYS_setresgid, libc::getegid);
 
 #[must_use]
 pub struct ScopedCaps {
@@ -268,6 +280,22 @@ impl FromStr for CachePolicy {
     }
 }
 
+/// The permission semantics to be emulated by this file system personality.
+#[derive(Debug, Default, Clone, Copy)]
+pub enum PermissionSemantics {
+    /// Be as close as possible to the common semantics of Linux file systems.
+    #[default]
+    LinuxComplete,
+
+    /// As `LinuxComplete`, with the following simplifications:
+    ///  - Extended attributes are not supported.
+    ///  - Idmaps are not supported.
+    ///  - Ownership bits are ignored, always returning the uid/gid from the process
+    ///    requesting the operation within the guest (obtained from `Context`).
+    ///  - Permissions bits are stored in the host, not as extended attributes.
+    LinuxSimplified,
+}
+
 /// Options that configure the behavior of the file system.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -325,9 +353,13 @@ pub struct Config {
 
     /// ID of this filesystem to uniquely identify exports.
     pub export_fsid: u64,
+
     /// Table of exported FDs to share with other subsystems.
     pub export_table: Option<ExportTable>,
-    pub allow_root_dir_delete: bool,
+
+    /// The permission semantics to be emulated. See the documentation for `PermissionSemantics` for
+    /// more details.
+    pub semantics: PermissionSemantics,
 }
 
 impl Default for Config {
@@ -342,7 +374,7 @@ impl Default for Config {
             proc_sfd_rawfd: None,
             export_fsid: 0,
             export_table: None,
-            allow_root_dir_delete: false,
+            semantics: PermissionSemantics::LinuxComplete,
         }
     }
 }
@@ -358,14 +390,12 @@ pub struct PassthroughFs {
     // documentation of the `O_PATH` flag in `open(2)` for more details on what one can and cannot
     // do with an fd opened with this flag.
     inodes: RwLock<MultikeyBTreeMap<Inode, InodeAltKey, Arc<InodeData>>>,
-    next_inode: AtomicU64,
-    init_inode: u64,
+    inode_alloc: Arc<InodeAllocator>,
 
     // File descriptors for open files and directories. Unlike the fds in `inodes`, these _can_ be
     // used for reading and writing data.
     handles: RwLock<BTreeMap<Handle, Arc<HandleData>>>,
     next_handle: AtomicU64,
-    init_handle: u64,
 
     // File descriptor pointing to the `/proc/self/fd` directory. This is used to convert an fd from
     // `inodes` into one that can go into `handles`. This is accomplished by reading the
@@ -392,7 +422,7 @@ enum FileOrLink {
 }
 
 impl PassthroughFs {
-    pub fn new(cfg: Config) -> io::Result<PassthroughFs> {
+    pub fn new(cfg: Config, inode_alloc: Arc<InodeAllocator>) -> io::Result<PassthroughFs> {
         let fd = if let Some(fd) = cfg.proc_sfd_rawfd {
             fd
         } else {
@@ -438,12 +468,10 @@ impl PassthroughFs {
 
         Ok(PassthroughFs {
             inodes: RwLock::new(MultikeyBTreeMap::new()),
-            next_inode: AtomicU64::new(fuse::ROOT_ID + 2),
-            init_inode: fuse::ROOT_ID + 1,
+            inode_alloc,
 
             handles: RwLock::new(BTreeMap::new()),
             next_handle: AtomicU64::new(1),
-            init_handle: 0,
 
             proc_self_fd,
 
@@ -527,88 +555,6 @@ impl PassthroughFs {
                 }
             }
         }
-    }
-
-    fn do_lookup(&self, parent: Inode, name: &CStr) -> io::Result<Entry> {
-        let p = self
-            .inodes
-            .read()
-            .unwrap()
-            .get(&parent)
-            .cloned()
-            .ok_or_else(ebadf)?;
-
-        // Safe because this doesn't modify any memory and we check the return value.
-        let fd = unsafe {
-            libc::openat(
-                p.file.as_raw_fd(),
-                name.as_ptr(),
-                libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            )
-        };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-
-        // Safe because we just opened this fd.
-        let f = unsafe { File::from_raw_fd(fd) };
-
-        let (st, mnt_id) = statx(&f)?;
-
-        let mut attr_flags: u32 = 0;
-
-        if st.st_mode & libc::S_IFMT == libc::S_IFDIR
-            && self.announce_submounts.load(Ordering::Relaxed)
-            && (st.st_dev != p.dev || mnt_id != p.mnt_id)
-        {
-            attr_flags |= fuse::ATTR_SUBMOUNT;
-        }
-
-        let altkey = InodeAltKey {
-            ino: st.st_ino,
-            dev: st.st_dev,
-            mnt_id,
-        };
-        let data = self.inodes.read().unwrap().get_alt(&altkey).cloned();
-
-        let inode = if let Some(data) = data {
-            // Matches with the release store in `forget`.
-            data.refcount.fetch_add(1, Ordering::Acquire);
-            data.inode
-        } else {
-            // There is a possible race here where 2 threads end up adding the same file
-            // into the inode list.  However, since each of those will get a unique Inode
-            // value and unique file descriptors this shouldn't be that much of a problem.
-            let inode = self.next_inode.fetch_add(1, Ordering::Relaxed);
-            self.inodes.write().unwrap().insert(
-                inode,
-                InodeAltKey {
-                    ino: st.st_ino,
-                    dev: st.st_dev,
-                    mnt_id,
-                },
-                Arc::new(InodeData {
-                    inode,
-                    file: f,
-                    dev: st.st_dev,
-                    mnt_id,
-                    refcount: AtomicU64::new(1),
-                }),
-            );
-
-            inode
-        };
-
-        debug!("do_lookup: {}, inode: {:?}", name.to_str().unwrap(), inode);
-
-        Ok(Entry {
-            inode,
-            generation: 0,
-            attr: st,
-            attr_flags,
-            attr_timeout: self.cfg.attr_timeout,
-            entry_timeout: self.cfg.entry_timeout,
-        })
     }
 
     fn do_readdir<F>(
@@ -776,23 +722,23 @@ impl PassthroughFs {
     fn do_release(&self, inode: Inode, handle: Handle) -> io::Result<()> {
         let mut handles = self.handles.write().unwrap();
 
-        if let btree_map::Entry::Occupied(e) = handles.entry(handle) {
-            if e.get().inode == inode {
-                if e.get().exported.load(Ordering::Relaxed) {
-                    self.cfg
-                        .export_table
-                        .as_ref()
-                        .unwrap()
-                        .lock()
-                        .unwrap()
-                        .remove(&(self.cfg.export_fsid, handle));
-                }
-
-                // We don't need to close the file here because that will happen automatically when
-                // the last `Arc` is dropped.
-                e.remove();
-                return Ok(());
+        if let btree_map::Entry::Occupied(e) = handles.entry(handle)
+            && e.get().inode == inode
+        {
+            if e.get().exported.load(Ordering::Relaxed) {
+                self.cfg
+                    .export_table
+                    .as_ref()
+                    .unwrap()
+                    .lock()
+                    .unwrap()
+                    .remove(&(self.cfg.export_fsid, handle));
             }
+
+            // We don't need to close the file here because that will happen automatically when
+            // the last `Arc` is dropped.
+            e.remove();
+            return Ok(());
         }
 
         Err(ebadf())
@@ -879,7 +825,7 @@ fn forget_one(
             // we don't want misbehaving clients to cause integer overflow.
             let new_count = refcount.saturating_sub(count);
 
-            // Synchronizes with the acquire load in `do_lookup`.
+            // Synchronizes with the acquire load in `lookup`.
             if data
                 .refcount
                 .compare_exchange(refcount, new_count, Ordering::Release, Ordering::Relaxed)
@@ -991,26 +937,85 @@ impl FileSystem for PassthroughFs {
     }
 
     fn lookup(&self, _ctx: Context, parent: Inode, name: &CStr) -> io::Result<Entry> {
-        debug!("do_lookup: {name:?}");
-        let init_name = unsafe { CStr::from_bytes_with_nul_unchecked(INIT_CSTR) };
+        let p = self
+            .inodes
+            .read()
+            .unwrap()
+            .get(&parent)
+            .cloned()
+            .ok_or_else(ebadf)?;
 
-        if self.init_inode != 0 && name == init_name {
-            let mut st: libc::stat64 = unsafe { mem::zeroed() };
-            st.st_size = INIT_BINARY.len() as i64;
-            st.st_ino = self.init_inode;
-            st.st_mode = 0o100_755;
-
-            Ok(Entry {
-                inode: self.init_inode,
-                generation: 0,
-                attr: st,
-                attr_flags: 0,
-                attr_timeout: self.cfg.attr_timeout,
-                entry_timeout: self.cfg.entry_timeout,
-            })
-        } else {
-            self.do_lookup(parent, name)
+        // Safe because this doesn't modify any memory and we check the return value.
+        let fd = unsafe {
+            libc::openat(
+                p.file.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
         }
+
+        // Safe because we just opened this fd.
+        let f = unsafe { File::from_raw_fd(fd) };
+
+        let (st, mnt_id) = statx(&f)?;
+
+        let mut attr_flags: u32 = 0;
+
+        if st.st_mode & libc::S_IFMT == libc::S_IFDIR
+            && self.announce_submounts.load(Ordering::Relaxed)
+            && (st.st_dev != p.dev || mnt_id != p.mnt_id)
+        {
+            attr_flags |= fuse::ATTR_SUBMOUNT;
+        }
+
+        let altkey = InodeAltKey {
+            ino: st.st_ino,
+            dev: st.st_dev,
+            mnt_id,
+        };
+        let data = self.inodes.read().unwrap().get_alt(&altkey).cloned();
+
+        let inode = if let Some(data) = data {
+            // Matches with the release store in `forget`.
+            data.refcount.fetch_add(1, Ordering::Acquire);
+            data.inode
+        } else {
+            // There is a possible race here where 2 threads end up adding the same file
+            // into the inode list.  However, since each of those will get a unique Inode
+            // value and unique file descriptors this shouldn't be that much of a problem.
+            let inode = self.inode_alloc.next();
+            self.inodes.write().unwrap().insert(
+                inode,
+                InodeAltKey {
+                    ino: st.st_ino,
+                    dev: st.st_dev,
+                    mnt_id,
+                },
+                Arc::new(InodeData {
+                    inode,
+                    file: f,
+                    dev: st.st_dev,
+                    mnt_id,
+                    refcount: AtomicU64::new(1),
+                }),
+            );
+
+            inode
+        };
+
+        debug!("lookup: {}, inode: {:?}", name.to_str().unwrap(), inode);
+
+        Ok(Entry {
+            inode,
+            generation: 0,
+            attr: st,
+            attr_flags,
+            attr_timeout: self.cfg.attr_timeout,
+            entry_timeout: self.cfg.entry_timeout,
+        })
     }
 
     fn forget(&self, _ctx: Context, inode: Inode, count: u64) {
@@ -1071,7 +1076,7 @@ impl FileSystem for PassthroughFs {
         // Safe because this doesn't modify any memory and we check the return value.
         let res = unsafe { libc::mkdirat(data.file.as_raw_fd(), name.as_ptr(), mode & !umask) };
         if res == 0 {
-            self.do_lookup(parent, name)
+            self.lookup(ctx, parent, name)
         } else {
             Err(io::Error::last_os_error())
         }
@@ -1098,7 +1103,7 @@ impl FileSystem for PassthroughFs {
 
     fn readdirplus<F>(
         &self,
-        _ctx: Context,
+        ctx: Context,
         inode: Inode,
         handle: Handle,
         size: u32,
@@ -1116,7 +1121,7 @@ impl FileSystem for PassthroughFs {
             // interior '\0' bytes. We trust the kernel to provide us with properly formatted data
             // so we'll just skip the checks here.
             let name = unsafe { CStr::from_bytes_with_nul_unchecked(dir_entry.name) };
-            let entry = self.do_lookup(inode, name)?;
+            let entry = self.lookup(ctx, inode, name)?;
 
             add_entry(dir_entry, entry)
         })
@@ -1129,11 +1134,7 @@ impl FileSystem for PassthroughFs {
         kill_priv: bool,
         flags: u32,
     ) -> io::Result<(Option<Handle>, OpenOptions)> {
-        if inode == self.init_inode {
-            Ok((Some(self.init_handle), OpenOptions::empty()))
-        } else {
-            self.do_open(inode, kill_priv, flags)
-        }
+        self.do_open(inode, kill_priv, flags)
     }
 
     fn release(
@@ -1197,7 +1198,7 @@ impl FileSystem for PassthroughFs {
         // Safe because we just opened this fd.
         let file = RwLock::new(unsafe { File::from_raw_fd(fd) });
 
-        let entry = self.do_lookup(parent, name)?;
+        let entry = self.lookup(ctx, parent, name)?;
 
         let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
         let data = HandleData {
@@ -1234,16 +1235,6 @@ impl FileSystem for PassthroughFs {
         _flags: u32,
     ) -> io::Result<usize> {
         debug!("read: {inode:?}");
-        if inode == self.init_inode {
-            let off: usize = offset.try_into().map_err(|_| einval())?;
-            let len = if off + (size as usize) < INIT_BINARY.len() {
-                size as usize
-            } else {
-                INIT_BINARY.len() - off
-            };
-            return w.write(&INIT_BINARY[off..(off + len)]);
-        }
-
         let data = self
             .handles
             .read()
@@ -1528,13 +1519,13 @@ impl FileSystem for PassthroughFs {
         if res < 0 {
             Err(io::Error::last_os_error())
         } else {
-            self.do_lookup(parent, name)
+            self.lookup(ctx, parent, name)
         }
     }
 
     fn link(
         &self,
-        _ctx: Context,
+        ctx: Context,
         inode: Inode,
         newparent: Inode,
         newname: &CStr,
@@ -1568,7 +1559,7 @@ impl FileSystem for PassthroughFs {
             )
         };
         if res == 0 {
-            self.do_lookup(newparent, newname)
+            self.lookup(ctx, newparent, newname)
         } else {
             Err(io::Error::last_os_error())
         }
@@ -1600,7 +1591,7 @@ impl FileSystem for PassthroughFs {
         let res =
             unsafe { libc::symlinkat(linkname.as_ptr(), data.file.as_raw_fd(), name.as_ptr()) };
         if res == 0 {
-            self.do_lookup(parent, name)
+            self.lookup(ctx, parent, name)
         } else {
             Err(io::Error::last_os_error())
         }
@@ -1822,10 +1813,6 @@ impl FileSystem for PassthroughFs {
     ) -> io::Result<GetxattrReply> {
         if !self.cfg.xattr {
             return Err(io::Error::from_raw_os_error(libc::ENOSYS));
-        }
-
-        if inode == self.init_inode {
-            return Err(io::Error::from_raw_os_error(libc::ENODATA));
         }
 
         let mut buf = vec![0; size as usize];
@@ -2087,36 +2074,6 @@ impl FileSystem for PassthroughFs {
 
         debug!("setupmapping: ino {inode:?} addr={addr:x} len={len}");
 
-        if inode == self.init_inode {
-            let ret = unsafe {
-                libc::mmap(
-                    addr as *mut libc::c_void,
-                    len as usize,
-                    libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED,
-                    -1,
-                    0,
-                )
-            };
-            if std::ptr::eq(ret, libc::MAP_FAILED) {
-                return Err(io::Error::last_os_error());
-            }
-
-            let to_copy = if len as usize > INIT_BINARY.len() {
-                INIT_BINARY.len()
-            } else {
-                len as usize
-            };
-            unsafe {
-                libc::memcpy(
-                    addr as *mut libc::c_void,
-                    INIT_BINARY.as_ptr() as *const _,
-                    to_copy,
-                )
-            };
-            return Ok(());
-        }
-
         let file = self.open_inode(inode, open_flags)?;
         let fd = file.as_raw_fd();
 
@@ -2175,10 +2132,10 @@ impl FileSystem for PassthroughFs {
         handle: Self::Handle,
         _flags: u32,
         cmd: u32,
-        arg: u64,
+        _arg: u64,
         _in_size: u32,
         out_size: u32,
-        exit_code: &Arc<AtomicI32>,
+        _exit_code: &Arc<AtomicI32>,
     ) -> io::Result<Vec<u8>> {
         const VIRTIO_IOC_MAGIC: u8 = b'v';
 
@@ -2189,14 +2146,6 @@ impl FileSystem for PassthroughFs {
             VIRTIO_IOC_TYPE_EXPORT_FD,
             VIRTIO_IOC_EXPORT_FD_SIZE
         ) as u32;
-
-        const VIRTIO_IOC_TYPE_EXIT_CODE: u8 = 2;
-        const VIRTIO_IOC_EXIT_CODE_REQ: u32 =
-            request_code_none!(VIRTIO_IOC_MAGIC, VIRTIO_IOC_TYPE_EXIT_CODE) as u32;
-
-        const VIRTIO_IOC_REMOVE_ROOT_DIR_CODE: u8 = 3;
-        const VIRTIO_IOC_REMOVE_ROOT_DIR_REQ: u32 =
-            request_code_none!(VIRTIO_IOC_MAGIC, VIRTIO_IOC_REMOVE_ROOT_DIR_CODE) as u32;
 
         match cmd {
             VIRTIO_IOC_EXPORT_FD_REQ => {
@@ -2228,15 +2177,116 @@ impl FileSystem for PassthroughFs {
                 ret.extend_from_slice(&handle.to_ne_bytes());
                 Ok(ret)
             }
-            VIRTIO_IOC_EXIT_CODE_REQ => {
-                exit_code.store(arg as i32, Ordering::SeqCst);
-                Ok(Vec::new())
-            }
-            VIRTIO_IOC_REMOVE_ROOT_DIR_REQ if self.cfg.allow_root_dir_delete => {
-                std::fs::remove_dir_all(&self.cfg.root_dir)?;
-                Ok(Vec::new())
-            }
             _ => Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A non-zero uid the server can be made to run as, plus a guest
+    // uid distinct from it and from root. Both must be mappable when
+    // the test runs inside a user namespace (e.g. `buildah unshare`),
+    // so keep them inside the conventional 65536-wide subid range.
+    const SERVER_UID: libc::uid_t = 1;
+    const SERVER_GID: libc::gid_t = 1;
+    const GUEST_UID: libc::uid_t = 1000;
+
+    /// Regression test for the `scoped_cred` credential restore.
+    ///
+    /// The fs server switches the worker thread's effective uid per
+    /// request (`ScopedUid`) and restores it on drop. When the server
+    /// runs as a non-root user that holds CAP_SETUID — e.g. an
+    /// unprivileged daemon granted the capability via systemd's
+    /// `AmbientCapabilities=` — restoring to a hardcoded euid 0 (the
+    /// old behavior) wedges the thread: the next switch from euid 0 to
+    /// a non-zero uid clears its effective capability set, the restore
+    /// after that fails EPERM, and the thread is stranded at the guest
+    /// uid, failing every later request (including ones for guest
+    /// root). Restoring the *previous* euid keeps switching between
+    /// non-zero uids only, which never clears the capabilities.
+    ///
+    /// This drives the real `ScopedUid` through repeated switches and
+    /// asserts the thread is left back at the server uid. Credential
+    /// changes are per-thread (raw syscalls, by design), so it runs on
+    /// a dedicated thread and leaves the rest of the test binary
+    /// untouched. It needs CAP_SETUID and the ability to move to a
+    /// non-zero uid; without them (a plain `cargo test` as a normal
+    /// user) it skips rather than fails.
+    #[test]
+    fn scoped_uid_restores_server_uid_without_wedging() {
+        let outcome = std::thread::spawn(scoped_uid_no_wedge_body)
+            .join()
+            .expect("worker thread panicked");
+        match outcome {
+            Ok(()) => {}
+            Err(skip) => eprintln!("SKIP scoped_uid_restores_server_uid_without_wedging: {skip}"),
+        }
+    }
+
+    /// Establish the non-root-with-CAP_SETUID substrate on the current
+    /// thread, then exercise `ScopedUid`. `Err(reason)` means the
+    /// substrate could not be set up and the test should skip; a real
+    /// regression (the thread left wedged) panics via `assert` so the
+    /// test fails.
+    fn scoped_uid_no_wedge_body() -> Result<(), String> {
+        if !has_cap(None, CapSet::Effective, Capability::CAP_SETUID).map_err(|e| e.to_string())? {
+            return Err("missing CAP_SETUID (run as root or under a userns with caps)".into());
+        }
+
+        // Keep the permitted caps across the upcoming uid change.
+        if unsafe { libc::prctl(libc::PR_SET_KEEPCAPS, 1, 0, 0, 0) } != 0 {
+            return Err(format!("PR_SET_KEEPCAPS: {}", io::Error::last_os_error()));
+        }
+        // Per-thread setresgid/setresuid via raw syscalls, mirroring how
+        // `scoped_cred` changes only the calling thread's credentials.
+        // gid first — once euid is non-zero the right to setgid may be
+        // gone. A failure here is a substrate problem (e.g. the target
+        // uid is not mapped into the namespace), so it skips.
+        if unsafe { libc::syscall(libc::SYS_setresgid, SERVER_GID, SERVER_GID, SERVER_GID) } != 0 {
+            return Err(format!("setresgid: {}", io::Error::last_os_error()));
+        }
+        if unsafe { libc::syscall(libc::SYS_setresuid, SERVER_UID, SERVER_UID, SERVER_UID) } != 0 {
+            return Err(format!("setresuid: {}", io::Error::last_os_error()));
+        }
+        // The euid 0 -> non-zero move cleared the effective set; raise
+        // back the caps the server relies on from the retained permitted
+        // set. This is the state an AmbientCapabilities= daemon boots in.
+        for cap in [Capability::CAP_SETUID, Capability::CAP_SETGID] {
+            caps::raise(None, CapSet::Effective, cap).map_err(|e| e.to_string())?;
+        }
+        assert_eq!(
+            unsafe { libc::geteuid() },
+            SERVER_UID,
+            "precondition: thread should now run as the server uid"
+        );
+
+        // From here the substrate is in place: anything wrong below is a
+        // real regression and must fail (assert), not skip.
+        //
+        // The server's per-request switch: a handful as a non-zero guest
+        // uid. Two already suffice (the first restore parks euid at the
+        // old hardcoded 0, the second switch then clears the caps), but
+        // run more so a wedge is unmistakable.
+        for i in 0..4 {
+            let scoped = ScopedUid::new(GUEST_UID)
+                .expect("switching to the guest uid should succeed while caps are held");
+            assert_eq!(
+                unsafe { libc::geteuid() },
+                GUEST_UID,
+                "switch #{i} should land on the guest uid"
+            );
+            drop(scoped);
+        }
+
+        assert_eq!(
+            unsafe { libc::geteuid() },
+            SERVER_UID,
+            "worker thread wedged after repeated switches: euid was not restored to \
+             the server uid (the scoped_cred Drop regressed to restoring euid 0)"
+        );
+        Ok(())
     }
 }

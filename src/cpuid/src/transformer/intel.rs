@@ -17,14 +17,14 @@ pub fn update_feature_info_entry(
 
     common::update_feature_info_entry(entry, vm_spec)?;
 
-    // enable X2APIC bit
-    #[cfg(feature = "tdx")]
-    if entry.index == 0x1 {
-        println!("adjusting 0x1 index feature");
-        entry.ecx &= 1 << 21;
-    }
+    // Advertise VMX only when nested virtualization is enabled AND the host supports it.
+    entry.ecx.write_bit(
+        ecx::VMX_BITINDEX,
+        vm_spec.nested_enabled() && entry.ecx.read_bit(ecx::VMX_BITINDEX),
+    );
 
-    entry.ecx.write_bit(ecx::TSC_DEADLINE_TIMER_BITINDEX, true);
+    #[cfg(feature = "tdx")]
+    entry.ecx.write_bit(ecx::X2APIC_BITINDEX, true);
 
     Ok(())
 }
@@ -219,7 +219,7 @@ mod tests {
     fn test_update_feature_info_entry() {
         use crate::cpu_leaf::leaf_0x1::*;
 
-        let vm_spec = VmSpec::new(0, 1, false).expect("Error creating vm_spec");
+        let vm_spec = VmSpec::new(0, 1, false, false).expect("Error creating vm_spec");
         let mut entry = kvm_cpuid_entry2 {
             function: leaf_0x1::LEAF_NUM,
             index: 0,
@@ -234,11 +234,13 @@ mod tests {
         assert!(update_feature_info_entry(&mut entry, &vm_spec).is_ok());
 
         assert!(entry.ecx.read_bit(ecx::TSC_DEADLINE_TIMER_BITINDEX));
+        #[cfg(feature = "tdx")]
+        assert!(entry.ecx.read_bit(ecx::X2APIC_BITINDEX));
     }
 
     #[test]
     fn test_update_perf_mon_entry() {
-        let vm_spec = VmSpec::new(0, 1, false).expect("Error creating vm_spec");
+        let vm_spec = VmSpec::new(0, 1, false, false).expect("Error creating vm_spec");
         let mut entry = kvm_cpuid_entry2 {
             function: leaf_0xa::LEAF_NUM,
             index: 0,
@@ -266,7 +268,7 @@ mod tests {
     ) {
         use crate::cpu_leaf::leaf_0x4::*;
 
-        let vm_spec = VmSpec::new(0, cpu_count, ht_enabled).expect("Error creating vm_spec");
+        let vm_spec = VmSpec::new(0, cpu_count, ht_enabled, false).expect("Error creating vm_spec");
         let mut entry = kvm_cpuid_entry2 {
             function: 0x0,
             index: 0,
@@ -298,7 +300,7 @@ mod tests {
     ) {
         use crate::cpu_leaf::leaf_0xb::*;
 
-        let vm_spec = VmSpec::new(0, cpu_count, ht_enabled).expect("Error creating vm_spec");
+        let vm_spec = VmSpec::new(0, cpu_count, ht_enabled, false).expect("Error creating vm_spec");
         let mut entry = kvm_cpuid_entry2 {
             function: 0x0,
             index,

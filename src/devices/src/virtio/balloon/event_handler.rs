@@ -1,4 +1,7 @@
+#[cfg(unix)]
 use std::os::unix::io::AsRawFd;
+#[cfg(windows)]
+use utils::windows::AsRawFd;
 
 use polly::event_manager::{EventManager, Subscriber};
 use utils::epoll::{EpollEvent, EventSet};
@@ -21,7 +24,9 @@ impl Balloon {
         }
 
         if let Err(e) = self.queue_event(IFQ_INDEX).read() {
-            error!("Failed to read balloon inflate queue event: {e:?}");
+            if e.kind() != ErrorKind::WouldBlock {
+                error!("Failed to read balloon inflate queue event: {e:?}");
+            }
         }
     }
 
@@ -35,7 +40,9 @@ impl Balloon {
         }
 
         if let Err(e) = self.queue_event(DFQ_INDEX).read() {
-            error!("Failed to read balloon inflate queue event: {e:?}");
+            if e.kind() != ErrorKind::WouldBlock {
+                error!("Failed to read balloon inflate queue event: {e:?}");
+            }
         }
     }
 
@@ -49,7 +56,9 @@ impl Balloon {
         }
 
         if let Err(e) = self.queue_event(STQ_INDEX).read() {
-            error!("Failed to read balloon stats queue event: {e:?}");
+            if e.kind() != ErrorKind::WouldBlock {
+                error!("Failed to read balloon stats queue event: {e:?}");
+            }
         }
     }
 
@@ -63,7 +72,9 @@ impl Balloon {
         }
 
         if let Err(e) = self.queue_event(PHQ_INDEX).read() {
-            error!("Failed to read balloon page-hinting queue event: {e:?}");
+            if e.kind() != ErrorKind::WouldBlock {
+                error!("Failed to read balloon page-hinting queue event: {e:?}");
+            }
         }
     }
 
@@ -77,7 +88,9 @@ impl Balloon {
         }
 
         if let Err(e) = self.queue_event(FRQ_INDEX).read() {
-            error!("Failed to read balloon free-page reporting queue event: {e:?}");
+            if e.kind() != ErrorKind::WouldBlock {
+                error!("Failed to read balloon free-page reporting queue event: {e:?}");
+            }
         } else if self.process_frq() {
             self.device_state.signal_used_queue();
         }
@@ -187,3 +200,4 @@ impl Subscriber for Balloon {
         )]
     }
 }
+use std::io::ErrorKind;

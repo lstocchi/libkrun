@@ -19,25 +19,34 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use imago::{
-    file::File as ImagoFile, qcow2::Qcow2, raw::Raw, vmdk::Vmdk, DynStorage, FormatDriverBuilder,
-    PermissiveImplicitOpenGate, Storage, StorageOpenOptions, SyncFormatAccess,
+    DynStorage, FormatAccess, FormatDriverBuilder, PermissiveImplicitOpenGate, Storage,
+    StorageOpenOptions, file::File as ImagoFile, qcow2::Qcow2, raw::Raw, vmdk::Vmdk,
 };
 use log::{error, warn};
-use utils::eventfd::{EventFd, EFD_NONBLOCK};
+use utils::eventfd::{EFD_NONBLOCK, EventFd};
 use virtio_bindings::{
     virtio_blk::*, virtio_config::VIRTIO_F_VERSION_1, virtio_ring::VIRTIO_RING_F_EVENT_IDX,
 };
 use vm_memory::{ByteValued, GuestMemoryMmap};
 
+#[cfg(target_os = "windows")]
+use std::mem::MaybeUninit;
+#[cfg(target_os = "windows")]
+use std::os::windows::io::AsRawHandle;
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::Storage::FileSystem::{
+    BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+};
+
 use super::worker::BlockWorker;
 use super::{
-    super::{ActivateResult, DeviceQueue, DeviceState, QueueConfig, VirtioDevice, TYPE_BLOCK},
+    super::{ActivateResult, DeviceQueue, DeviceState, QueueConfig, TYPE_BLOCK, VirtioDevice},
     Error, NUM_QUEUES, QUEUE_CONFIG, SECTOR_SHIFT, SECTOR_SIZE,
 };
 
 use crate::virtio::{
-    block::{ImageType, SyncMode},
     ActivateError, InterruptTransport,
+    block::{DiskFormat, SyncMode},
 };
 
 /// Configuration options for disk caching.
@@ -68,14 +77,14 @@ impl CacheType {
 /// Helper object for setting up all `Block` fields derived from its backing file.
 pub(crate) struct DiskProperties {
     cache_type: CacheType,
-    pub(crate) file: Arc<Mutex<SyncFormatAccess<Box<dyn DynStorage>>>>,
+    pub(crate) file: Arc<Mutex<FormatAccess<Box<dyn DynStorage>>>>,
     nsectors: u64,
     image_id: Vec<u8>,
 }
 
 impl DiskProperties {
     pub fn new(
-        disk_image: Arc<Mutex<SyncFormatAccess<Box<dyn DynStorage>>>>,
+        disk_image: Arc<Mutex<FormatAccess<Box<dyn DynStorage>>>>,
         disk_image_id: Vec<u8>,
         cache_type: CacheType,
     ) -> io::Result<Self> {
@@ -107,31 +116,59 @@ impl DiskProperties {
     }
 
     fn build_device_id(disk_file: &File) -> result::Result<String, Error> {
-        let blk_metadata = disk_file.metadata().map_err(Error::GetFileMetadata)?;
         // This is how kvmtool does it.
-        let device_id = format!(
-            "{}{}{}",
-            blk_metadata.st_dev(),
-            blk_metadata.st_rdev(),
-            blk_metadata.st_ino()
-        );
+        #[cfg(unix)]
+        let device_id = {
+            let blk_metadata = disk_file.metadata().map_err(Error::GetFileMetadata)?;
+            format!(
+                "{}{}{}",
+                blk_metadata.st_dev(),
+                blk_metadata.st_rdev(),
+                blk_metadata.st_ino()
+            )
+        };
+        #[cfg(target_os = "windows")]
+        let device_id = {
+            let mut info = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
+            let ret =
+                unsafe { GetFileInformationByHandle(disk_file.as_raw_handle(), info.as_mut_ptr()) };
+            if ret != 0 {
+                let info = unsafe { info.assume_init() };
+                format!(
+                    "{}{}{}",
+                    info.dwVolumeSerialNumber, info.nFileIndexHigh, info.nFileIndexLow
+                )
+            } else {
+                return Err(Error::GetFileMetadata(io::Error::last_os_error()));
+            }
+        };
         Ok(device_id)
     }
 
-    fn build_disk_image_id(disk_file: &File) -> Vec<u8> {
+    fn build_disk_image_id(disk_file: &File, block_id: &str) -> Vec<u8> {
         let mut default_id = vec![0; VIRTIO_BLK_ID_BYTES as usize];
-        match Self::build_device_id(disk_file) {
-            Err(_) => {
-                warn!("Could not generate device id. We'll use a default.");
+
+        // The public libkrun disk API accepts a caller-provided block_id. Make
+        // that the virtio-blk GET_ID value so Linux can expose it as
+        // /sys/block/<dev>/serial. Fall back to the historical backing-file
+        // derived id only for callers that pass an empty block_id.
+        let disk_id = if block_id.is_empty() {
+            match Self::build_device_id(disk_file) {
+                Err(_) => {
+                    warn!("Could not generate device id. We'll use a default.");
+                    return default_id;
+                }
+                Ok(m) => m,
             }
-            Ok(m) => {
-                // The kernel only knows to read a maximum of VIRTIO_BLK_ID_BYTES.
-                // This will also zero out any leftover bytes.
-                let disk_id = m.as_bytes();
-                let bytes_to_copy = cmp::min(disk_id.len(), VIRTIO_BLK_ID_BYTES as usize);
-                default_id[..bytes_to_copy].clone_from_slice(&disk_id[..bytes_to_copy])
-            }
-        }
+        } else {
+            block_id.to_string()
+        };
+
+        // The kernel only knows to read a maximum of VIRTIO_BLK_ID_BYTES.
+        // This will also zero out any leftover bytes.
+        let disk_id = disk_id.as_bytes();
+        let bytes_to_copy = cmp::min(disk_id.len(), VIRTIO_BLK_ID_BYTES as usize);
+        default_id[..bytes_to_copy].clone_from_slice(&disk_id[..bytes_to_copy]);
         default_id
     }
 
@@ -205,7 +242,7 @@ pub struct Block {
     // Host file and properties.
     disk: Option<DiskProperties>,
     cache_type: CacheType,
-    disk_image: Arc<Mutex<SyncFormatAccess<Box<dyn DynStorage>>>>,
+    disk_image: Arc<Mutex<FormatAccess<Box<dyn DynStorage>>>>,
     disk_image_id: Vec<u8>,
     worker_thread: Option<JoinHandle<()>>,
     worker_stopfd: EventFd,
@@ -233,7 +270,7 @@ impl Block {
         partuuid: Option<String>,
         cache_type: CacheType,
         disk_image_path: String,
-        disk_image_format: ImageType,
+        disk_image_format: DiskFormat,
         is_disk_read_only: bool,
         direct_io: bool,
         sync_mode: SyncMode,
@@ -243,7 +280,7 @@ impl Block {
             .write(!is_disk_read_only)
             .open(PathBuf::from(&disk_image_path))?;
 
-        let disk_image_id = DiskProperties::build_disk_image_id(&disk_image);
+        let disk_image_id = DiskProperties::build_disk_image_id(&disk_image, &id);
 
         let file_opts = StorageOpenOptions::new()
             .write(!is_disk_read_only)
@@ -252,32 +289,30 @@ impl Block {
 
         #[cfg(target_os = "macos")]
         let file_opts = file_opts.relaxed_sync(sync_mode == SyncMode::Relaxed);
-        let file = ImagoFile::open_sync(file_opts)?;
+        let file = ImagoFile::open(file_opts)?;
         let discard_alignment = file.discard_align();
 
         let disk_image = match disk_image_format {
-            ImageType::Qcow2 => {
+            DiskFormat::Qcow2 => {
                 let mut qcow2 =
-                    Qcow2::<Box<dyn DynStorage>, Arc<imago::FormatAccess<_>>>::open_image_sync(
+                    Qcow2::<Box<dyn DynStorage>, Arc<imago::FormatAccess<_>>>::open_image(
                         Box::new(file),
                         !is_disk_read_only,
                     )?;
-                qcow2.open_implicit_dependencies_sync()?;
-                SyncFormatAccess::new(qcow2)?
+                qcow2.open_implicit_dependencies()?;
+                FormatAccess::new(qcow2)
             }
-            ImageType::Raw => {
-                let raw = Raw::<Box<dyn DynStorage>>::open_image_sync(
-                    Box::new(file),
-                    !is_disk_read_only,
-                )?;
-                SyncFormatAccess::new(raw)?
+            DiskFormat::Raw => {
+                let raw =
+                    Raw::<Box<dyn DynStorage>>::open_image(Box::new(file), !is_disk_read_only)?;
+                FormatAccess::new(raw)
             }
-            ImageType::Vmdk => {
+            DiskFormat::Vmdk => {
                 let vmdk = Vmdk::<Box<dyn DynStorage>, Arc<imago::FormatAccess<_>>>::builder(
                     Box::new(file),
                 )
-                .open_sync(PermissiveImplicitOpenGate::default())?;
-                SyncFormatAccess::new(vmdk)?
+                .open(PermissiveImplicitOpenGate::default())?;
+                FormatAccess::new(vmdk)
             }
         };
 
@@ -440,5 +475,62 @@ impl VirtioDevice for Block {
         }
         self.device_state = DeviceState::Inactive;
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use utils::tempfile::TempFile;
+
+    #[test]
+    fn disk_image_id_prefers_supplied_block_id() {
+        let backing = TempFile::new().expect("create backing file");
+        backing
+            .as_file()
+            .set_len(SECTOR_SIZE)
+            .expect("size backing file");
+
+        let image_id = DiskProperties::build_disk_image_id(backing.as_file(), "workload-rootfs");
+
+        assert_eq!(image_id.len(), VIRTIO_BLK_ID_BYTES as usize);
+        assert_eq!(&image_id[..b"workload-rootfs".len()], b"workload-rootfs");
+        assert!(
+            image_id[b"workload-rootfs".len()..]
+                .iter()
+                .all(|byte| *byte == 0)
+        );
+    }
+
+    #[test]
+    fn disk_image_id_truncates_supplied_block_id_to_virtio_limit() {
+        let backing = TempFile::new().expect("create backing file");
+        backing
+            .as_file()
+            .set_len(SECTOR_SIZE)
+            .expect("size backing file");
+        let long_id = "volume-name-that-is-longer-than-virtio-limit";
+
+        let image_id = DiskProperties::build_disk_image_id(backing.as_file(), long_id);
+
+        assert_eq!(image_id.len(), VIRTIO_BLK_ID_BYTES as usize);
+        assert_eq!(
+            &image_id,
+            &long_id.as_bytes()[..VIRTIO_BLK_ID_BYTES as usize]
+        );
+    }
+
+    #[test]
+    fn disk_image_id_accepts_empty_block_id() {
+        let backing = TempFile::new().expect("create backing file");
+        backing
+            .as_file()
+            .set_len(SECTOR_SIZE)
+            .expect("size backing file");
+
+        let image_id = DiskProperties::build_disk_image_id(backing.as_file(), "");
+
+        assert_eq!(image_id.len(), VIRTIO_BLK_ID_BYTES as usize);
     }
 }

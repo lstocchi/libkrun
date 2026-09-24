@@ -4,8 +4,12 @@
 use std::collections::HashMap;
 use std::fmt::Formatter;
 use std::io;
-use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::{Arc, Mutex};
+
+#[cfg(unix)]
+use std::os::unix::io::{AsRawFd, RawFd};
+#[cfg(target_os = "windows")]
+use utils::windows::{AsRawFd, RawFd};
 
 use utils::epoll::{self, Epoll, EpollEvent};
 
@@ -33,11 +37,13 @@ impl std::fmt::Debug for Error {
             Poll(err) => write!(f, "Error during epoll call: {err}"),
             AlreadyExists(pollable) => write!(
                 f,
-                "A handler for the specified pollable {pollable} already exists."
+                "A handler for the specified pollable {:?} already exists.",
+                pollable
             ),
             NotFound(pollable) => write!(
                 f,
-                "A handler for the specified pollable {pollable} was not found."
+                "A handler for the specified pollable {:?} was not found.",
+                pollable
             ),
         }
     }
@@ -110,7 +116,7 @@ impl EventManager {
         let interest_list = subscriber.lock().unwrap().interest_list();
 
         for event in interest_list {
-            self.register(event.data() as i32, event, subscriber.clone())?
+            self.register(event.data() as Pollable, event, subscriber.clone())?
         }
 
         Ok(())
@@ -202,6 +208,7 @@ impl EventManager {
             &mut self.ready_events[..],
         ) {
             Ok(event_count) => event_count,
+            #[cfg(unix)]
             Err(e) if e.raw_os_error() == Some(libc::EINTR) => 0,
             Err(e) => return Err(Error::Poll(e)),
         };
@@ -242,9 +249,8 @@ mod tests {
 
         // Flags used for checking that the event manager called the `process`
         // function for ev1/ev2.
-        processed_ev1_out: bool,
-        processed_ev2_out: bool,
         processed_ev1_in: bool,
+        processed_ev2_in: bool,
 
         // Flags used for driving register/unregister/modify of events from
         // outside of the `process` function.
@@ -255,12 +261,21 @@ mod tests {
 
     impl DummySubscriber {
         fn new() -> Self {
+            let event_fd_1 = EventFd::new(0).unwrap();
+            let event_fd_2 = EventFd::new(0).unwrap();
+            // On Windows the IOCP only delivers a packet when the underlying
+            // Event object is signaled.  Linux eventfds are always writable
+            // (EPOLLOUT fires instantly) so this isn't needed there.
+            #[cfg(target_os = "windows")]
+            {
+                event_fd_1.write(1).unwrap();
+                event_fd_2.write(1).unwrap();
+            }
             DummySubscriber {
-                event_fd_1: EventFd::new(0).unwrap(),
-                event_fd_2: EventFd::new(0).unwrap(),
-                processed_ev1_out: false,
-                processed_ev2_out: false,
+                event_fd_1,
+                event_fd_2,
                 processed_ev1_in: false,
+                processed_ev2_in: false,
                 register_ev2: false,
                 unregister_ev1: false,
                 modify_ev1: false,
@@ -281,22 +296,17 @@ mod tests {
             self.modify_ev1 = true;
         }
 
-        fn processed_ev1_out(&self) -> bool {
-            self.processed_ev1_out
-        }
-
-        fn processed_ev2_out(&self) -> bool {
-            self.processed_ev2_out
-        }
-
         fn processed_ev1_in(&self) -> bool {
             self.processed_ev1_in
         }
 
+        fn processed_ev2_in(&self) -> bool {
+            self.processed_ev2_in
+        }
+
         fn reset_state(&mut self) {
-            self.processed_ev1_out = false;
-            self.processed_ev2_out = false;
             self.processed_ev1_in = false;
+            self.processed_ev2_in = false;
         }
 
         fn handle_updates(&mut self, event_manager: &mut EventManager) {
@@ -304,7 +314,7 @@ mod tests {
                 event_manager
                     .register(
                         self.event_fd_2.as_raw_fd(),
-                        EpollEvent::new(EventSet::OUT, self.event_fd_2.as_raw_fd() as u64),
+                        EpollEvent::new(EventSet::IN, self.event_fd_2.as_raw_fd() as u64),
                         event_manager
                             .subscriber(self.event_fd_1.as_raw_fd())
                             .unwrap(),
@@ -332,18 +342,12 @@ mod tests {
         }
 
         fn handle_in(&mut self, source: RawFd) {
-            if self.event_fd_1.as_raw_fd() == source {
-                self.processed_ev1_in = true;
-            }
-        }
-
-        fn handle_out(&mut self, source: RawFd) {
             match source {
                 _ if self.event_fd_1.as_raw_fd() == source => {
-                    self.processed_ev1_out = true;
+                    self.processed_ev1_in = true;
                 }
                 _ if self.event_fd_2.as_raw_fd() == source => {
-                    self.processed_ev2_out = true;
+                    self.processed_ev2_in = true;
                 }
                 _ => {}
             }
@@ -352,7 +356,7 @@ mod tests {
 
     impl Subscriber for DummySubscriber {
         fn process(&mut self, event: &EpollEvent, event_manager: &mut EventManager) {
-            let source = event.data() as i32;
+            let source = event.data() as Pollable;
             let event_set = EventSet::from_bits(event.events()).unwrap();
 
             // We only know how to treat EPOLLOUT and EPOLLIN.
@@ -364,16 +368,14 @@ mod tests {
 
             self.handle_updates(event_manager);
 
-            match event_set {
-                EventSet::IN => self.handle_in(source),
-                EventSet::OUT => self.handle_out(source),
-                _ => {}
+            if event_set.contains(EventSet::IN) {
+                self.handle_in(source);
             }
         }
 
         fn interest_list(&self) -> Vec<EpollEvent> {
             vec![EpollEvent::new(
-                EventSet::OUT,
+                EventSet::IN,
                 self.event_fd_1.as_raw_fd() as u64,
             )]
         }
@@ -385,6 +387,20 @@ mod tests {
         let mut event_manager = EventManager::new().unwrap();
         let dummy_subscriber = Arc::new(Mutex::new(DummySubscriber::new()));
 
+        // Write to eventfds to make them readable (trigger IN events).
+        dummy_subscriber
+            .lock()
+            .unwrap()
+            .event_fd_1
+            .write(1)
+            .unwrap();
+        dummy_subscriber
+            .lock()
+            .unwrap()
+            .event_fd_2
+            .write(1)
+            .unwrap();
+
         event_manager
             .add_subscriber(dummy_subscriber.clone())
             .unwrap();
@@ -394,14 +410,14 @@ mod tests {
         // When running the loop the first time, ev1 should be processed, but ev2 shouldn't
         // because it was just added as part of processing ev1.
         event_manager.run().unwrap();
-        assert!(dummy_subscriber.lock().unwrap().processed_ev1_out());
-        assert!(!dummy_subscriber.lock().unwrap().processed_ev2_out());
+        assert!(dummy_subscriber.lock().unwrap().processed_ev1_in());
+        assert!(!dummy_subscriber.lock().unwrap().processed_ev2_in());
 
         // Check that both ev1 and ev2 are processed.
         dummy_subscriber.lock().unwrap().reset_state();
         event_manager.run().unwrap();
-        assert!(dummy_subscriber.lock().unwrap().processed_ev1_out());
-        assert!(dummy_subscriber.lock().unwrap().processed_ev2_out());
+        assert!(dummy_subscriber.lock().unwrap().processed_ev1_in());
+        assert!(dummy_subscriber.lock().unwrap().processed_ev2_in());
     }
 
     // Test that unregistering an event while processing another one works.
@@ -409,6 +425,14 @@ mod tests {
     fn test_unregister() {
         let mut event_manager = EventManager::new().unwrap();
         let dummy_subscriber = Arc::new(Mutex::new(DummySubscriber::new()));
+
+        // Write to ev1 to make it readable.
+        dummy_subscriber
+            .lock()
+            .unwrap()
+            .event_fd_1
+            .write(1)
+            .unwrap();
 
         event_manager
             .add_subscriber(dummy_subscriber.clone())
@@ -418,13 +442,13 @@ mod tests {
         dummy_subscriber.lock().unwrap().unregister_ev1();
 
         event_manager.run().unwrap();
-        assert!(dummy_subscriber.lock().unwrap().processed_ev1_out());
+        assert!(dummy_subscriber.lock().unwrap().processed_ev1_in());
 
         dummy_subscriber.lock().unwrap().reset_state();
 
         // We expect no events to be available. Let's run with timeout so that run exists.
         event_manager.run_with_timeout(100).unwrap();
-        assert!(!dummy_subscriber.lock().unwrap().processed_ev1_out());
+        assert!(!dummy_subscriber.lock().unwrap().processed_ev1_in());
     }
 
     #[test]
@@ -432,19 +456,7 @@ mod tests {
         let mut event_manager = EventManager::new().unwrap();
         let dummy_subscriber = Arc::new(Mutex::new(DummySubscriber::new()));
 
-        event_manager
-            .add_subscriber(dummy_subscriber.clone())
-            .unwrap();
-
-        // Modify ev1 so that it waits for EPOLL_IN.
-        dummy_subscriber.lock().unwrap().modify_ev1();
-        event_manager.run().unwrap();
-        assert!(dummy_subscriber.lock().unwrap().processed_ev1_out());
-        assert!(!dummy_subscriber.lock().unwrap().processed_ev2_out());
-
-        dummy_subscriber.lock().unwrap().reset_state();
-
-        // Make sure ev1 is ready for IN so that we don't loop forever.
+        // Write to ev1 to make it readable.
         dummy_subscriber
             .lock()
             .unwrap()
@@ -452,10 +464,22 @@ mod tests {
             .write(1)
             .unwrap();
 
+        event_manager
+            .add_subscriber(dummy_subscriber.clone())
+            .unwrap();
+
+        // Modify ev1 (exercises the modify code path).
+        dummy_subscriber.lock().unwrap().modify_ev1();
         event_manager.run().unwrap();
-        assert!(!dummy_subscriber.lock().unwrap().processed_ev1_out());
-        assert!(!dummy_subscriber.lock().unwrap().processed_ev2_out());
         assert!(dummy_subscriber.lock().unwrap().processed_ev1_in());
+        assert!(!dummy_subscriber.lock().unwrap().processed_ev2_in());
+
+        dummy_subscriber.lock().unwrap().reset_state();
+
+        // ev1 should still fire after modification (data still readable).
+        event_manager.run().unwrap();
+        assert!(dummy_subscriber.lock().unwrap().processed_ev1_in());
+        assert!(!dummy_subscriber.lock().unwrap().processed_ev2_in());
 
         // Create a valid epoll event, but do not register it to check error path for modify.
         let event_fd = EventFd::new(0).unwrap();
@@ -490,17 +514,23 @@ mod tests {
             .unwrap();
 
         // At this point ev2 is not registered. Check that unregistering it throws an error.
-        assert!(event_manager
-            .unregister(dummy_subscriber.lock().unwrap().event_fd_2.as_raw_fd())
-            .is_err());
+        assert!(
+            event_manager
+                .unregister(dummy_subscriber.lock().unwrap().event_fd_2.as_raw_fd())
+                .is_err()
+        );
 
         // Try to unregister ev1 twice. Only the first call should be successful.
-        assert!(event_manager
-            .unregister(dummy_subscriber.lock().unwrap().event_fd_1.as_raw_fd())
-            .is_ok());
-        assert!(event_manager
-            .unregister(dummy_subscriber.lock().unwrap().event_fd_1.as_raw_fd())
-            .is_err());
+        assert!(
+            event_manager
+                .unregister(dummy_subscriber.lock().unwrap().event_fd_1.as_raw_fd())
+                .is_ok()
+        );
+        assert!(
+            event_manager
+                .unregister(dummy_subscriber.lock().unwrap().event_fd_1.as_raw_fd())
+                .is_err()
+        );
     }
 
     #[test]
@@ -514,6 +544,11 @@ mod tests {
 
         let dummy_fd = dummy_subscriber.lock().unwrap().event_fd_1.as_raw_fd();
         assert!(event_manager.subscriber(dummy_fd).is_ok());
-        assert!(event_manager.subscriber(-1).is_err());
+
+        #[cfg(unix)]
+        let bad_fd: Pollable = -1;
+        #[cfg(windows)]
+        let bad_fd: Pollable = std::ptr::null_mut();
+        assert!(event_manager.subscriber(bad_fd).is_err());
     }
 }

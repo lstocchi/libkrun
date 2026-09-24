@@ -4,21 +4,25 @@
 // Portions Copyright 2017 The Chromium OS Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the THIRD-PARTY file.
+use crate::Error as DeviceError;
 use crate::virtio::net::Result;
 use crate::virtio::net::{NUM_QUEUES, QUEUE_CONFIG};
 use crate::virtio::queue::Error as QueueError;
 use crate::virtio::{
     ActivateError, ActivateResult, DeviceQueue, DeviceState, InterruptTransport, QueueConfig,
-    VirtioDevice, TYPE_NET,
+    TYPE_NET, VirtioDevice,
 };
-use crate::Error as DeviceError;
 
 use super::backend::{ReadError, WriteError};
 use super::worker::NetWorker;
 
+#[cfg(unix)]
+use std::os::fd::RawFd;
+#[cfg(windows)]
+use std::os::windows::io::RawSocket;
+
 use std::cmp;
 use std::io::Write;
-use std::os::fd::RawFd;
 use std::path::PathBuf;
 use virtio_bindings::virtio_net::VIRTIO_NET_F_MAC;
 use virtio_bindings::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
@@ -61,9 +65,14 @@ unsafe impl ByteValued for VirtioNetConfig {}
 
 #[derive(Clone)]
 pub enum VirtioNetBackend {
+    #[cfg(unix)]
     UnixstreamFd(RawFd),
+    #[cfg(windows)]
+    UnixstreamFd(RawSocket),
     UnixstreamPath(PathBuf),
+    #[cfg(unix)]
     UnixgramFd(RawFd),
+    #[cfg(unix)]
     UnixgramPath(PathBuf, bool),
     #[cfg(target_os = "linux")]
     Tap(String),

@@ -12,7 +12,7 @@ use std::slice;
 use libc::c_char;
 
 use arch_gen::x86::mpspec;
-use vm_memory::{Address, ByteValued, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
+use vm_memory::{Address, ByteValued, Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
 
 // This is a workaround to the Rust enforcement specifying that any implementation of a foreign
 // trait (in this case `ByteValued`) where:
@@ -44,7 +44,7 @@ unsafe impl ByteValued for MpcLintsrcWrapper {}
 unsafe impl ByteValued for MpfIntelWrapper {}
 
 // MPTABLE, describing VCPUS.
-const MPTABLE_START: u64 = 0x9fc00;
+pub const MPTABLE_START: u64 = 0x9fc00;
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum Error {
@@ -81,7 +81,7 @@ pub const MAX_SUPPORTED_CPUS: u32 = 254;
 
 // Convenience macro for making arrays of diverse character types.
 macro_rules! char_array {
-    ($t:ty; $( $c:expr ),*) => ( [ $( $c as $t ),* ] )
+    ($t:ty; $( $c:expr_2021 ),*) => ( [ $( $c as $t ),* ] )
 }
 
 // Most of these variables are sourced from the Intel MP Spec 1.4.
@@ -376,7 +376,7 @@ mod tests {
         let mut buf: Vec<u8> = vec![0; mpc_table.0.length as usize];
         mem.write_volatile_to(mpc_offset, &mut buf, mpc_table.0.length as usize)
             .unwrap();
-        sum.write(&buf).unwrap();
+        sum.write_all(&buf).unwrap();
         assert_eq!(sum.0, 0);
     }
 

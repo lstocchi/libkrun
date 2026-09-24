@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::{mem, thread};
+use std::{mem, panic::{catch_unwind, AssertUnwindSafe}, thread};
 
 use vm_memory::GuestMemoryMmap;
 
@@ -149,9 +149,15 @@ impl Port {
             thread::Builder::new()
                 .name("console port".into())
                 .spawn(move || {
-                    process_rx(
-                        mem, rx_queue, interrupt, input, control, port_id, stopfd, stop,
-                    )
+                    if catch_unwind(AssertUnwindSafe(|| {
+                        process_rx(
+                            mem, rx_queue, interrupt, input, control, port_id, stopfd, stop,
+                        )
+                    }))
+                    .is_err()
+                    {
+                        log::error!("console port {port_id}: RX worker panicked");
+                    }
                 })
                 .unwrap()
         });

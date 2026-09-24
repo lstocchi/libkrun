@@ -1,5 +1,6 @@
 use crate::tcp_tester::TcpTester;
 use macros::{guest, host};
+use std::net::Ipv4Addr;
 
 const PORT: u16 = 8001;
 
@@ -10,7 +11,7 @@ pub struct TestTsiTcpGuestListen {
 impl TestTsiTcpGuestListen {
     pub fn new() -> Self {
         Self {
-            tcp_tester: TcpTester::new(PORT),
+            tcp_tester: TcpTester::new(Ipv4Addr::LOCALHOST, PORT),
         }
     }
 }
@@ -18,34 +19,67 @@ impl TestTsiTcpGuestListen {
 #[host]
 mod host {
     use super::*;
-    use crate::common::setup_fs_and_enter;
-    use crate::{krun_call, krun_call_u32, Test, TestSetup};
-    use krun_sys::*;
-    use std::ffi::CString;
-    use std::ptr::null;
     use std::thread;
-    use std::time::Duration;
+
+    use crate::common::{build_init_config, init_krun, setup_standard_devices};
+    use crate::{ShouldRun, Test, TestSetup};
+
+    #[cfg(feature = "dynamic-linking")]
+    fn require_symbols() -> Result<(), libloading::Error> {
+        crate::common::require_vm_symbols()?;
+        krun::require(
+            None,
+            &[
+                krun::Symbol::KrunVsockDeviceNew,
+                krun::Symbol::KrunVsockDeviceDestroy,
+                krun::Symbol::KrunVsockDeviceAddPortForward,
+            ],
+        )
+    }
 
     impl Test for TestTsiTcpGuestListen {
-        fn start_vm(self: Box<Self>, test_setup: TestSetup) -> anyhow::Result<()> {
-            unsafe {
-                thread::spawn(move || {
-                    thread::sleep(Duration::from_secs(1));
-                    self.tcp_tester.run_client();
-                });
-
-                krun_call!(krun_set_log_level(KRUN_LOG_LEVEL_TRACE))?;
-                let ctx = krun_call_u32!(krun_create_ctx())?;
-                let port_mapping = format!("{PORT}:{PORT}");
-                let port_mapping = CString::new(port_mapping).unwrap();
-                let port_map = [port_mapping.as_ptr(), null()];
-
-                krun_call!(krun_set_port_map(ctx, port_map.as_ptr()))?;
-                krun_call!(krun_set_vm_config(ctx, 1, 512))?;
-                setup_fs_and_enter(ctx, test_setup)?;
-                println!("OK");
+        fn should_run(&self) -> ShouldRun {
+            #[cfg(feature = "dynamic-linking")]
+            if require_symbols().is_err() {
+                return ShouldRun::No("feature not enabled in this libkrun build");
             }
-            Ok(())
+            ShouldRun::Yes
+        }
+
+        fn start_vm(self: Box<Self>, test_setup: TestSetup) -> anyhow::Result<()> {
+            thread::spawn(move || {
+                self.tcp_tester.run_client();
+            });
+
+            init_krun()?;
+            #[cfg(feature = "dynamic-linking")]
+            require_symbols().unwrap();
+
+            let init_config = build_init_config(&test_setup.test_case, &[]);
+            let stdin = std::io::stdin();
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let (mut devices, payload) =
+                setup_standard_devices(&test_setup, &init_config, &stdin, &stdout, &stderr)?;
+            let mut vsock = krun::VsockDevice::new(3, krun::TsiFlags::HIJACK_INET)
+                .map_err(|e| anyhow::anyhow!("VsockDevice: {e:?}"))?;
+            vsock
+                .add_port_forward(&format!("{PORT}:{PORT}"))
+                .map_err(|e| anyhow::anyhow!("add_port_forward: {e:?}"))?;
+            devices.add(vsock);
+
+            let vmm = krun::VmmBuilder::new()
+                .vcpus(1)
+                .map_err(|e| anyhow::anyhow!("vcpus: {e:?}"))?
+                .ram_mib(512)
+                .map_err(|e| anyhow::anyhow!("ram_mib: {e:?}"))?
+                .payload(payload)
+                .devices(devices)
+                .build()
+                .map_err(|e| anyhow::anyhow!("build: {e:?}"))?;
+
+            vmm.run();
+            unreachable!()
         }
     }
 }

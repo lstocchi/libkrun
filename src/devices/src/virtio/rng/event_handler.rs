@@ -1,9 +1,12 @@
+#[cfg(unix)]
 use std::os::unix::io::AsRawFd;
+#[cfg(target_os = "windows")]
+use utils::windows::AsRawFd;
 
 use polly::event_manager::{EventManager, Subscriber};
 use utils::epoll::{EpollEvent, EventSet};
 
-use super::device::{Rng, REQ_INDEX};
+use super::device::{REQ_INDEX, Rng};
 use crate::virtio::device::VirtioDevice;
 
 impl Rng {
@@ -17,7 +20,9 @@ impl Rng {
         }
 
         if let Err(e) = self.queue_event(REQ_INDEX).read() {
-            error!("Failed to read request queue event: {e:?}");
+            if e.kind() != ErrorKind::WouldBlock {
+                error!("Failed to read request queue event: {e:?}");
+            }
         } else if self.process_req() {
             self.device_state.signal_used_queue();
         }
@@ -56,16 +61,15 @@ impl Rng {
 impl Subscriber for Rng {
     fn process(&mut self, event: &EpollEvent, event_manager: &mut EventManager) {
         let source = event.fd();
-        let req = self.queue_event(REQ_INDEX).as_raw_fd();
         let activate_evt = self.activate_evt.as_raw_fd();
-
-        if self.is_activated() {
-            match source {
-                _ if source == req => self.handle_req_event(event),
-                _ if source == activate_evt => {
-                    self.handle_activate_event(event_manager);
-                }
-                _ => warn!("Unexpected rng event received: {source:?}"),
+        if source == activate_evt {
+            self.handle_activate_event(event_manager);
+        } else if self.is_activated() {
+            let req = self.queue_event(REQ_INDEX).as_raw_fd();
+            if source == req {
+                self.handle_req_event(event);
+            } else {
+                warn!("Unexpected rng event received: {source:?}")
             }
         } else {
             warn!("rng: The device is not yet activated. Spurious event received: {source:?}");
@@ -79,3 +83,4 @@ impl Subscriber for Rng {
         )]
     }
 }
+use std::io::ErrorKind;

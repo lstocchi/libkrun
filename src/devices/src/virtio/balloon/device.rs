@@ -3,7 +3,7 @@ use std::convert::TryInto;
 use std::io::Write;
 
 use utils::eventfd::EventFd;
-use vm_memory::{ByteValued, GuestMemory, GuestMemoryMmap};
+use vm_memory::{ByteValued, GuestMemoryBackend, GuestMemoryMmap};
 
 use super::super::{
     ActivateError, ActivateResult, BalloonError, DeviceQueue, DeviceState, QueueConfig,
@@ -11,6 +11,8 @@ use super::super::{
 };
 use super::{defs, defs::uapi};
 use crate::virtio::InterruptTransport;
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::System::Memory::DiscardVirtualMemory;
 
 // Inflate queue.
 pub(crate) const IFQ_INDEX: usize = 0;
@@ -93,12 +95,21 @@ impl Balloon {
                     "balloon: should release guest_addr={:?} host_addr={:p} len={}",
                     desc.addr, host_addr, desc.len
                 );
+                #[cfg(target_os = "linux")]
+                let advice = libc::MADV_DONTNEED;
+                #[cfg(target_os = "macos")]
+                let advice = libc::MADV_FREE;
+                #[cfg(unix)]
                 unsafe {
                     libc::madvise(
                         host_addr as *mut libc::c_void,
                         desc.len.try_into().unwrap(),
-                        libc::MADV_DONTNEED,
+                        advice,
                     )
+                };
+                #[cfg(target_os = "windows")]
+                unsafe {
+                    DiscardVirtualMemory(host_addr as *mut core::ffi::c_void, desc.len as usize)
                 };
             }
 

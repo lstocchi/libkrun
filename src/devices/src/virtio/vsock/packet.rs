@@ -23,11 +23,14 @@ use std::net::{Ipv6Addr, SocketAddrV6};
 use std::os::raw::c_char;
 use std::result;
 
+#[cfg(windows)]
+use super::windows::sockaddr_storage::SockaddrStorage;
 #[cfg(target_os = "linux")]
-use nix::sys::socket::{sockaddr, AddressFamily};
+use nix::sys::socket::{AddressFamily, sockaddr};
+#[cfg(unix)]
 use nix::sys::socket::{SockaddrLike, SockaddrStorage};
 use utils::byte_order;
-use vm_memory::{self, Address, GuestAddress, GuestMemory, GuestMemoryError};
+use vm_memory::{self, Address, GuestAddress, GuestMemoryBackend, GuestMemoryError};
 
 use super::super::DescriptorChain;
 use super::defs;
@@ -191,9 +194,10 @@ pub struct VsockPacket {
     hdr: *mut u8,
     buf: Option<*mut u8>,
     buf_size: usize,
+    owned_buf: Option<Vec<u8>>,
 }
 
-fn get_host_address<T: GuestMemory>(
+fn get_host_address<T: GuestMemoryBackend>(
     mem: &T,
     guest_addr: GuestAddress,
     size: usize,
@@ -224,38 +228,107 @@ impl VsockPacket {
                 .map_err(VsockError::GuestMemoryMmap)?,
             buf: None,
             buf_size: 0,
+            owned_buf: None,
         };
+        let pkt_len = pkt.len();
 
         // No point looking for a data/buffer descriptor, if the packet is zero-lengthed.
-        if pkt.len() == 0 {
+        if pkt_len == 0 {
             return Ok(pkt);
         }
 
         // Reject weirdly-sized packets.
         //
-        if pkt.len() > defs::MAX_PKT_BUF_SIZE as u32 {
-            return Err(VsockError::InvalidPktLen(pkt.len()));
+        if pkt_len > defs::MAX_PKT_BUF_SIZE as u32 {
+            return Err(VsockError::InvalidPktLen(pkt_len));
         }
 
-        // If the packet header showed a non-zero length, there should be a data descriptor here.
-        let buf_desc = head.next_descriptor().ok_or(VsockError::BufDescMissing)?;
+        let head_data_size = head.len as usize - VSOCK_PKT_HDR_SIZE;
 
-        // TX data should be read-only.
+        // Single combined descriptor: header + data with no next descriptor.
+        if !head.has_next() {
+            if head_data_size == 0 {
+                return Err(VsockError::BufDescMissing);
+            }
+            let buf_addr = head
+                .addr
+                .checked_add(VSOCK_PKT_HDR_SIZE as u64)
+                .ok_or(VsockError::GuestMemoryBounds)?;
+            pkt.buf_size = head_data_size;
+            pkt.buf = Some(
+                get_host_address(head.mem, buf_addr, pkt.buf_size)
+                    .map_err(VsockError::GuestMemoryMmap)?,
+            );
+            if pkt.buf_size < pkt_len as usize {
+                return Err(VsockError::BufDescTooSmall);
+            }
+            return Ok(pkt);
+        }
+
+        let buf_desc = head.next_descriptor().ok_or(VsockError::BufDescMissing)?;
         if buf_desc.is_write_only() {
             return Err(VsockError::UnreadableDescriptor);
         }
 
-        // The data buffer should be large enough to fit the size of the data, as described by
-        // the header descriptor.
-        if buf_desc.len < pkt.len() {
+        // Classic two-descriptor case: header in first, all data in second. Zero-copy.
+        if head_data_size == 0 && !buf_desc.has_next() {
+            if buf_desc.len < pkt_len {
+                return Err(VsockError::BufDescTooSmall);
+            }
+            pkt.buf_size = buf_desc.len as usize;
+            pkt.buf = Some(
+                get_host_address(buf_desc.mem, buf_desc.addr, pkt.buf_size)
+                    .map_err(VsockError::GuestMemoryMmap)?,
+            );
+            return Ok(pkt);
+        }
+
+        // Multiple data regions: inline data after header and/or multiple data descriptors.
+        // Copy into a contiguous owned buffer.
+        let mut owned_buf: Vec<u8> = Vec::with_capacity(pkt_len as usize);
+
+        if head_data_size > 0 {
+            let buf_addr = head
+                .addr
+                .checked_add(VSOCK_PKT_HDR_SIZE as u64)
+                .ok_or(VsockError::GuestMemoryBounds)?;
+            let src = get_host_address(head.mem, buf_addr, head_data_size)
+                .map_err(VsockError::GuestMemoryMmap)?;
+            owned_buf.extend_from_slice(unsafe {
+                std::slice::from_raw_parts(src as *const u8, head_data_size)
+            });
+        }
+
+        // First data descriptor (already validated as readable above).
+        if buf_desc.len > 0 {
+            let src = get_host_address(buf_desc.mem, buf_desc.addr, buf_desc.len as usize)
+                .map_err(VsockError::GuestMemoryMmap)?;
+            owned_buf.extend_from_slice(unsafe {
+                std::slice::from_raw_parts(src as *const u8, buf_desc.len as usize)
+            });
+        }
+
+        let mut next = buf_desc.next_descriptor();
+        while let Some(desc) = next {
+            if desc.is_write_only() {
+                return Err(VsockError::UnreadableDescriptor);
+            }
+            if desc.len > 0 {
+                let src = get_host_address(desc.mem, desc.addr, desc.len as usize)
+                    .map_err(VsockError::GuestMemoryMmap)?;
+                owned_buf.extend_from_slice(unsafe {
+                    std::slice::from_raw_parts(src as *const u8, desc.len as usize)
+                });
+            }
+            next = desc.next_descriptor();
+        }
+
+        if owned_buf.len() < (pkt_len as usize) {
             return Err(VsockError::BufDescTooSmall);
         }
 
-        pkt.buf_size = buf_desc.len as usize;
-        pkt.buf = Some(
-            get_host_address(buf_desc.mem, buf_desc.addr, pkt.buf_size)
-                .map_err(VsockError::GuestMemoryMmap)?,
-        );
+        pkt.buf_size = owned_buf.len();
+        pkt.owned_buf = Some(owned_buf);
 
         Ok(pkt)
     }
@@ -281,6 +354,7 @@ impl VsockPacket {
                 .map_err(VsockError::GuestMemoryMmap)?,
             buf: None,
             buf_size: 0,
+            owned_buf: None,
         };
 
         // Starting from Linux 6.2 the virtio-vsock driver can use a single descriptor for both
@@ -331,11 +405,15 @@ impl VsockPacket {
     ///            (and often is) larger than the length of the packet data. The packet data length
     ///            is stored in the packet header, and accessible via `VsockPacket::len()`.
     pub fn buf(&self) -> Option<&[u8]> {
-        self.buf.map(|ptr| {
-            // This is safe since bound checks have already been performed when creating the packet
-            // from the virtq descriptor.
-            unsafe { std::slice::from_raw_parts(ptr as *const u8, self.buf_size) }
-        })
+        if let Some(ref owned) = self.owned_buf {
+            Some(owned.as_slice())
+        } else {
+            self.buf.map(|ptr| {
+                // This is safe since bound checks have already been performed when creating the
+                // packet from the virtq descriptor.
+                unsafe { std::slice::from_raw_parts(ptr as *const u8, self.buf_size) }
+            })
+        }
     }
 
     /// Provides in-place, byte-slice, mutable access to the vsock packet data buffer.
@@ -346,11 +424,15 @@ impl VsockPacket {
     ///            (and often is) larger than the length of the packet data. The packet data length
     ///            is stored in the packet header, and accessible via `VsockPacket::len()`.
     pub fn buf_mut(&mut self) -> Option<&mut [u8]> {
-        self.buf.map(|ptr| {
-            // This is safe since bound checks have already been performed when creating the packet
-            // from the virtq descriptor.
-            unsafe { std::slice::from_raw_parts_mut(ptr, self.buf_size) }
-        })
+        if let Some(ref mut owned) = self.owned_buf {
+            Some(owned.as_mut_slice())
+        } else {
+            self.buf.map(|ptr| {
+                // This is safe since bound checks have already been performed when creating the
+                // packet from the virtq descriptor.
+                unsafe { std::slice::from_raw_parts_mut(ptr, self.buf_size) }
+            })
+        }
     }
 
     pub fn src_cid(&self) -> u64 {
@@ -545,6 +627,11 @@ impl VsockPacket {
         }
     }
 
+    #[cfg(target_os = "windows")]
+    fn parse_address(buf: &[u8], addr_len: u32) -> Option<SockaddrStorage> {
+        SockaddrStorage::from_linux_bytes(buf, addr_len)
+    }
+
     pub fn read_proxy_create(&self) -> Option<TsiProxyCreate> {
         if self.buf_size >= 6 {
             let peer_port: u32 = byte_order::read_le_u32(&self.buf().unwrap()[0..]);
@@ -575,10 +662,10 @@ impl VsockPacket {
     }
 
     pub fn write_connect_rsp(&mut self, rsp: TsiConnectRsp) {
-        if self.buf_size >= 4 {
-            if let Some(buf) = self.buf_mut() {
-                byte_order::write_le_u32(&mut buf[0..], rsp.result as u32);
-            }
+        if self.buf_size >= 4
+            && let Some(buf) = self.buf_mut()
+        {
+            byte_order::write_le_u32(&mut buf[0..], rsp.result as u32);
         }
     }
 
@@ -598,29 +685,29 @@ impl VsockPacket {
     }
 
     pub fn write_getname_rsp(&mut self, rsp: TsiGetnameRsp) {
-        if self.buf_size >= 132 {
-            if let Some(buf) = self.buf_mut() {
-                byte_order::write_le_u32(&mut buf[0..], rsp.result as u32);
-                byte_order::write_le_u32(&mut buf[4..], rsp.addr_len);
-                let addr_ptr = rsp.addr.as_ptr();
-                let slice = unsafe {
-                    std::slice::from_raw_parts(addr_ptr as *const u8, rsp.addr.len() as usize)
-                };
-                buf[8..(rsp.addr.len() + 8) as usize].copy_from_slice(slice);
+        if self.buf_size >= 132
+            && let Some(buf) = self.buf_mut()
+        {
+            byte_order::write_le_u32(&mut buf[0..], rsp.result as u32);
+            byte_order::write_le_u32(&mut buf[4..], rsp.addr_len);
+            let addr_ptr = rsp.addr.as_ptr();
+            let slice = unsafe {
+                std::slice::from_raw_parts(addr_ptr as *const u8, rsp.addr.len() as usize)
+            };
+            buf[8..(rsp.addr.len() + 8) as usize].copy_from_slice(slice);
 
-                // On macOS, convert BSD sockaddr (u8 sa_len + u8 sa_family) to
-                // Linux wire format (u16 sa_family). Also translate macOS AF_*
-                // values to their Linux equivalents (e.g. AF_INET6: 30 → 10).
-                #[cfg(target_os = "macos")]
-                {
-                    let bsd_family = buf[9];
-                    let linux_family: u16 = match bsd_family as i32 {
-                        libc::AF_INET => defs::LINUX_AF_INET,
-                        libc::AF_INET6 => defs::LINUX_AF_INET6,
-                        _ => 0, // AF_UNSPEC
-                    };
-                    byte_order::write_le_u16(&mut buf[8..], linux_family);
-                }
+            // On macOS, convert BSD sockaddr (u8 sa_len + u8 sa_family) to
+            // Linux wire format (u16 sa_family). Also translate macOS AF_*
+            // values to their Linux equivalents (e.g. AF_INET6: 30 → 10).
+            #[cfg(target_os = "macos")]
+            {
+                let bsd_family = buf[9];
+                let linux_family: u16 = match bsd_family as i32 {
+                    libc::AF_INET => defs::LINUX_AF_INET,
+                    libc::AF_INET6 => defs::LINUX_AF_INET6,
+                    _ => 0, // AF_UNSPEC
+                };
+                byte_order::write_le_u16(&mut buf[8..], linux_family);
             }
         }
     }
@@ -659,10 +746,10 @@ impl VsockPacket {
     }
 
     pub fn write_listen_rsp(&mut self, rsp: TsiListenRsp) {
-        if self.buf_size >= 4 {
-            if let Some(buf) = self.buf_mut() {
-                byte_order::write_le_u32(&mut buf[0..], rsp.result as u32);
-            }
+        if self.buf_size >= 4
+            && let Some(buf) = self.buf_mut()
+        {
+            byte_order::write_le_u32(&mut buf[0..], rsp.result as u32);
         }
     }
 
@@ -678,10 +765,10 @@ impl VsockPacket {
     }
 
     pub fn write_accept_rsp(&mut self, rsp: TsiAcceptRsp) {
-        if self.buf_size >= 4 {
-            if let Some(buf) = self.buf_mut() {
-                byte_order::write_le_u32(&mut buf[0..], rsp.result as u32);
-            }
+        if self.buf_size >= 4
+            && let Some(buf) = self.buf_mut()
+        {
+            byte_order::write_le_u32(&mut buf[0..], rsp.result as u32);
         }
     }
 
@@ -699,10 +786,10 @@ impl VsockPacket {
     }
 
     pub fn write_time_sync(&mut self, time: u64) {
-        if self.buf_size >= 8 {
-            if let Some(buf) = self.buf_mut() {
-                byte_order::write_le_u64(&mut buf[0..], time);
-            }
+        if self.buf_size >= 8
+            && let Some(buf) = self.buf_mut()
+        {
+            byte_order::write_le_u64(&mut buf[0..], time);
         }
     }
 }

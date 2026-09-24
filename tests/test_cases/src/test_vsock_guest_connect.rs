@@ -1,3 +1,5 @@
+#![cfg(any(feature = "host", target_os = "linux"))]
+
 use macros::{guest, host};
 use std::io::{ErrorKind, Read};
 use std::os::unix::net::UnixStream;
@@ -33,15 +35,26 @@ const VSOCK_PORT: u32 = 1234;
 mod host {
     use super::*;
 
-    use crate::common::setup_fs_and_enter;
-    use crate::{krun_call, krun_call_u32};
-    use crate::{Test, TestSetup};
-    use krun_sys::*;
-    use std::ffi::CString;
     use std::io::Write;
+    use std::mem;
     use std::os::unix::net::UnixListener;
-    use std::os::unix::prelude::OsStrExt;
-    use std::{mem, thread};
+    use std::thread;
+
+    use crate::common::{build_init_config, init_krun, setup_standard_devices};
+    use crate::{ShouldRun, Test, TestSetup};
+
+    #[cfg(feature = "dynamic-linking")]
+    fn require_symbols() -> Result<(), libloading::Error> {
+        crate::common::require_vm_symbols()?;
+        krun::require(
+            None,
+            &[
+                krun::Symbol::KrunVsockDeviceNew,
+                krun::Symbol::KrunVsockDeviceDestroy,
+                krun::Symbol::KrunVsockDeviceAddUnixPort,
+            ],
+        )
+    }
 
     fn server(listener: UnixListener) {
         let (mut stream, _addr) = listener.accept().unwrap();
@@ -50,30 +63,50 @@ mod host {
         stream_expect_msg(&mut stream, b"pong!");
         stream_expect_wouldblock(&mut stream);
         stream.write_all(b"bye!").unwrap();
-        // Leak the socket fd, to make sure it is not closed early when we exit the thread
         mem::forget(stream);
     }
 
     impl Test for TestVsockGuestConnect {
-        fn start_vm(self: Box<Self>, test_setup: TestSetup) -> anyhow::Result<()> {
-            let sock_path = test_setup.tmp_dir.join("test.sock");
-            let sock_path_cstr = CString::new(sock_path.as_os_str().as_bytes())?;
-
-            let listener = UnixListener::bind(&sock_path).unwrap();
-
-            thread::spawn(move || server(listener));
-            unsafe {
-                krun_call!(krun_set_log_level(KRUN_LOG_LEVEL_TRACE))?;
-                let ctx = krun_call_u32!(krun_create_ctx())?;
-                krun_call!(krun_add_vsock_port(
-                    ctx,
-                    VSOCK_PORT,
-                    sock_path_cstr.as_ptr()
-                ))?;
-                krun_call!(krun_set_vm_config(ctx, 1, 1024))?;
-                setup_fs_and_enter(ctx, test_setup)?;
+        fn should_run(&self) -> ShouldRun {
+            #[cfg(feature = "dynamic-linking")]
+            if require_symbols().is_err() {
+                return ShouldRun::No("feature not enabled in this libkrun build");
             }
-            Ok(())
+            ShouldRun::Yes
+        }
+
+        fn start_vm(self: Box<Self>, test_setup: TestSetup) -> anyhow::Result<()> {
+            init_krun()?;
+            #[cfg(feature = "dynamic-linking")]
+            require_symbols().unwrap();
+
+            let sock_path = test_setup.tmp_dir.join("test.sock");
+            let listener = UnixListener::bind(&sock_path).unwrap();
+            thread::spawn(move || server(listener));
+
+            let init_config = build_init_config(&test_setup.test_case, &[]);
+            let stdin = std::io::stdin();
+            let stdout = std::io::stdout();
+            let stderr = std::io::stderr();
+            let (mut devices, payload) =
+                setup_standard_devices(&test_setup, &init_config, &stdin, &stdout, &stderr)?;
+            let mut vsock = krun::VsockDevice::new(3, krun::TsiFlags::empty())
+                .map_err(|e| anyhow::anyhow!("VsockDevice: {e:?}"))?;
+            vsock.add_unix_port(VSOCK_PORT, sock_path.to_str().unwrap(), false);
+            devices.add(vsock);
+
+            let vmm = krun::VmmBuilder::new()
+                .vcpus(1)
+                .map_err(|e| anyhow::anyhow!("vcpus: {e:?}"))?
+                .ram_mib(1024)
+                .map_err(|e| anyhow::anyhow!("ram_mib: {e:?}"))?
+                .payload(payload)
+                .devices(devices)
+                .build()
+                .map_err(|e| anyhow::anyhow!("build: {e:?}"))?;
+
+            vmm.run();
+            unreachable!()
         }
     }
 }
@@ -84,7 +117,7 @@ mod guest {
     use crate::Test;
 
     use nix::libc::VMADDR_CID_HOST;
-    use nix::sys::socket::{connect, socket, AddressFamily, SockFlag, SockType, VsockAddr};
+    use nix::sys::socket::{AddressFamily, SockFlag, SockType, VsockAddr, connect, socket};
     use std::io::Write;
     use std::os::fd::AsRawFd;
 

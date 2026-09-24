@@ -9,6 +9,52 @@
 #include <sys/stat.h>
 
 #include <libkrun.h>
+#include <libkrun_init.h>
+
+static bool push_to_stderr(void *userdata, KrunStr s)
+{
+    (void)userdata;
+    fwrite(s.data, 1, s.len, stderr);
+    return true;
+}
+
+// CHECK_INIT macro for init-blob errors (KrunInitError)
+static KrunVtableHandle stderr_writer = KRUN_VTABLE_HANDLE(
+    KRUN_INIT_PUSH_STR_TYPE_TAG,
+    ((KrunInitPushStrVtable){ .drop = NULL, .push = push_to_stderr }),
+    NULL);
+
+#define CHECK_INIT(call)                                                       \
+    err = NULL;                                                                \
+    call;                                                                      \
+    if (err) {                                                                 \
+        flockfile(stderr);                                                     \
+        fprintf(stderr, "%s failed: ", #call);                                 \
+        krun_init_error_message(err, &stderr_writer);                          \
+        fputc('\n', stderr);                                                   \
+        funlockfile(stderr);                                                   \
+        krun_init_error_destroy(err);                                          \
+        return -1;                                                             \
+    }
+
+// CHECK macro for libkrun errors (KrunError)
+static KrunVtableHandle krun_stderr_writer = KRUN_VTABLE_HANDLE(
+    KRUN_PUSH_STR_TYPE_TAG,
+    ((KrunPushStrVtable){ .drop = NULL, .push = push_to_stderr }),
+    NULL);
+
+#define CHECK(call)                                                            \
+    krun_err = NULL;                                                           \
+    call;                                                                      \
+    if (krun_err) {                                                            \
+        flockfile(stderr);                                                     \
+        fprintf(stderr, "%s failed: ", #call);                                 \
+        krun_error_message(krun_err, &krun_stderr_writer);                     \
+        fputc('\n', stderr);                                                   \
+        funlockfile(stderr);                                                   \
+        krun_error_destroy(krun_err);                                          \
+        return -1;                                                             \
+    }
 
 static int cmd_output(char *output, size_t output_size, const char *prog, ...)
 {
@@ -119,35 +165,46 @@ int main(int argc, char *const argv[])
     const char *const *command_args = (argc > 3) ? (const char *const *)&argv[3] : NULL;
     const char *const envp[] = { 0 };
 
-    krun_set_log_level(KRUN_LOG_LEVEL_WARN);
+    KrunError krun_err;
+    CHECK(krun_init_log(-1, KRUN_LOG_LEVEL_WARN, KRUN_LOG_STYLE_AUTO, 0, &krun_err));
 
-    int err;
-    int ctx_id = krun_create_ctx();
-    if (ctx_id < 0) { errno = -ctx_id; perror("krun_create_ctx"); return 1; }
+    // Create the filesystem overlay for init-blob injection.
+    KrunFsOverlay overlay = krun_fs_overlay_new();
 
-    if ((err = krun_disable_implicit_console(ctx_id))) {
-        errno = -err;
-        perror("krun_disable_implicit_console");
+    // Create the krunfw payload (embedded kernel + init).
+    KrunPayload payload = krun_payload_load_krunfw(&krun_err);
+    if (!payload) {
+        fprintf(stderr, "Error loading krunfw payload\n");
         return 1;
     }
 
-    int console_id = krun_add_virtio_console_multiport(ctx_id);
-    if (console_id < 0) {
-        errno = -console_id;
-        perror("krun_add_virtio_console_multiport");
-        return 1;
+    // Build init configuration.
+    {
+        KrunInitError err;
+        KrunInitBuilder builder = krun_init_config_builder();
+
+        krun_init_builder_arg(&builder, KRUN_STR(command));
+        if (command_args) {
+            for (int i = 0; command_args[i]; i++)
+                krun_init_builder_arg(&builder, KRUN_STR(command_args[i]));
+        }
+
+        KrunInitConfig config = krun_init_builder_build(&builder);
+        CHECK_INIT(krun_init_config_apply(config, overlay, payload, &err));
     }
+
+    // Create the device manager.
+    KrunMmioDeviceManager devices = krun_mmio_device_manager_new();
 
     /* Configure console ports - edit this section to add/remove ports */
     {
-        
-        // You could also use the controlling terminal of this process in the guest: 
-        /* 
-        if ((err = krun_add_console_port_tty(ctx_id, console_id, "host_tty", open("/dev/tty", O_RDWR)))) {
-            errno = -err; 
-            perror("port host_tty"); 
-            return 1;
-        }
+        KrunConsoleBuilder cb = krun_console_device_builder();
+
+        // You could also use the controlling terminal of this process in the guest:
+        /*
+        uint32_t port_idx;
+        int host_tty = open("/dev/tty", O_RDWR);
+        CHECK(krun_console_builder_add_tty_port(cb, KRUN_STR("host_tty"), host_tty, &port_idx, &krun_err));
         */
 
         int num_consoles = 3;
@@ -162,11 +219,8 @@ int main(int argc, char *const argv[])
                 perror("create_tmux_tty");
                 return 1;
             }
-            if ((err = krun_add_console_port_tty(ctx_id, console_id, port_name, tmux_fd))) {
-                errno = -err;
-                perror("krun_add_console_port_tty");
-                return 1;
-            }
+            uint32_t port_idx;
+            CHECK(krun_console_builder_add_tty_port(cb, KRUN_STR(port_name), tmux_fd, &port_idx, &krun_err));
         }
 
         int in_fd, out_fd;
@@ -174,11 +228,8 @@ int main(int argc, char *const argv[])
             perror("create_fifo_inout");
             return 1;
         }
-        if ((err = krun_add_console_port_inout(ctx_id, console_id, "fifo_inout", in_fd, out_fd))) {
-            errno = -err;
-            perror("krun_add_console_port_inout");
-            return 1;
-        }
+        uint32_t port_idx;
+        CHECK(krun_console_builder_add_inout_port(cb, KRUN_STR("fifo_inout"), in_fd, out_fd, &port_idx, &krun_err));
 
         fprintf(stderr, "\n=== Console ports configured ===\n");
         for (int i = 0; i < num_consoles; i++) {
@@ -187,32 +238,34 @@ int main(int argc, char *const argv[])
         fprintf(stderr, "  fifo_inout: /tmp/consoles_example_in (host->guest)\n");
         fprintf(stderr, "  fifo_inout: /tmp/consoles_example_out (guest->host)\n");
         fprintf(stderr, "================================\n\n");
+
+        CHECK(KrunConsoleDevice console = krun_console_builder_build(cb, &krun_err));
+        krun_mmio_device_manager_add(devices, console);
     }
 
-    if ((err = krun_set_vm_config(ctx_id, 4, 4096))) {
-        errno = -err;
-        perror("krun_set_vm_config");
-        return 1;
+    // Configure the root filesystem via virtiofs.
+    {
+        CHECK(KrunFsDevice rootfs = krun_fs_device_new(KRUN_STR("/dev/root"), KRUN_STR(root_dir), &krun_err));
+        krun_fs_device_set_overlay(rootfs, overlay);
+        krun_mmio_device_manager_add(devices, rootfs);
     }
 
-    if ((err = krun_set_root(ctx_id, root_dir))) {
-        errno = -err;
-        perror("krun_set_root");
-        return 1;
+    {
+        CHECK(KrunRngDevice rng = krun_rng_device_new(&krun_err));
+        krun_mmio_device_manager_add(devices, rng);
+
+        CHECK(KrunBalloonDevice balloon = krun_balloon_device_new(&krun_err));
+        krun_mmio_device_manager_add(devices, balloon);
     }
 
-    if ((err = krun_set_exec(ctx_id, command, command_args, envp))) {
-        errno = -err;
-        perror("krun_set_exec");
-        return 1;
-    }
+    // Build the VM.
+    KrunVmmBuilder builder = krun_vmm_builder_new();
+    CHECK(krun_vmm_builder_vcpus(&builder, 4, &krun_err));
+    CHECK(krun_vmm_builder_ram_mib(&builder, 4096, &krun_err));
+    krun_vmm_builder_payload(&builder, payload);
+    krun_vmm_builder_devices(&builder, devices);
 
-    if ((err = krun_start_enter(ctx_id))) {
-        errno = -err;
-        perror("krun_start_enter");
-        return 1;
-    }
+    CHECK(KrunVmm vmm = krun_vmm_builder_build(&builder, &krun_err));
+    krun_vmm_run(vmm);
     return 0;
 }
-
-

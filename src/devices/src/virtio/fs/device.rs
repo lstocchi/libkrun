@@ -2,24 +2,28 @@
 use crossbeam_channel::Sender;
 use std::cmp;
 use std::io::Write;
-use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
-use utils::eventfd::{EventFd, EFD_NONBLOCK};
+use utils::eventfd::{EFD_NONBLOCK, EventFd};
 #[cfg(target_os = "macos")]
 use utils::worker_message::WorkerMessage;
 use virtio_bindings::{virtio_config::VIRTIO_F_VERSION_1, virtio_ring::VIRTIO_RING_F_EVENT_IDX};
 use vm_memory::{ByteValued, GuestMemoryMmap};
 
 use super::super::{
-    ActivateResult, DeviceQueue, DeviceState, FsError, QueueConfig, VirtioDevice, VirtioShmRegion,
+    ActivateError, ActivateResult, DeviceQueue, DeviceState, FsError, QueueConfig, VirtioDevice,
+    VirtioShmRegion,
 };
-use super::passthrough;
-use super::worker::FsWorker;
 use super::ExportTable;
+use super::passthrough;
+use super::virtual_entry::VirtualDirEntry;
+use super::worker::FsWorker;
 use super::{defs, defs::uapi};
 use crate::virtio::InterruptTransport;
+use crate::virtio::passthrough::PermissionSemantics;
 
 #[derive(Copy, Clone)]
 #[repr(C, packed)]
@@ -44,8 +48,11 @@ pub struct Fs {
     acked_features: u64,
     device_state: DeviceState,
     config: VirtioFsConfig,
+    allow_idmap: bool,
     shm_region: Option<VirtioShmRegion>,
-    passthrough_cfg: passthrough::Config,
+    passthrough_cfg: Option<passthrough::Config>,
+    read_only: bool,
+    virtual_entries: Vec<VirtualDirEntry<'static>>,
     worker_thread: Option<JoinHandle<()>>,
     worker_stopfd: EventFd,
     exit_code: Arc<AtomicI32>,
@@ -56,9 +63,11 @@ pub struct Fs {
 impl Fs {
     pub fn new(
         fs_id: String,
-        shared_dir: String,
+        semantics: PermissionSemantics,
+        shared_dir: Option<String>,
         exit_code: Arc<AtomicI32>,
-        allow_root_dir_delete: bool,
+        read_only: bool,
+        virtual_entries: Vec<VirtualDirEntry<'static>>,
     ) -> super::Result<Fs> {
         let avail_features = (1u64 << VIRTIO_F_VERSION_1) | (1u64 << VIRTIO_RING_F_EVENT_IDX);
 
@@ -67,19 +76,33 @@ impl Fs {
         config.tag[..tag.len()].copy_from_slice(tag.as_slice());
         config.num_request_queues = 1;
 
-        let fs_cfg = passthrough::Config {
-            root_dir: shared_dir,
-            allow_root_dir_delete,
-            ..Default::default()
+        let attr_timeout = if matches!(semantics, PermissionSemantics::LinuxSimplified) {
+            // As uid/gid are context-dependent, attributes can't be cached.
+            Duration::from_secs(0)
+        } else {
+            // The value defined as default in virtio-fs.
+            Duration::from_secs(5)
         };
+
+        let fs_cfg = shared_dir.map(|root_dir| passthrough::Config {
+            root_dir,
+            semantics,
+            attr_timeout,
+            ..Default::default()
+        });
+
+        let allow_idmap = matches!(semantics, PermissionSemantics::LinuxComplete);
 
         Ok(Fs {
             avail_features,
             acked_features: 0,
             device_state: DeviceState::Inactive,
             config,
+            allow_idmap,
             shm_region: None,
             passthrough_cfg: fs_cfg,
+            read_only,
+            virtual_entries,
             worker_thread: None,
             worker_stopfd: EventFd::new(EFD_NONBLOCK).map_err(FsError::EventFd)?,
             exit_code,
@@ -99,10 +122,24 @@ impl Fs {
     pub fn set_export_table(&mut self, export_table: ExportTable) -> u64 {
         static FS_UNIQUE_ID: AtomicU64 = AtomicU64::new(0);
 
-        self.passthrough_cfg.export_fsid = FS_UNIQUE_ID.fetch_add(1, Ordering::Relaxed);
-        self.passthrough_cfg.export_table = Some(export_table);
+        let Some(cfg) = self.passthrough_cfg.as_mut() else {
+            // NullFs-backed devices have no passthrough config and don't
+            // participate in cross-domain fd export. Consume (and waste) an
+            // fsid so numbering stays dense, but don't store the table.
+            return FS_UNIQUE_ID.fetch_add(1, Ordering::Relaxed);
+        };
+        cfg.export_fsid = FS_UNIQUE_ID.fetch_add(1, Ordering::Relaxed);
+        cfg.export_table = Some(export_table);
 
-        self.passthrough_cfg.export_fsid
+        cfg.export_fsid
+    }
+
+    pub fn add_virtual_entry(&mut self, entry: VirtualDirEntry<'static>) {
+        self.virtual_entries.push(entry);
+    }
+
+    pub fn set_exit_code(&mut self, exit_code: Arc<AtomicI32>) {
+        self.exit_code = exit_code;
     }
 
     #[cfg(target_os = "macos")]
@@ -176,18 +213,26 @@ impl VirtioDevice for Fs {
             queue_evts.push(dq.event);
         }
 
+        let virtual_entries = self.virtual_entries.clone();
         let worker = FsWorker::new(
             worker_queues,
             queue_evts,
             interrupt.clone(),
             mem.clone(),
+            self.allow_idmap,
             self.shm_region.clone(),
             self.passthrough_cfg.clone(),
+            self.read_only,
+            virtual_entries,
             self.worker_stopfd.try_clone().unwrap(),
             self.exit_code.clone(),
             #[cfg(target_os = "macos")]
             self.map_sender.clone(),
-        );
+        )
+        .map_err(|e| {
+            error!("virtio_fs: failed to create worker: {}", e);
+            ActivateError::BadActivate
+        })?;
         self.worker_thread = Some(worker.run());
 
         self.device_state = DeviceState::Activated(mem, interrupt);

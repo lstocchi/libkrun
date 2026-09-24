@@ -22,14 +22,30 @@ pub const INITRD_SEV_START: u64 = 0xa00000;
 /// Start of the high memory.
 pub const HIMEM_START: u64 = 0x0010_0000; //1 MB.
 
-// Typically, on x86 systems 16 IRQs are used (0-15).
+// The I/O APIC has 24 pins (0-23). ISA IRQs 0-4 are reserved for
+// legacy devices, leaving GSIs 5-23 for virtio-mmio devices.
 /// First usable IRQ ID for virtio device interrupts on x86_64.
 pub const IRQ_BASE: u32 = 5;
 /// Last usable IRQ ID for virtio device interrupts on x86_64.
-pub const IRQ_MAX: u32 = 15;
+pub const IRQ_MAX: u32 = 23;
 
 /// Address for the TSS setup.
 pub const KVM_TSS_ADDRESS: u64 = 0xfffb_d000;
+
+/// Address of the hvm_start_info struct used in PVH boot.
+/// Mutually exclusive with SNP_CPUID_START (TEE only).
+pub const PVH_INFO_START: u64 = 0x6000;
+
+/// Starting address of array of modules of hvm_modlist_entry type.
+/// Used to enable initrd support using the PVH boot ABI.
+pub const MODLIST_START: u64 = 0x6040;
+
+/// Address of memory map table used in PVH boot. Can overlap
+/// with the zero page address since they are mutually exclusive.
+pub const MEMMAP_START: u64 = 0x7000;
+
+/// Location of RSDP pointer in x86 machines.
+pub const RSDP_ADDR: u64 = 0x000e_0000;
 
 /// The 'zero page', a.k.a linux kernel bootparams.
 pub const ZERO_PAGE_START: u64 = 0x7000;

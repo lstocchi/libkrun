@@ -6,15 +6,16 @@ use std::cmp;
 use std::collections::VecDeque;
 use std::fmt::{self, Display};
 use std::io::{self, Read, Write};
-use std::mem::{size_of, MaybeUninit};
+use std::mem::{MaybeUninit, size_of};
 use std::ops::Deref;
 use std::ptr::copy_nonoverlapping;
 use std::result;
 
 use crate::virtio::queue::DescriptorChain;
 use vm_memory::{
-    Address, ByteValued, Bytes, GuestAddress, GuestMemory, GuestMemoryError, GuestMemoryMmap,
-    GuestMemoryRegion, Le16, Le32, Le64, VolatileMemory, VolatileMemoryError, VolatileSlice,
+    Address, ByteValued, Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryError,
+    GuestMemoryMmap, GuestMemoryRegion, Le16, Le32, Le64, VolatileMemory, VolatileMemoryError,
+    VolatileSlice,
 };
 
 use super::file_traits::{FileReadWriteAtVolatile, FileReadWriteVolatile};
@@ -276,7 +277,7 @@ impl<'a> Reader<'a> {
                     return Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
                         "failed to fill whole buffer",
-                    ))
+                    ));
                 }
                 Ok(n) => count -= n,
                 Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
@@ -423,7 +424,7 @@ impl<'a> Writer<'a> {
                     return Err(io::Error::new(
                         io::ErrorKind::WriteZero,
                         "failed to write whole buffer",
-                    ))
+                    ));
                 }
                 Ok(n) => count -= n,
                 Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
@@ -565,7 +566,7 @@ mod tests {
         assert_eq!(reader.bytes_read(), 0);
 
         let mut buffer = [0_u8; 64];
-        if let Err(_) = reader.read_exact(&mut buffer) {
+        if reader.read_exact(&mut buffer).is_err() {
             panic!("read_exact should not fail here");
         }
 
@@ -605,15 +606,15 @@ mod tests {
         assert_eq!(writer.available_bytes(), 106);
         assert_eq!(writer.bytes_written(), 0);
 
-        let mut buffer = [0_u8; 64];
-        if let Err(_) = writer.write_all(&mut buffer) {
+        let buffer = [0_u8; 64];
+        if writer.write_all(&buffer).is_err() {
             panic!("write_all should not fail here");
         }
 
         assert_eq!(writer.available_bytes(), 42);
         assert_eq!(writer.bytes_written(), 64);
 
-        match writer.write(&mut buffer) {
+        match writer.write(&buffer) {
             Err(_) => panic!("write should not fail here"),
             Ok(length) => assert_eq!(length, 42),
         }
@@ -739,7 +740,7 @@ mod tests {
         )
         .expect("create_descriptor_chain failed");
         let mut writer = Writer::new(&memory, chain_writer).expect("failed to create Writer");
-        if let Err(_) = writer.write_obj(secret) {
+        if writer.write_obj(secret).is_err() {
             panic!("write_obj should not fail here");
         }
 
@@ -777,8 +778,7 @@ mod tests {
 
         let mut reader = Reader::new(&memory, chain).expect("failed to create Reader");
 
-        let mut buf = Vec::with_capacity(1024);
-        buf.resize(1024, 0);
+        let mut buf = vec![0; 1024];
 
         assert_eq!(
             reader
@@ -929,7 +929,7 @@ mod tests {
         .expect("create_descriptor_chain failed");
         let mut reader = Reader::new(&memory, chain).expect("failed to create Reader");
 
-        if let Ok(_) = reader.split_at(256) {
+        if reader.split_at(256).is_ok() {
             panic!("successfully split Reader with out of bounds offset");
         }
     }
