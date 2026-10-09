@@ -9,8 +9,11 @@ use windows_sys::Win32::{
     Foundation::FALSE,
     Storage::FileSystem::{ReadFile, WriteFile},
     System::{
-        Console::{CONSOLE_SCREEN_BUFFER_INFO, GetConsoleScreenBufferInfo, GetNumberOfConsoleInputEvents},
-        Threading::{INFINITE, WaitForMultipleObjects, WaitForSingleObject},
+        Console::{
+            GetConsoleScreenBufferInfo, GetNumberOfConsoleInputEvents, CONSOLE_SCREEN_BUFFER_INFO,
+        },
+        Pipes::PeekNamedPipe,
+        Threading::{WaitForMultipleObjects, WaitForSingleObject, INFINITE},
     },
 };
 
@@ -60,15 +63,40 @@ impl AsRawHandle for PortInputHandle {
 
 impl PortInput for PortInputHandle {
     fn read_bytes(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        // A synchronous ReadFile on a console handle cannot be interrupted by
-        // the port stop event. Check first so the RX thread waits on both the
-        // console and stop handles instead of getting stuck during teardown.
-        let mut event_count = 0;
-        if unsafe { GetNumberOfConsoleInputEvents(self.as_raw_handle(), &mut event_count) } == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if event_count == 0 {
-            return Err(io::ErrorKind::WouldBlock.into());
+        if self.0.is_terminal() {
+            // A synchronous ReadFile on a console handle cannot be interrupted by
+            // the port stop event. Check first so the RX thread waits on both the
+            // console and stop handles instead of getting stuck during teardown.
+            let mut event_count = 0;
+            if unsafe { GetNumberOfConsoleInputEvents(self.as_raw_handle(), &mut event_count) } == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            if event_count == 0 {
+                return Err(io::ErrorKind::WouldBlock.into());
+            }
+        } else {
+            let mut bytes_available = 0;
+            if unsafe {
+                PeekNamedPipe(
+                    self.as_raw_handle(),
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    &mut bytes_available,
+                    std::ptr::null_mut(),
+                )
+            } == 0
+            {
+                let error = io::Error::last_os_error();
+                if error.kind() == ErrorKind::BrokenPipe {
+                    return Ok(0);
+                }
+                return Err(error);
+            }
+            if bytes_available == 0 {
+                return Err(ErrorKind::WouldBlock.into());
+            }
         }
 
         let len = u32::try_from(buf.len()).map_err(|_| {
@@ -96,6 +124,12 @@ impl PortInput for PortInputHandle {
     }
 
     fn wait_until_readable(&self, stopfd: Option<&EventFd>) {
+        if !self.0.is_terminal() {
+            // Windows does not signal an anonymous-pipe handle when data arrives.
+            // Poll it so the stop event is observed promptly during port shutdown.
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            return;
+        }
         let mut handles = vec![self.as_raw_handle()];
         if let Some(s) = stopfd {
             handles.push(s.as_raw_fd());

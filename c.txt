@@ -1,0 +1,61 @@
+diff --git a/src/devices/src/virtio/console/port_io/windows.rs b/src/devices/src/virtio/console/port_io/windows.rs
+index 36440106..77a68f69 100644
+--- a/src/devices/src/virtio/console/port_io/windows.rs
++++ b/src/devices/src/virtio/console/port_io/windows.rs
+@@ -9,7 +9,7 @@ use windows_sys::Win32::{
+     Foundation::FALSE,
+     Storage::FileSystem::{ReadFile, WriteFile},
+     System::{
+-        Console::{CONSOLE_SCREEN_BUFFER_INFO, GetConsoleScreenBufferInfo},
++        Console::{CONSOLE_SCREEN_BUFFER_INFO, GetConsoleScreenBufferInfo, GetNumberOfConsoleInputEvents},
+         Threading::{INFINITE, WaitForMultipleObjects, WaitForSingleObject},
+     },
+ };
+@@ -60,6 +60,17 @@ impl AsRawHandle for PortInputHandle {
+ 
+ impl PortInput for PortInputHandle {
+     fn read_bytes(&mut self, buf: &mut [u8]) -> io::Result<usize> {
++        // A synchronous ReadFile on a console handle cannot be interrupted by
++        // the port stop event. Check first so the RX thread waits on both the
++        // console and stop handles instead of getting stuck during teardown.
++        let mut event_count = 0;
++        if unsafe { GetNumberOfConsoleInputEvents(self.as_raw_handle(), &mut event_count) } == 0 {
++            return Err(io::Error::last_os_error());
++        }
++        if event_count == 0 {
++            return Err(io::ErrorKind::WouldBlock.into());
++        }
++
+         let len = u32::try_from(buf.len()).map_err(|_| {
+             io::Error::new(ErrorKind::InvalidInput, "buffer length exceeds u32::MAX")
+         })?;
+diff --git a/src/devices/src/virtio/console/process_rx.rs b/src/devices/src/virtio/console/process_rx.rs
+index 070c56e6..2d8c146c 100644
+--- a/src/devices/src/virtio/console/process_rx.rs
++++ b/src/devices/src/virtio/console/process_rx.rs
+@@ -1,5 +1,7 @@
+ #[cfg(not(windows))]
+ use std::io;
++#[cfg(windows)]
++use std::io::ErrorKind;
+ use std::sync::atomic::{AtomicBool, Ordering};
+ use std::sync::{Arc, Mutex};
+ use std::thread;
+@@ -134,11 +136,13 @@ fn read_to_desc(
+ ) -> Result<usize, GuestMemoryError> {
+     // Read into a temp host buffer first and then copy to guest memory.
+     // If we read directly into guest memory, ReadFile would block while holding
+-    // a reference to it, which deadlocks WHP vCPUs trying to access that same memory.
++    // a reference to it, which deadlocks WHv vCPUs trying to access that same memory.
+     let mut host_buf = vec![0; desc.len as usize];
+-    let bytes_read = input
+-        .read_bytes(&mut host_buf)
+-        .map_err(GuestMemoryError::IOError)?;
++    let bytes_read = match input.read_bytes(&mut host_buf) {
++        Ok(bytes_read) => bytes_read,
++        Err(e) if e.kind() == ErrorKind::WouldBlock => return Ok(0),
++        Err(e) => return Err(GuestMemoryError::IOError(e)),
++    };
+     if bytes_read == 0 {
+         *eof = true;
+         return Ok(0);
