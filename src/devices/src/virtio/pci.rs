@@ -400,6 +400,14 @@ impl VirtioPciTransport {
 
         let bus_master_enabled = Arc::new(AtomicBool::new(false));
         state.set_bus_master_gate(bus_master_enabled.clone());
+        let queue_sizes: Vec<u16> = state
+            .queue_config
+            .iter()
+            .map(|config| config.size)
+            .collect();
+        for (queue_index, size) in queue_sizes.into_iter().enumerate() {
+            state.with_queue_mut(queue_index as u32, |queue| queue.size = size);
+        }
         let queue_registers = state
             .queue_config
             .iter()
@@ -1520,6 +1528,10 @@ mod tests {
             &mut queue_size,
         );
         assert_eq!(u16::from_le_bytes(queue_size), TEST_QUEUE_SIZE);
+        assert_eq!(
+            transport.state.with_queue(0, 0, |queue| queue.size),
+            TEST_QUEUE_SIZE
+        );
 
         write_bar(
             &mut transport,
@@ -1625,6 +1637,10 @@ mod tests {
             &mut queue_size,
         );
         assert_eq!(u16::from_le_bytes(queue_size), TEST_QUEUE_SIZE);
+        assert_eq!(
+            transport.state.with_queue(0, 0, |queue| queue.size),
+            TEST_QUEUE_SIZE
+        );
         read_bar(
             &mut transport,
             bar_base + common_cfg::QUEUE_ENABLE,
