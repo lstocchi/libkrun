@@ -298,6 +298,7 @@ impl Subscriber for Serial {
     }
 }
 
+#[cfg(unix)]
 #[cfg(test)]
 mod tests {
     use super::*;
