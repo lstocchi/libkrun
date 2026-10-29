@@ -20,6 +20,7 @@ use super::super::{FC_EXIT_CODE_GENERIC_ERROR, FC_EXIT_CODE_OK};
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError, unbounded};
 use utils::eventfd::EventFd;
+use utils::perf::{self, Counter};
 use vm_memory::{
     Address, Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryError, GuestMemoryMmap,
     GuestMemoryRegion,
@@ -401,6 +402,7 @@ impl Vcpu {
     }
 
     fn run(&mut self) {
+        perf::init();
         self.wait_for_resume();
 
         loop {
@@ -463,6 +465,7 @@ impl Vcpu {
 
         let result = match reason {
             VcpuExitReason::IoPortAccess => {
+                perf::inc(Counter::VcpuExitIoPort);
                 let ctx = self.callback_context(&self.io_bus as *const devices::Bus);
                 unsafe {
                     self.emulator
@@ -476,6 +479,7 @@ impl Vcpu {
                 Ok(VcpuEmulation::Handled)
             }
             VcpuExitReason::MemoryAccess => {
+                perf::inc(Counter::VcpuExitMemory);
                 let bus = self
                     .mmio_bus
                     .as_ref()
@@ -496,6 +500,7 @@ impl Vcpu {
                 // A Linux guest hits HLT when idle.
                 // WHP handles most HLT states internally (if interrupts are enabled),
                 // but if we land here, the vCPU is truly stalled.
+                perf::inc(Counter::VcpuExitHalt);
 
                 // Check if we should actually be shutting down.
                 if self.exit_evt.is_signaled() {
@@ -506,14 +511,21 @@ impl Vcpu {
                 // worker threads can run.  sleep(1ms) on Windows rounds
                 // up to one scheduler tick (~1-15 ms) which is acceptable
                 // for an idle vCPU and avoids burning a full core.
+                let slept = std::time::Instant::now();
                 thread::sleep(std::time::Duration::from_millis(1));
+                perf::add(
+                    Counter::VcpuExitHaltSleepMs,
+                    slept.elapsed().as_millis() as u64,
+                );
                 Ok(VcpuEmulation::Handled)
             }
             VcpuExitReason::InterruptWindow => {
+                perf::inc(Counter::VcpuExitInterruptWindow);
                 let _ = self.whp_vcpu.clear_interrupt_window();
                 Ok(VcpuEmulation::Handled)
             }
             VcpuExitReason::Canceled => {
+                perf::inc(Counter::VcpuExitCanceled);
                 // If the vCPU was canceled while waiting for an interrupt window,
                 // and the guest has now unmasked interrupts (IF=1), clear the window
                 // request to prevent a spurious InterruptWindow exit storm on re-entry.
@@ -526,7 +538,10 @@ impl Vcpu {
                 }
                 Ok(VcpuEmulation::Handled)
             }
-            VcpuExitReason::ApicEoi => Ok(VcpuEmulation::Handled),
+            VcpuExitReason::ApicEoi => {
+                perf::inc(Counter::VcpuExitApicEoi);
+                Ok(VcpuEmulation::Handled)
+            }
             _ => {
                 error!(
                     "vCPU {} unhandled or unexpected exit reason: {:?}",

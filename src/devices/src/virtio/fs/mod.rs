@@ -42,13 +42,15 @@ mod defs {
     use super::super::QueueConfig;
 
     pub const FS_DEV_ID: &str = "virtio_fs";
-    pub const NUM_QUEUES: usize = 2;
+    /// Number of request queues served each by its own worker thread. The
+    /// guest spreads requests across them (by nodeid), so queue workers run
+    /// concurrently and the round-trip latency of one request does not
+    /// serialize the others.
+    pub const NUM_REQUEST_QUEUES: usize = 1;
+    /// High priority queue plus the request queues.
+    pub const NUM_QUEUES: usize = 1 + NUM_REQUEST_QUEUES;
     pub const QUEUE_SIZE: u16 = 1024;
     pub static QUEUE_CONFIG: [QueueConfig; NUM_QUEUES] = [QueueConfig::new(QUEUE_SIZE); NUM_QUEUES];
-    // High priority queue.
-    pub const HPQ_INDEX: usize = 0;
-    // Request queue.
-    pub const REQ_INDEX: usize = 1;
 
     pub mod uapi {
         pub const VIRTIO_ID_FS: u32 = 26;

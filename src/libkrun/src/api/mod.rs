@@ -52,8 +52,6 @@ pub use device_builders::{ConsoleBuilder, ConsoleDevice};
 pub use device_builders::{DisplayBackend, DisplayInfoBuilder};
 #[cfg(feature = "gpu")]
 pub use device_builders::{GpuDevice, VirglRendererFlags};
-#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
-pub use devices::virtio::passthrough::PermissionSemantics;
 #[cfg(feature = "blk")]
 pub use devices::virtio::block::{DiskFormat, SyncMode};
 pub use error::VmmError;
@@ -132,8 +130,6 @@ ffier::library_definition!("krun", library_tag = 1,
     trait ffier_builtins::Error = 13,
     Error for crate::api::error::VmmError,
     enum crate::vmm::vmm_config::external_kernel::KernelFormat,
-    #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
-    enum devices::virtio::passthrough::PermissionSemantics,
     #[cfg(feature = "blk")]
     enum devices::virtio::block::DiskFormat,
     #[cfg(feature = "blk")]

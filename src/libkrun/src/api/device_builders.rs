@@ -656,13 +656,43 @@ impl<'a> FsDevice<'a> {
 
     /// Set the permission semantics emulated by this device.
     ///
-    /// Must be called before the VM is started. See the documentation for
-    /// `PermissionSemantics` for the differences between the variants.
-    pub fn set_permission_semantics(&mut self, semantics: PermissionSemantics) {
+    /// Must be called before the VM is started. `0` selects the complete Linux
+    /// semantics (the default) and `1` the simplified ones; see the documentation
+    /// for `PermissionSemantics` for the differences between them. To let one
+    /// guest user own the shared directory instead, prefer
+    /// [`set_fixed_owner`](Self::set_fixed_owner), which keeps file attributes
+    /// cacheable in the guest.
+    pub fn set_permission_semantics(&mut self, semantics: u32) {
+        let semantics = match semantics {
+            0 => PermissionSemantics::LinuxComplete,
+            1 => PermissionSemantics::LinuxSimplified,
+            _ => {
+                log::error!("ignoring unknown permission semantics: {semantics}");
+                return;
+            }
+        };
         self.inner
             .lock()
             .unwrap()
             .set_permission_semantics(semantics);
+    }
+
+    /// Report every file in the shared directory as owned by `uid` and `gid`.
+    ///
+    /// Use this when one guest user should own a host directory that the host user owns: the
+    /// guest sees `uid`:`gid` as the owner of every file, while files are created and changed on
+    /// the host as the user running libkrun. Ownership changes from the guest are not kept, and
+    /// extended attributes are not available. Unlike reporting the requesting process as the
+    /// owner, a fixed owner keeps file attributes cacheable in the guest.
+    ///
+    /// The guest sees every set-user-ID and set-group-ID file in the directory as owned by `uid`
+    /// and `gid`, so with a `uid` of 0 such a file runs as root in the guest. Mount the share
+    /// with `nosuid` unless the guest should allow that.
+    ///
+    /// Takes effect on macOS and Windows hosts. On Linux the host's ownership is passed through
+    /// unchanged.
+    pub fn set_fixed_owner(&mut self, uid: u32, gid: u32) {
+        self.inner.lock().unwrap().set_fixed_owner(uid, gid);
     }
 }
 

@@ -22,6 +22,7 @@ use super::ExportTable;
 use super::passthrough;
 use super::virtual_entry::VirtualDirEntry;
 use super::worker::FsWorker;
+use super::worker::build_server;
 use super::{defs, defs::uapi};
 use crate::virtio::InterruptTransport;
 use crate::virtio::passthrough::PermissionSemantics;
@@ -54,7 +55,7 @@ pub struct Fs {
     passthrough_cfg: Option<passthrough::Config>,
     read_only: bool,
     virtual_entries: Vec<VirtualDirEntry<'static>>,
-    worker_thread: Option<JoinHandle<()>>,
+    worker_threads: Vec<JoinHandle<()>>,
     worker_stopfd: EventFd,
     exit_code: Arc<AtomicI32>,
     #[cfg(target_os = "macos")]
@@ -75,7 +76,7 @@ impl Fs {
         let tag = fs_id.into_bytes();
         let mut config = VirtioFsConfig::default();
         config.tag[..tag.len()].copy_from_slice(tag.as_slice());
-        config.num_request_queues = 1;
+        config.num_request_queues = defs::NUM_REQUEST_QUEUES as u32;
 
         let attr_timeout = if matches!(semantics, PermissionSemantics::LinuxSimplified) {
             // As uid/gid are context-dependent, attributes can't be cached.
@@ -89,6 +90,11 @@ impl Fs {
             root_dir,
             semantics,
             attr_timeout,
+            // Every FUSE request costs a VM-exit round trip, so buffered
+            // (writeback) writes that the guest can flush asynchronously hide
+            // a lot of latency on Windows hosts.
+            #[cfg(target_os = "windows")]
+            writeback: true,
             ..Default::default()
         });
 
@@ -104,7 +110,7 @@ impl Fs {
             passthrough_cfg: fs_cfg,
             read_only,
             virtual_entries,
-            worker_thread: None,
+            worker_threads: Vec::new(),
             worker_stopfd: EventFd::new(EFD_NONBLOCK).map_err(FsError::EventFd)?,
             exit_code,
             #[cfg(target_os = "macos")]
@@ -114,6 +120,18 @@ impl Fs {
 
     pub fn id(&self) -> &str {
         defs::FS_DEV_ID
+    }
+
+    /// Report every file of the shared directory as owned by `uid` and `gid`, with the
+    /// simplified permission semantics, before the device is activated. Has no effect on a
+    /// device without a shared directory.
+    pub fn set_fixed_owner(&mut self, uid: u32, gid: u32) {
+        if let Some(cfg) = self.passthrough_cfg.as_mut() {
+            cfg.semantics = PermissionSemantics::LinuxSimplifiedOwnedBy(uid, gid);
+            // The owner no longer depends on the caller, so attributes stay cacheable.
+            cfg.attr_timeout = Duration::from_secs(5);
+        }
+        self.allow_idmap = false;
     }
 
     pub fn set_shm_region(&mut self, shm_region: VirtioShmRegion) {
@@ -225,39 +243,40 @@ impl VirtioDevice for Fs {
         interrupt: InterruptTransport,
         queues: Vec<DeviceQueue>,
     ) -> ActivateResult {
-        if self.worker_thread.is_some() {
-            panic!("virtio_fs: worker thread already exists");
+        if !self.worker_threads.is_empty() {
+            panic!("virtio_fs: worker threads already exist");
         }
 
-        // Extract queues and eventfds from DeviceQueues.
-        let mut worker_queues = Vec::with_capacity(queues.len());
-        let mut queue_evts = Vec::with_capacity(queues.len());
-        for dq in queues {
-            worker_queues.push(dq.queue);
-            queue_evts.push(dq.event);
-        }
-
-        let virtual_entries = self.virtual_entries.clone();
-        let worker = FsWorker::new(
-            worker_queues,
-            queue_evts,
-            interrupt.clone(),
-            mem.clone(),
-            self.allow_idmap,
-            self.shm_region.clone(),
+        // One FUSE server shared by every queue worker, so the inode
+        // namespace stays common across request queues.
+        let server = build_server(
             self.passthrough_cfg.clone(),
             self.read_only,
-            virtual_entries,
-            self.worker_stopfd.try_clone().unwrap(),
-            self.exit_code.clone(),
-            #[cfg(target_os = "macos")]
-            self.map_sender.clone(),
+            self.virtual_entries.clone(),
         )
         .map_err(|e| {
             error!("virtio_fs: failed to create worker: {}", e);
             ActivateError::BadActivate
         })?;
-        self.worker_thread = Some(worker.run());
+
+        let mut threads = Vec::with_capacity(queues.len());
+        for dq in queues {
+            let worker = FsWorker::new(
+                server.clone(),
+                dq.queue,
+                dq.event,
+                interrupt.clone(),
+                mem.clone(),
+                self.allow_idmap,
+                self.shm_region.clone(),
+                self.worker_stopfd.try_clone().unwrap(),
+                self.exit_code.clone(),
+                #[cfg(target_os = "macos")]
+                self.map_sender.clone(),
+            );
+            threads.push(worker.run());
+        }
+        self.worker_threads = threads;
 
         self.device_state = DeviceState::Activated(mem, interrupt);
         Ok(())
@@ -272,10 +291,12 @@ impl VirtioDevice for Fs {
     }
 
     fn reset(&mut self) -> bool {
-        if let Some(worker) = self.worker_thread.take() {
+        if !self.worker_threads.is_empty() {
             let _ = self.worker_stopfd.write(1);
-            if let Err(e) = worker.join() {
-                error!("error waiting for worker thread: {e:?}");
+            for worker in self.worker_threads.drain(..) {
+                if let Err(e) = worker.join() {
+                    error!("error waiting for worker thread: {e:?}");
+                }
             }
         }
         self.device_state = DeviceState::Inactive;

@@ -33,10 +33,10 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, DeleteFileW, FILE_APPEND_DATA, FILE_ATTRIBUTE_DIRECTORY,
     FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_REPARSE_POINT,
-    FILE_ATTRIBUTE_TAG_INFO, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, FileAttributeTagInfo,
-    GetDiskFreeSpaceExW, GetFileAttributesW, GetFileInformationByHandle,
-    GetFileInformationByHandleEx, GetVolumePathNameW, SetFileAttributesW,
+    FILE_ATTRIBUTE_TAG_INFO, FILE_BASIC_INFO, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA,
+    FileAttributeTagInfo, FileBasicInfo, GetDiskFreeSpaceExW, GetFileInformationByHandle,
+    GetFileInformationByHandleEx, GetVolumePathNameW, SetFileInformationByHandle,
 };
 use windows_sys::Win32::System::IO::{DeviceIoControl, IO_STATUS_BLOCK};
 use windows_sys::Win32::System::Ioctl::FSCTL_GET_REPARSE_POINT;
@@ -191,8 +191,6 @@ impl FromStr for CachePolicy {
 }
 
 /// The permission semantics to be emulated by this file system personality.
-#[cfg_attr(feature = "ffi", ffier::export)]
-#[repr(u32)]
 #[derive(Debug, Default, Clone, Copy)]
 pub enum PermissionSemantics {
     /// Be as close as possible to the common semantics of Linux file systems.
@@ -206,6 +204,20 @@ pub enum PermissionSemantics {
     ///    requesting the operation within the guest (obtained from `Context`).
     ///  - Permissions bits are stored in the host, not as extended attributes.
     LinuxSimplified,
+
+    /// As `LinuxSimplified`, but every file is reported as owned by this uid and gid instead of
+    /// by the requesting process, so attributes stay the same for every caller and can be cached.
+    LinuxSimplifiedOwnedBy(u32, u32),
+}
+
+impl PermissionSemantics {
+    /// The owner to report for every file, when the semantics fix one.
+    fn fixed_owner(self, ctx: &Context) -> (u32, u32) {
+        match self {
+            PermissionSemantics::LinuxSimplifiedOwnedBy(uid, gid) => (uid, gid),
+            _ => (ctx.uid, ctx.gid),
+        }
+    }
 }
 
 /// Options that configure the behavior of the file system.
@@ -429,7 +441,7 @@ fn file_info_to_stat64(
     } else {
         let is_readonly = (file_attributes & FILE_ATTRIBUTE_READONLY) != 0;
         let mode_bits = match semantics {
-            PermissionSemantics::LinuxSimplified => {
+            PermissionSemantics::LinuxSimplified | PermissionSemantics::LinuxSimplifiedOwnedBy(..) => {
                 if is_readonly {
                     0o444
                 } else {
@@ -468,9 +480,8 @@ fn file_info_to_stat64(
     };
 
     match semantics {
-        PermissionSemantics::LinuxSimplified => {
-            st.st_uid = ctx.uid;
-            st.st_gid = ctx.gid;
+        PermissionSemantics::LinuxSimplified | PermissionSemantics::LinuxSimplifiedOwnedBy(..) => {
+            (st.st_uid, st.st_gid) = semantics.fixed_owner(ctx);
         }
         PermissionSemantics::LinuxComplete => {
             if let Ok((uid, gid, mode)) = read_override_stat(path) {
@@ -1062,16 +1073,79 @@ pub fn openat(path: &str) -> io::Result<HANDLE> {
     Ok(h)
 }
 
-fn set_file_times(path: &Path, atime: Option<u64>, mtime: Option<u64>) -> io::Result<()> {
+/// Set the read-only attribute and/or access and modification times on an
+/// already-open handle in a single metadata update. `attributes` is the full
+/// attribute set to apply (query the current one first to preserve the other
+/// bits); times of `None` are left unchanged.
+fn set_file_basic_info(
+    h: HANDLE,
+    attributes: u32,
+    atime: Option<u64>,
+    mtime: Option<u64>,
+) -> io::Result<()> {
+    let to_ft = |v: u64| -> i64 {
+        v as i64
+    };
+
+    let info = FILE_BASIC_INFO {
+        CreationTime: 0,
+        LastAccessTime: atime.map_or(0, to_ft),
+        LastWriteTime: mtime.map_or(0, to_ft),
+        ChangeTime: 0,
+        FileAttributes: attributes,
+    };
+
+    let res = unsafe {
+        SetFileInformationByHandle(
+            h,
+            FileBasicInfo,
+            &info as *const _ as *const core::ffi::c_void,
+            size_of::<FILE_BASIC_INFO>() as u32,
+        )
+    };
+    if res == 0 {
+        Err(win_err_to_linux(io::Error::last_os_error()))
+    } else {
+        Ok(())
+    }
+}
+
+/// Truncate the file to `size` on an already-open handle.
+fn set_file_size_by_handle(h: HANDLE, size: u64) -> io::Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::{FILE_END_OF_FILE_INFO, FileEndOfFileInfo};
+
+    let info = FILE_END_OF_FILE_INFO {
+        EndOfFile: size as i64,
+    };
+    let res = unsafe {
+        SetFileInformationByHandle(
+            h,
+            FileEndOfFileInfo,
+            &info as *const _ as *const core::ffi::c_void,
+            mem::size_of::<FILE_END_OF_FILE_INFO>() as u32,
+        )
+    };
+    if res == 0 {
+        Err(win_err_to_linux(io::Error::last_os_error()))
+    } else {
+        Ok(())
+    }
+}
+
+/// Convert FILETIME ticks (as produced by `unix_to_filetime`) to a FILETIME.
+fn ticks_to_filetime(ticks: u64) -> windows_sys::Win32::Foundation::FILETIME {
+    use windows_sys::Win32::Foundation::FILETIME;
+
+    FILETIME {
+        dwLowDateTime: ticks as u32,
+        dwHighDateTime: (ticks >> 32) as u32,
+    }
+}
+
+/// Set access and/or modification times on an already-open handle.
+fn set_file_times_by_handle(h: HANDLE, atime: Option<u64>, mtime: Option<u64>) -> io::Result<()> {
     use windows_sys::Win32::Foundation::FILETIME;
     use windows_sys::Win32::Storage::FileSystem::SetFileTime;
-
-    let flags = OpenFlags {
-        desired_access: FILE_WRITE_ATTRIBUTES,
-        create_disposition: FILE_OPEN,
-        create_options: FILE_SYNCHRONOUS_IO_NONALERT,
-    };
-    let h = open_handle(path, &flags).map_err(win_err_to_linux)?;
 
     let to_ft = |v: u64| -> FILETIME {
         FILETIME {
@@ -1091,7 +1165,6 @@ fn set_file_times(path: &Path, atime: Option<u64>, mtime: Option<u64>) -> io::Re
             m_ft.as_ref().map_or(std::ptr::null(), |f| f as *const _),
         )
     };
-    unsafe { CloseHandle(h) };
     if res == 0 {
         Err(win_err_to_linux(io::Error::last_os_error()))
     } else {
@@ -1222,7 +1295,22 @@ impl PassthroughFs {
             create_options: FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
         };
         let handle = HandleGuard(open_handle(&child_path, &flags)?);
-        let file_info = get_file_info_by_handle(handle.as_raw()).map_err(win_err_to_linux)?;
+        self.do_lookup_handle(ctx, parent, &parent_data, child_path, handle.as_raw())
+    }
+
+    /// Build the lookup [`Entry`] for `child_path` from an already-open handle,
+    /// inserting or reusing the inode as `do_lookup` does. Callers that already
+    /// hold a handle to the file (e.g. `create`) use this to avoid a second
+    /// open.
+    fn do_lookup_handle(
+        &self,
+        ctx: &Context,
+        parent: Inode,
+        parent_data: &Arc<InodeData>,
+        child_path: PathBuf,
+        handle: HANDLE,
+    ) -> io::Result<Entry> {
+        let file_info = get_file_info_by_handle(handle).map_err(win_err_to_linux)?;
         let alt_key = InodeAltKey {
             file_index: file_info.file_index,
             volume_serial: file_info.raw_info.dwVolumeSerialNumber,
@@ -1273,7 +1361,7 @@ impl PassthroughFs {
             &file_info,
             inode,
             &child_path,
-            handle.as_raw(),
+            handle,
         );
 
         let mut attr_flags = 0u32;
@@ -1899,30 +1987,20 @@ impl FileSystem for PassthroughFs {
     ) -> io::Result<(stat64, Duration)> {
         let path = self.inode_path(inode)?;
 
+        // In the simplified modes chmod maps the POSIX write bit to the native
+        // Windows Read-Only attribute. The update is applied together with the
+        // time updates below, on a single handle, instead of by path here.
+        let mut mode_writable: Option<bool> = None;
         match self.cfg.semantics {
-            PermissionSemantics::LinuxSimplified => {
-                // In LinuxSimplified mode:
-                // 1. UID/GID changes (chown) are ignored since ownership is dynamically returned as ctx.uid/gid.
+            PermissionSemantics::LinuxSimplified
+            | PermissionSemantics::LinuxSimplifiedOwnedBy(..) => {
+                // In the simplified modes:
+                // 1. UID/GID changes (chown) are ignored since ownership is reported as the
+                //    requesting process or the fixed owner, never stored.
                 // 2. Extended attribute (ADS) overrides are not written.
                 // 3. chmod maps POSIX write permissions to the native Windows Read-Only attribute.
                 if valid.contains(SetattrValid::MODE) {
-                    let is_writable = (attr.st_mode & 0o200) != 0;
-                    let wide_path = path_to_wide(&path);
-
-                    unsafe {
-                        let current_attrs = GetFileAttributesW(wide_path.as_ptr());
-                        if current_attrs != u32::MAX {
-                            let new_attrs = if is_writable {
-                                current_attrs & !FILE_ATTRIBUTE_READONLY
-                            } else {
-                                current_attrs | FILE_ATTRIBUTE_READONLY
-                            };
-
-                            if new_attrs != current_attrs {
-                                SetFileAttributesW(wide_path.as_ptr(), new_attrs);
-                            }
-                        }
-                    }
+                    mode_writable = Some((attr.st_mode & 0o200) != 0);
                 }
             }
             PermissionSemantics::LinuxComplete => {
@@ -1982,7 +2060,119 @@ impl FileSystem for PassthroughFs {
             }
         }
 
-        if valid.contains(SetattrValid::SIZE) {
+        // The simplified semantics can apply every mutable field (size, mode,
+        // times) on a single handle, so a chmod+utimes+ftruncate setattr
+        // costs one metadata query and one update instead of one syscall per
+        // field plus a query for the reply.
+        let wants_times = valid.intersects(
+            SetattrValid::ATIME
+                | SetattrValid::MTIME
+                | SetattrValid::ATIME_NOW
+                | SetattrValid::MTIME_NOW,
+        );
+        let simplified = matches!(
+            self.cfg.semantics,
+            PermissionSemantics::LinuxSimplified | PermissionSemantics::LinuxSimplifiedOwnedBy(..)
+        );
+        if simplified
+            && (valid.contains(SetattrValid::SIZE) || mode_writable.is_some() || wants_times)
+        {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default();
+            let now_ft = unix_to_filetime(now.as_secs() as i64, now.subsec_nanos());
+
+            let atime = if valid.contains(SetattrValid::ATIME_NOW) {
+                Some(now_ft)
+            } else if valid.contains(SetattrValid::ATIME) {
+                Some(unix_to_filetime(attr.st_atime, attr.st_atime_nsec))
+            } else {
+                None
+            };
+
+            let mtime = if valid.contains(SetattrValid::MTIME_NOW) {
+                Some(now_ft)
+            } else if valid.contains(SetattrValid::MTIME) {
+                Some(unix_to_filetime(attr.st_mtime, attr.st_mtime_nsec))
+            } else {
+                None
+            };
+
+            // Reuse the caller's handle when it is a valid raw file handle;
+            // otherwise open one that we keep for the reply below.
+            let mut _owned_handle: Option<HandleGuard> = None;
+            let h: HANDLE = if handle.is_some_and(|h| h != 0 && (h & (1 << 63)) == 0) {
+                let h = handle.unwrap() as HANDLE;
+                // POSIX Compliance: Allocating space on a Read-Only FD should return EBADF
+                if valid.contains(SetattrValid::SIZE) && is_handle_read_only(h as u64) {
+                    return Err(ebadf());
+                }
+                h
+            } else {
+                let flags = OpenFlags {
+                    desired_access: FILE_WRITE_ATTRIBUTES
+                        | FILE_READ_ATTRIBUTES
+                        | if valid.contains(SetattrValid::SIZE) {
+                            FILE_WRITE_DATA
+                        } else {
+                            0
+                        },
+                    create_disposition: FILE_OPEN,
+                    create_options: FILE_SYNCHRONOUS_IO_NONALERT,
+                };
+                let guard = HandleGuard(open_handle(&path, &flags).map_err(win_err_to_linux)?);
+                let raw = guard.as_raw();
+                _owned_handle = Some(guard);
+                raw
+            };
+
+            // Query the current state once; every field applied below also
+            // patches this copy, which becomes the reply.
+            let mut info = get_file_info_by_handle(h).map_err(win_err_to_linux)?;
+
+            if valid.contains(SetattrValid::SIZE) {
+                let current = ((info.raw_info.nFileSizeHigh as u64) << 32)
+                    | info.raw_info.nFileSizeLow as u64;
+                // Truncating to the current size is a no-op; skipping it
+                // avoids a pointless update on every O_TRUNC setattr the
+                // kernel issues in writeback mode.
+                if current != attr.st_size as u64 {
+                    set_file_size_by_handle(h, attr.st_size as u64)
+                        .map_err(win_err_to_linux)?;
+                    info.raw_info.nFileSizeHigh = ((attr.st_size as u64) >> 32) as u32;
+                    info.raw_info.nFileSizeLow = attr.st_size as u32;
+                }
+            }
+
+            if mode_writable.is_some() || wants_times {
+                if let Some(is_writable) = mode_writable {
+                    // The simplified semantics store the write permission as
+                    // the Windows Read-Only attribute; set it together with
+                    // the times in one metadata update.
+                    let current_attrs = info.raw_info.dwFileAttributes;
+                    let new_attrs = if is_writable {
+                        current_attrs & !FILE_ATTRIBUTE_READONLY
+                    } else {
+                        current_attrs | FILE_ATTRIBUTE_READONLY
+                    };
+                    set_file_basic_info(h, new_attrs, atime, mtime).map_err(win_err_to_linux)?;
+                    info.raw_info.dwFileAttributes = new_attrs;
+                } else {
+                    set_file_times_by_handle(h, atime, mtime).map_err(win_err_to_linux)?;
+                }
+                if let Some(atime) = atime {
+                    info.raw_info.ftLastAccessTime = ticks_to_filetime(atime);
+                }
+                if let Some(mtime) = mtime {
+                    info.raw_info.ftLastWriteTime = ticks_to_filetime(mtime);
+                }
+            }
+
+            let stat = file_info_to_stat64(&ctx, self.cfg.semantics, &info, inode, &path, h);
+            return Ok((stat, self.cfg.attr_timeout));
+        }
+
+        if !simplified && valid.contains(SetattrValid::SIZE) {
             if let Some(h) = handle {
                 // POSIX Compliance: Allocating space on a Read-Only FD should return EBADF
                 if is_handle_read_only(h) {
@@ -2004,12 +2194,9 @@ impl FileSystem for PassthroughFs {
             }
         }
 
-        if valid.intersects(
-            SetattrValid::ATIME
-                | SetattrValid::MTIME
-                | SetattrValid::ATIME_NOW
-                | SetattrValid::MTIME_NOW,
-        ) {
+        // In LinuxComplete mode, apply the time updates on a single handle
+        // and build the reply from it.
+        if !simplified && wants_times {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default();
@@ -2030,7 +2217,30 @@ impl FileSystem for PassthroughFs {
             } else {
                 None
             };
-            set_file_times(&path, atime, mtime).map_err(win_err_to_linux)?;
+
+            // Reuse the caller's handle when it is a valid raw file handle;
+            // otherwise open one that we keep for the reply below.
+            let mut _owned_reply_handle: Option<HandleGuard> = None;
+            let h: HANDLE = if handle.is_some_and(|h| h != 0 && (h & (1 << 63)) == 0) {
+                handle.unwrap() as HANDLE
+            } else {
+                let flags = OpenFlags {
+                    desired_access: FILE_WRITE_ATTRIBUTES | FILE_READ_ATTRIBUTES,
+                    create_disposition: FILE_OPEN,
+                    create_options: FILE_SYNCHRONOUS_IO_NONALERT,
+                };
+                let guard = HandleGuard(open_handle(&path, &flags).map_err(win_err_to_linux)?);
+                let raw = guard.as_raw();
+                _owned_reply_handle = Some(guard);
+                raw
+            };
+
+            set_file_times_by_handle(h, atime, mtime).map_err(win_err_to_linux)?;
+
+            // Build the reply from the same handle.
+            let info = get_file_info_by_handle(h).map_err(win_err_to_linux)?;
+            let stat = file_info_to_stat64(&ctx, self.cfg.semantics, &info, inode, &path, h);
+            return Ok((stat, self.cfg.attr_timeout));
         }
 
         self.do_getattr(&ctx, inode, handle)
@@ -2334,8 +2544,8 @@ impl FileSystem for PassthroughFs {
             return Err(io::Error::from_raw_os_error(linux_errno_raw(libc::EINVAL)));
         }
 
-        let parent_path = self.inode_path(parent)?;
-        let child_path = parent_path.join(cstr_to_path(name));
+        let parent_data = self.inode_data(parent)?;
+        let child_path = parent_data.get_path().join(cstr_to_path(name));
 
         let wb = self.writeback.load(Ordering::Relaxed);
         let oflags = parse_linux_open_flags(flags as i32 | LINUX_O_CREAT, wb);
@@ -2368,7 +2578,9 @@ impl FileSystem for PassthroughFs {
             }
         }
 
-        let entry = match self.do_lookup(&ctx, parent, name) {
+        // Build the reply entry from the handle we already hold instead of
+        // opening the file a second time in do_lookup.
+        let entry = match self.do_lookup_handle(&ctx, parent, &parent_data, child_path, h) {
             Ok(e) => e,
             Err(e) => {
                 unsafe { CloseHandle(h) };
@@ -2474,19 +2686,18 @@ impl FileSystem for PassthroughFs {
     fn flush(
         &self,
         _ctx: Context,
-        inode: Inode,
-        handle: Handle,
+        _inode: Inode,
+        _handle: Handle,
         _lock_owner: u64,
     ) -> io::Result<()> {
-        // On Windows, to perform a flush we need to have a file handle with write access.
-        // If the file has been open as read-only, there is nothing to flush
-        if is_handle_read_only(handle) {
-            return Ok(());
-        }
-
-        let file = self.reopen_inode(inode, handle, GENERIC_READ | GENERIC_WRITE)?;
-
-        file.sync_all().map_err(win_err_to_linux)
+        // FUSE flush is issued on close(2) and only asks for userspace buffers to
+        // be handed to the OS, not for data to reach the disk: POSIX close(2)
+        // gives no durability guarantees. All our writes go through synchronous
+        // OS handles, so there is nothing buffered in this process to flush, and
+        // calling FlushFileBuffers here (a full disk sync) made every file
+        // close pay milliseconds for no semantic gain. Guests that need
+        // durability use fsync, which maps to `fsync` below.
+        Ok(())
     }
 
     fn fsync(&self, _ctx: Context, inode: Inode, datasync: bool, handle: Handle) -> io::Result<()> {
@@ -2578,7 +2789,11 @@ impl FileSystem for PassthroughFs {
         value: &[u8],
         flags: u32,
     ) -> io::Result<()> {
-        if matches!(self.cfg.semantics, PermissionSemantics::LinuxSimplified) || !self.cfg.xattr {
+        if matches!(
+            self.cfg.semantics,
+            PermissionSemantics::LinuxSimplified | PermissionSemantics::LinuxSimplifiedOwnedBy(..)
+        ) || !self.cfg.xattr
+        {
             return Err(enosys());
         }
 
@@ -2609,7 +2824,11 @@ impl FileSystem for PassthroughFs {
         name: &CStr,
         size: u32,
     ) -> io::Result<GetxattrReply> {
-        if matches!(self.cfg.semantics, PermissionSemantics::LinuxSimplified) || !self.cfg.xattr {
+        if matches!(
+            self.cfg.semantics,
+            PermissionSemantics::LinuxSimplified | PermissionSemantics::LinuxSimplifiedOwnedBy(..)
+        ) || !self.cfg.xattr
+        {
             return Err(enosys());
         }
 
@@ -2646,7 +2865,11 @@ impl FileSystem for PassthroughFs {
     }
 
     fn listxattr(&self, _ctx: Context, inode: Inode, size: u32) -> io::Result<ListxattrReply> {
-        if matches!(self.cfg.semantics, PermissionSemantics::LinuxSimplified) || !self.cfg.xattr {
+        if matches!(
+            self.cfg.semantics,
+            PermissionSemantics::LinuxSimplified | PermissionSemantics::LinuxSimplifiedOwnedBy(..)
+        ) || !self.cfg.xattr
+        {
             return Err(enosys());
         }
 
@@ -2672,7 +2895,11 @@ impl FileSystem for PassthroughFs {
     }
 
     fn removexattr(&self, _ctx: Context, inode: Inode, name: &CStr) -> io::Result<()> {
-        if matches!(self.cfg.semantics, PermissionSemantics::LinuxSimplified) || !self.cfg.xattr {
+        if matches!(
+            self.cfg.semantics,
+            PermissionSemantics::LinuxSimplified | PermissionSemantics::LinuxSimplifiedOwnedBy(..)
+        ) || !self.cfg.xattr
+        {
             return Err(enosys());
         }
 

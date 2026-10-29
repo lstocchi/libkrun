@@ -101,7 +101,8 @@ impl<F: FileSystem + Sync> Server<F> {
             );
         }
         debug!("opcode: {}", in_header.opcode);
-        match in_header.opcode {
+        let started = std::time::Instant::now();
+        let result = match in_header.opcode {
             x if x == Opcode::Lookup as u32 => self.lookup(in_header, r, w),
             x if x == Opcode::Forget as u32 => self.forget(in_header, r), // No reply.
             x if x == Opcode::Getattr as u32 => self.getattr(in_header, r, w),
@@ -184,7 +185,9 @@ impl<F: FileSystem + Sync> Server<F> {
                 in_header.unique,
                 w,
             ),
-        }
+        };
+        utils::perf::fs_op(in_header.opcode, started.elapsed());
+        result
     }
 
     fn lookup(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
