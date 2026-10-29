@@ -529,6 +529,8 @@ impl FromStr for CachePolicy {
 }
 
 /// The permission semantics to be emulated by this file system personality.
+#[cfg_attr(feature = "ffi", ffier::export)]
+#[repr(u32)]
 #[derive(Debug, Default, Clone, Copy)]
 pub enum PermissionSemantics {
     /// Be as close as possible to the common semantics of Linux file systems.

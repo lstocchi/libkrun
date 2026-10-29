@@ -128,6 +128,11 @@ typedef void (*krun_free_object_array_fn)(KrunObjectArray a);
 #define KRUN_KERNEL_FORMAT_IMAGE_GZ 4
 #define KRUN_KERNEL_FORMAT_IMAGE_ZSTD 5
 
+/* PermissionSemantics ------------------------------------------------ */
+
+#define KRUN_PERMISSION_SEMANTICS_LINUX_COMPLETE 0
+#define KRUN_PERMISSION_SEMANTICS_LINUX_SIMPLIFIED 1
+
 /* DiskFormat -------------------------------------------------------- */
 
 #define KRUN_DISK_FORMAT_RAW 0
@@ -244,6 +249,14 @@ typedef void (*krun_fs_device_set_overlay_fn)(KrunFsDevice handle, KrunFsOverlay
  */
 void krun_fs_device_set_dax_window_size(KrunFsDevice handle, uint64_t bytes);
 typedef void (*krun_fs_device_set_dax_window_size_fn)(KrunFsDevice handle, uint64_t bytes);
+/**
+ * Set the permission semantics emulated by this device.
+ *
+ * Must be called before the VM is started. See the documentation for
+ * `PermissionSemantics` for the differences between the variants.
+ */
+void krun_fs_device_set_permission_semantics(KrunFsDevice handle, uint32_t semantics);
+typedef void (*krun_fs_device_set_permission_semantics_fn)(KrunFsDevice handle, uint32_t semantics);
 void krun_fs_device_destroy(KrunFsDevice handle);
 typedef void (*krun_fs_device_destroy_fn)(KrunFsDevice handle);
 

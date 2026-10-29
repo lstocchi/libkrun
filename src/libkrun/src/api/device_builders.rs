@@ -653,6 +653,17 @@ impl<'a> FsDevice<'a> {
     pub fn set_dax_window_size(&mut self, bytes: u64) {
         self.shm_size = Some(bytes as usize);
     }
+
+    /// Set the permission semantics emulated by this device.
+    ///
+    /// Must be called before the VM is started. See the documentation for
+    /// `PermissionSemantics` for the differences between the variants.
+    pub fn set_permission_semantics(&mut self, semantics: PermissionSemantics) {
+        self.inner
+            .lock()
+            .unwrap()
+            .set_permission_semantics(semantics);
+    }
 }
 
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]

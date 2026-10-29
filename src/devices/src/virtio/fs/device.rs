@@ -143,6 +143,25 @@ impl Fs {
         self.exit_code = exit_code;
     }
 
+    /// Set the permission semantics emulated by the passthrough filesystem.
+    ///
+    /// Must be called before the device is activated. Has no effect on
+    /// NullFs-backed devices, which have no passthrough configuration.
+    pub fn set_permission_semantics(&mut self, semantics: PermissionSemantics) {
+        self.allow_idmap = matches!(semantics, PermissionSemantics::LinuxComplete);
+        if let Some(cfg) = self.passthrough_cfg.as_mut() {
+            cfg.semantics = semantics;
+            // As uid/gid are context-dependent in simplified mode, attributes
+            // can't be cached.
+            cfg.attr_timeout = if matches!(semantics, PermissionSemantics::LinuxSimplified) {
+                Duration::from_secs(0)
+            } else {
+                // The value defined as default in virtio-fs.
+                Duration::from_secs(5)
+            };
+        }
+    }
+
     #[cfg(target_os = "macos")]
     pub fn set_map_sender(&mut self, map_sender: Sender<WorkerMessage>) {
         self.map_sender = Some(map_sender);
