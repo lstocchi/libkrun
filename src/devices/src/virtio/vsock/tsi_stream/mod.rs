@@ -14,6 +14,8 @@ use super::proxy::{
     AddressFamily, AsRawFd, OwnedFd, Proxy, ProxyError, ProxyRemoval, ProxyStatus, ProxyUpdate,
     RawFd, RecvPkt,
 };
+#[cfg(windows)]
+use super::tsi_sockopt::GuestOnlyOptions;
 
 use utils::epoll::EventSet;
 use vm_memory::GuestMemoryMmap;
@@ -53,6 +55,8 @@ pub struct TsiStreamProxy {
     pub(crate) push_cnt: Wrapping<u32>,
     pub(crate) pending_accepts: u64,
     pub(crate) unixsock_path: Option<PathBuf>,
+    #[cfg(windows)]
+    guest_options: GuestOnlyOptions,
 }
 
 impl TsiStreamProxy {
@@ -95,6 +99,8 @@ impl TsiStreamProxy {
             push_cnt: Wrapping(0),
             pending_accepts: 0,
             unixsock_path: None,
+            #[cfg(windows)]
+            guest_options: GuestOnlyOptions::default(),
         })
     }
 
@@ -137,6 +143,8 @@ impl TsiStreamProxy {
             push_cnt: Wrapping(0),
             pending_accepts: 0,
             unixsock_path: None,
+            #[cfg(windows)]
+            guest_options: GuestOnlyOptions::default(),
         }
     }
 
@@ -315,6 +323,10 @@ impl Proxy for TsiStreamProxy {
     }
 
     fn socket_option(&self, level: u32, name: u32, value: Option<i32>) -> Result<i32, i32> {
+        #[cfg(windows)]
+        if let Some(result) = self.guest_options.apply(level, name, value) {
+            return Ok(result);
+        }
         super::tsi_sockopt::socket_option(
             self.as_raw_fd(),
             self.family,
