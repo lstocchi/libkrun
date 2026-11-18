@@ -42,7 +42,7 @@ use windows_sys::Win32::Storage::FileSystem::{
     SetFileInformationByHandle,
 };
 use windows_sys::Win32::System::IO::{DeviceIoControl, IO_STATUS_BLOCK};
-use windows_sys::Win32::System::Ioctl::FSCTL_GET_REPARSE_POINT;
+use windows_sys::Win32::System::Ioctl::{FSCTL_GET_REPARSE_POINT, FSCTL_SET_REPARSE_POINT};
 use windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS;
 use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
 
@@ -284,29 +284,6 @@ fn check_name(name: &CStr) -> io::Result<()> {
 fn child_path(parent: &Path, name: &CStr) -> io::Result<PathBuf> {
     check_name(name)?;
     Ok(parent.join(cstr_to_path(name)))
-}
-
-/// Refuse a symlink target that resolves outside the shared directory from a link made `depth`
-/// directories below the shared root.
-///
-/// A host program that opens the link follows it, reading the target as a Windows path: `\` is
-/// a separator, `:` names a drive or a stream, a target starting with `/` starts at the root of
-/// a drive, and Win32 drops the trailing dots and spaces of a component, so a component made
-/// only of them does not name what it spells.
-fn check_symlink_target(target: &CStr, mut depth: usize) -> io::Result<()> {
-    let bytes = target.to_bytes();
-    if bytes.first() == Some(&b'/') || bytes.iter().any(|b| matches!(b, b'\\' | b':')) {
-        return Err(einval());
-    }
-    for component in bytes.split(|b| *b == b'/') {
-        match component {
-            b"" | b"." => {}
-            b".." => depth = depth.checked_sub(1).ok_or_else(einval)?,
-            _ if component.iter().all(|b| matches!(b, b'.' | b' ')) => return Err(einval()),
-            _ => depth += 1,
-        }
-    }
-    Ok(())
 }
 
 const FILETIME_UNIX_EPOCH_DIFF: i64 = 116_444_736_000_000_000;
@@ -581,15 +558,54 @@ fn read_lx_symlink_by_handle(handle: HANDLE) -> io::Result<Vec<u8>> {
     }
 
     let data_len = u16::from_le_bytes(buffer[4..6].try_into().unwrap()) as usize;
-    if bytes_returned < (8 + data_len) as u32 {
+    if data_len < mem::size_of::<u32>() || bytes_returned < (8 + data_len) as u32 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "Truncated LX_SYMLINK payload",
         ));
     }
 
-    // Target UTF-8 bytes start at offset 8
-    Ok(buffer[8..8 + data_len].to_vec())
+    // The payload starts with a dword WSL writes as 2; the target follows it.
+    Ok(buffer[12..8 + data_len].to_vec())
+}
+
+const LX_SYMLINK_VERSION: u32 = 2;
+
+/// Store `target` as an IO_REPARSE_TAG_LX_SYMLINK reparse point through `handle`, the way WSL
+/// stores symlinks on NTFS. Windows does not resolve that tag, so no host open ever follows a
+/// link stored this way, whatever its target spells, and the target round-trips verbatim.
+fn write_lx_symlink_by_handle(handle: HANDLE, target: &[u8]) -> io::Result<()> {
+    let data_len = mem::size_of::<u32>() + target.len();
+    if data_len > u16::MAX as usize {
+        return Err(einval());
+    }
+
+    let mut buffer = Vec::with_capacity(8 + data_len);
+    buffer.extend_from_slice(&(IO_REPARSE_TAG_LX_SYMLINK as u32).to_le_bytes());
+    buffer.extend_from_slice(&(data_len as u16).to_le_bytes());
+    buffer.extend_from_slice(&0u16.to_le_bytes());
+    buffer.extend_from_slice(&LX_SYMLINK_VERSION.to_le_bytes());
+    buffer.extend_from_slice(target);
+
+    let mut bytes_returned = 0u32;
+    let result = unsafe {
+        DeviceIoControl(
+            handle,
+            FSCTL_SET_REPARSE_POINT,
+            buffer.as_ptr() as *const core::ffi::c_void,
+            buffer.len() as u32,
+            std::ptr::null_mut(),
+            0,
+            &mut bytes_returned,
+            std::ptr::null_mut(),
+        )
+    };
+
+    if result == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 // ADS-backed override_stat helpers  (uid:gid:0mode)
@@ -751,50 +767,6 @@ fn write_ads_by_handle(file_handle: HANDLE, stream_suffix: &str, data: &[u8]) ->
         Ok(())
     } else {
         Err(nt_status_to_io_error(write_status))
-    }
-}
-
-/// Store a security context as an ADS named after `secctx.name`.
-/// When `symlink` is true, opens with `FILE_OPEN_REPARSE_POINT` so the
-/// ADS is placed on the symlink itself rather than following to the target.
-fn write_secctx(path: &Path, secctx: SecContext, symlink: bool) -> io::Result<()> {
-    let stream_name = format!(":{}", secctx.name.to_string_lossy());
-    let ads = ads_stream_path(path, &stream_name);
-
-    if symlink {
-        let h = open_handle(
-            &ads,
-            &OpenFlags {
-                desired_access: GENERIC_WRITE,
-                create_disposition: FILE_OVERWRITE_IF,
-                create_options: FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
-            },
-        )
-        .map_err(win_err_to_linux)?;
-
-        let mut iosb: IO_STATUS_BLOCK = unsafe { mem::zeroed() };
-        let status = unsafe {
-            NtWriteFile(
-                h,
-                std::ptr::null_mut(),
-                None,
-                std::ptr::null(),
-                &mut iosb,
-                secctx.secctx.as_ptr() as *const core::ffi::c_void,
-                secctx.secctx.len() as u32,
-                std::ptr::null(),
-                std::ptr::null(),
-            )
-        };
-        unsafe { CloseHandle(h) };
-
-        if status >= 0 {
-            Ok(())
-        } else {
-            Err(nt_status_to_io_error(status))
-        }
-    } else {
-        fs::write(&ads, &secctx.secctx).map_err(win_err_to_linux)
     }
 }
 
@@ -2330,17 +2302,16 @@ impl FileSystem for PassthroughFs {
             Ok(buf) => buf,
             _ => {
                 let target = fs::read_link(&*path).map_err(win_err_to_linux)?;
-                target.to_string_lossy().into_owned().into_bytes()
+                let mut buf = target.to_string_lossy().into_owned().into_bytes();
+                // A Windows symlink spells its target with '\', the guest expects '/'.
+                buf.iter_mut().for_each(|b| {
+                    if *b == b'\\' {
+                        *b = b'/'
+                    }
+                });
+                buf
             }
         };
-
-        // Convert Windows path formatting back to a Linux-friendly format.
-        // Windows symlinks use '\', but the FUSE Linux guest expects '/'
-        buf.iter_mut().for_each(|b| {
-            if *b == b'\\' {
-                *b = b'/'
-            }
-        });
 
         // Cap to PATH_MAX (4096) to match Linux parity exactly.
         // While Windows NT paths can be 32k, FUSE/Linux expects a max of 4096 bytes.
@@ -2349,19 +2320,9 @@ impl FileSystem for PassthroughFs {
         Ok(buf)
     }
 
-    /*
-     * Current implementation relies on standard Windows symlink APIs,
-     * which enforce host-side path validation.
-     *
-     * The Limitation is that absolute paths from the guest (e.g., "/etc/passwd") are treated as drive-relative
-     * on Windows, so they are refused with EINVAL.
-     *
-     * TODO:
-     * To support true absolute guest symlinks, we need to bypass the Win32 API
-     * and manually set an IO_REPARSE_TAG_LX_SYMLINK reparse point using
-     * DeviceIoControl. This will allow storing arbitrary Linux-style paths
-     * without host-side resolution.
-     */
+    /// The link is stored as an LX symlink: a reparse point holding the target verbatim,
+    /// which Windows does not resolve, so only the guest ever follows it, whatever the
+    /// target spells.
     fn symlink(
         &self,
         ctx: Context,
@@ -2370,34 +2331,61 @@ impl FileSystem for PassthroughFs {
         name: &CStr,
         extensions: Extensions,
     ) -> io::Result<Entry> {
-        let parent_path = self.inode_path(parent)?;
-        let link_path = child_path(parent_path.as_path(), name)?;
-        let depth = parent_path
-            .strip_prefix(&self.cfg.root_dir)
-            .map_or(0, |below| below.components().count());
-        check_symlink_target(linkname, depth)?;
-        let target = cstr_to_path(linkname);
+        let parent_data = self.inode_data(parent)?;
+        let parent_g = HandleGuard(
+            self.open_inode(
+                &parent_data,
+                &OpenFlags {
+                    desired_access: GENERIC_READ,
+                    create_disposition: FILE_OPEN,
+                    create_options: FILE_SYNCHRONOUS_IO_NONALERT | FILE_DIRECTORY_FILE,
+                },
+            )
+            .map_err(win_err_to_linux)?,
+        );
 
-        // Windows requires knowing if a symlink target is a file or a directory.
-        // FUSE doesn't provide this distinction upfront, so we try file first,
-        // and safely fall back to directory if it fails.
-        std::os::windows::fs::symlink_file(&target, &link_path)
-            .or_else(|_| std::os::windows::fs::symlink_dir(&target, &link_path))
-            .map_err(win_err_to_linux)?;
+        let child_g = HandleGuard(
+            open_relative(
+                parent_g.as_raw(),
+                name,
+                &OpenFlags {
+                    desired_access: GENERIC_READ | GENERIC_WRITE | DELETE,
+                    create_disposition: FILE_CREATE,
+                    create_options: FILE_SYNCHRONOUS_IO_NONALERT,
+                },
+            )
+            .map_err(win_err_to_linux)?,
+        );
 
-        if matches!(self.cfg.semantics, PermissionSemantics::LinuxComplete) {
-            if let Some(secctx) = extensions.secctx {
-                write_secctx(&link_path, secctx, true)?;
+        let made = (|| {
+            if matches!(self.cfg.semantics, PermissionSemantics::LinuxComplete) {
+                if let Some(secctx) = extensions.secctx {
+                    let stream_name = format!(":{}", secctx.name.to_string_lossy());
+                    write_ads_by_handle(child_g.as_raw(), &stream_name, &secctx.secctx)?;
+                }
+
+                let stat_str = format!("{}:{}:0{:o}", ctx.uid, ctx.gid, S_IFLNK as u32 | 0o777);
+                write_ads_by_handle(child_g.as_raw(), OVERRIDE_STAT_STREAM, stat_str.as_bytes())?;
             }
 
-            write_override_stat(
-                &link_path,
-                Some((ctx.uid, ctx.gid)),
-                Some(S_IFLNK as u32 | 0o777),
-            )?;
+            write_lx_symlink_by_handle(child_g.as_raw(), linkname.to_bytes())
+        })();
+
+        if let Err(e) = made {
+            // The guest saw an error, so the link must not be left behind.
+            let _ = set_delete_disposition(child_g.as_raw());
+            return Err(e);
         }
 
-        self.do_lookup(&ctx, parent, name)
+        let child_path = child_path(parent_data.get_path().as_path(), name)?;
+        self.entry_from_handle(
+            &ctx,
+            parent,
+            &parent_data,
+            &child_path,
+            child_g.as_raw(),
+            Some((Some(ctx.uid), Some(ctx.gid), Some(S_IFLNK as u32 | 0o777))),
+        )
     }
 
     fn mknod(
@@ -3222,38 +3210,6 @@ mod tests {
     }
 
     #[test]
-    fn a_symlink_target_outside_the_share_is_refused() {
-        for (target, depth) in [
-            (c"/etc/passwd", 2),
-            (c"..", 0),
-            (c"../x", 0),
-            (c"a/../../x", 0),
-            (c"../../x", 1),
-            (c"a\\b", 0),
-            (c"C:x", 0),
-            (c".../../x", 1),
-            (c"a/.. /x", 1),
-        ] {
-            assert!(
-                check_symlink_target(target, depth).is_err(),
-                "{target:?} at depth {depth}"
-            );
-        }
-        for (target, depth) in [
-            (c"x", 0),
-            (c"./a//b/", 0),
-            (c"a/../x", 0),
-            (c"..", 1),
-            (c"../../x", 2),
-        ] {
-            assert!(
-                check_symlink_target(target, depth).is_ok(),
-                "{target:?} at depth {depth}"
-            );
-        }
-    }
-
-    #[test]
     fn a_lookup_stays_within_the_shared_directory() {
         let share = Share::new("lookup");
         let fs = share.served();
@@ -3307,21 +3263,77 @@ mod tests {
     }
 
     #[test]
-    fn a_symlink_stays_within_the_shared_directory() {
+    fn a_symlink_is_stored_where_the_host_cannot_follow_it() {
         let share = Share::new("symlink");
         let fs = share.served();
 
-        for (target, name) in [
-            (c"..".to_owned(), c"up"),
-            (c"..\\outside.txt".to_owned(), c"beside"),
-            (name_of(&share.outside), c"host"),
-        ] {
-            refused(
-                fs.symlink(CTX, &target, fuse::ROOT_ID, name, Extensions::default()),
-                "a symlink target reached an entry outside the share",
-            );
-            let made = share.root.join(name.to_str().unwrap());
-            assert!(fs::symlink_metadata(&made).is_err(), "{made:?}");
-        }
+        let link = fs
+            .symlink(CTX, c"..", fuse::ROOT_ID, c"up", Extensions::default())
+            .expect("a Linux target is guest data, allowed wherever the link is made");
+        assert_eq!(fs.readlink(CTX, link.inode).unwrap(), b"..");
+        let (attr, _) = fs.getattr(CTX, link.inode, None).unwrap();
+        assert_eq!(attr.st_mode, S_IFLNK as u32 | 0o777);
+        assert!(
+            fs::read(share.root.join("up")).is_err(),
+            "the host followed a guest link"
+        );
+
+        let verbatim = fs
+            .symlink(
+                CTX,
+                c"a\\b",
+                fuse::ROOT_ID,
+                c"verbatim",
+                Extensions::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            fs.readlink(CTX, verbatim.inode).unwrap(),
+            b"a\\b",
+            "the target round-trips verbatim"
+        );
+    }
+
+    #[test]
+    fn a_renamed_symlink_stays_within_the_shared_directory() {
+        let share = Share::new("symlink-rename");
+        let fs = share.served();
+
+        let sub = fs
+            .mkdir(
+                CTX,
+                fuse::ROOT_ID,
+                c"below",
+                0o755,
+                0,
+                Extensions::default(),
+            )
+            .unwrap();
+        fs.symlink(CTX, c"..", sub.inode, c"up", Extensions::default())
+            .expect("a target the guest resolves itself is allowed at any depth");
+
+        fs.rename(CTX, sub.inode, c"up", fuse::ROOT_ID, c"up", 0)
+            .unwrap();
+
+        let up = fs.lookup(CTX, fuse::ROOT_ID, c"up").unwrap();
+        assert!(
+            fs.create(
+                CTX,
+                up.inode,
+                c"made.txt",
+                0o644,
+                false,
+                LINUX_O_CREAT as u32,
+                0,
+                Extensions::default(),
+            )
+            .is_err(),
+            "the host resolved the moved link"
+        );
+        let made_outside = share.base.join("made.txt");
+        assert!(
+            !made_outside.exists(),
+            "a symlink reached outside the share after a rename moved it up: {made_outside:?}"
+        );
     }
 }
